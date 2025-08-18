@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # Python syntax and style checking
+  python-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, 3.10, 3.11, 3.12]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install black flake8 isort mypy
+
+      - name: Check Python syntax with black
+        run: |
+          black --check --diff .
+
+      - name: Check Python syntax with flake8
+        run: |
+          flake8 . --max-line-length=88 --extend-ignore=E203,W503
+
+      - name: Check Python syntax with isort
+        run: |
+          isort --check-only --diff --profile=black .
+
+      - name: Check Python type hints with mypy
+        run: |
+          mypy --ignore-missing-imports --no-strict-optional .
+
+  # C/C++/CUDA syntax checking
+  cpp-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang-format
+
+      - name: Check C/C++/CUDA formatting with clang-format
+        run: |
+          find . -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.cu" -o -name "*.cuh" | xargs clang-format --dry-run --Werror
+
+      - name: Check C/C++/CUDA compilation (basic syntax check)
+        run: |
+          # Find all C/C++ source files
+          find . -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.cu" -o -name "*.cuh" > source_files.txt
+
+          # Check if we have any source files
+          if [ -s source_files.txt ]; then
+            echo "Found source files:"
+            cat source_files.txt
+
+            # Try to compile each C/C++ file to check syntax
+            while IFS= read -r file; do
+              if [[ "$file" == *.c ]] || [[ "$file" == *.cpp ]]; then
+                echo "Checking syntax for: $file"
+                gcc -fsyntax-only -std=c99 "$file" 2>/dev/null || g++ -fsyntax-only -std=c++17 "$file" 2>/dev/null || echo "Syntax check failed for $file"
+              fi
+            done < source_files.txt
+          else
+            echo "No C/C++ source files found"
+          fi
+
+  # Shell script checking
+  shell-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check shell scripts
+        run: |
+          find . -name "*.sh" -o -name "*.bash" -o -name "*.zsh" | xargs shellcheck --severity=warning

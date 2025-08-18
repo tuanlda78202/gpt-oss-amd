@@ -1,0 +1,28 @@
+name: pre-commit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  pre-commit-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ${{ github.repository }}
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+
+      # Install pre-commit
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      # Run pre-commit checks
+      - name: Run pre-commit checks
+        run: pre-commit run --all-files

@@ -1,0 +1,17 @@
+name: commitlint
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+jobs:
+  lint-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci || npm i
+      - run: npx commitlint --from ${{ github.event.pull_request.base.sha || github.event.before }} --to ${{ github.sha }} --verbose
