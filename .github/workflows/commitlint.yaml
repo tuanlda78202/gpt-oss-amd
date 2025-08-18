@@ -2,7 +2,8 @@ name: commitlint
 on:
   pull_request:
   push:
-    branches: [ main ]
+    branches: [main]
+
 jobs:
   lint-commits:
     runs-on: ubuntu-latest
@@ -10,8 +11,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - run: npm ci || npm i
-      - run: npx commitlint --from ${{ github.event.pull_request.base.sha || github.event.before }} --to ${{ github.sha }} --verbose
+          node-version: 20
+
+      - name: Lint commits (Conventional Commits)
+        env:
+          FROM_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          TO_SHA: ${{ github.sha }}
+        run: |
+          # lightweight config so commitlint knows what rules to use
+          echo "module.exports = {extends: ['@commitlint/config-conventional']};" > commitlint.config.cjs
+          npx --yes -p @commitlint/cli@19 -p @commitlint/config-conventional@19 \
+            commitlint --from "$FROM_SHA" --to "$TO_SHA" --verbose
