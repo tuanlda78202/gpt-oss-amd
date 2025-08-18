@@ -46,9 +46,7 @@ This repository implements an inference serving system for **gpt-oss** models (2
 ## resources
 
 - **Model binaries (internal/shared path):**
-
   - `/nfs/gpu_trainee/final-project/modelbin/`
-
     - `gpt-oss-7m.bin` (debug only)
     - `gpt-oss-20b.bin`
     - `gpt-oss-120b.bin`
@@ -141,7 +139,6 @@ make runomp   # Compiled with -O3 and -fopenmp
 - Maintain **correctness metrics** (e.g., checksum/sanity prompts).
 - Report **tokens/sec** for each mode and model size.
 - Optimize across:
-
   - CPU threading (OpenMP/pthreads)
   - HIP kernels (coalescing, tiling, occupancy)
   - Multi-GPU parallelization (pipeline/tensor-level where appropriate)
@@ -166,9 +163,3 @@ make runomp   # Compiled with -O3 and -fopenmp
 - [OpenMP](https://www.openmp.org/specifications/)
 - [Slurm](https://slurm.schedmd.com/documentation.html)
 - [tiktoken](https://github.com/openai/tiktoken)
-
----
-
-## license
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

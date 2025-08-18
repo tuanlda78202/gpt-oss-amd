@@ -1,6 +1,4 @@
 import os
-import sys
-import threading
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -31,8 +29,9 @@ model.to(torch.float32)
 prompt = "Tell me a joke"
 enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
 input_ids = enc.input_ids
-attention_mask = enc.attention_mask if "attention_mask" in enc else torch.ones_like(
-    input_ids)
+attention_mask = (
+    enc.attention_mask if "attention_mask" in enc else torch.ones_like(input_ids)
+)
 
 # Streamer prints tokens to stdout as they are generated
 streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)

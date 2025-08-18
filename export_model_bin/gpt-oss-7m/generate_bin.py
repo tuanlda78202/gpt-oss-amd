@@ -2,7 +2,6 @@
 
 import argparse
 from collections import OrderedDict
-from itertools import islice
 import json
 import re
 import struct
@@ -13,11 +12,21 @@ import torch
 
 # Explicit list to ensure correct keys order
 KEYS = [
-    "vocab_size", "hidden_size", "num_experts", "experts_per_token",
-    "intermediate_size", "num_hidden_layers", "head_dim",
-    "num_attention_heads", "num_key_value_heads", "max_seq_len",
-    "initial_context_length", "rope_theta", "rope_scaling_factor",
-    "sliding_window", "swiglu_limit"
+    "vocab_size",
+    "hidden_size",
+    "num_experts",
+    "experts_per_token",
+    "intermediate_size",
+    "num_hidden_layers",
+    "head_dim",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "max_seq_len",
+    "initial_context_length",
+    "rope_theta",
+    "rope_scaling_factor",
+    "sliding_window",
+    "swiglu_limit",
 ]
 
 CATEGORIES = [
@@ -86,8 +95,7 @@ def binarize_weights(state_dict, dtype="float32"):
     torch_dtype = torch.float32 if dtype == "float32" else np.bfloat16
     weights_bin = b""
     for name, tensor in reordered.items():
-        np_tensor = tensor.detach().cpu().to(torch_dtype).numpy().astype(
-            np_dtype)
+        np_tensor = tensor.detach().cpu().to(torch_dtype).numpy().astype(np_dtype)
         weights_bin += np_tensor.tobytes()
         print(f"Binarized {name}")
 
@@ -96,18 +104,11 @@ def binarize_weights(state_dict, dtype="float32"):
 
 def parseCLIArgs():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-c",
-                        "--config",
-                        type=str,
-                        help="Path to config.json file")
-    parser.add_argument("-i",
-                        "--input",
-                        type=str,
-                        help="Path to input .safetensors file")
-    parser.add_argument("-o",
-                        "--output",
-                        type=str,
-                        help="Path to output .bin file")
+    parser.add_argument("-c", "--config", type=str, help="Path to config.json file")
+    parser.add_argument(
+        "-i", "--input", type=str, help="Path to input .safetensors file"
+    )
+    parser.add_argument("-o", "--output", type=str, help="Path to output .bin file")
 
     args = parser.parse_args()
     return args

@@ -1,6 +1,5 @@
 import argparse
 from collections import OrderedDict
-import os
 
 from safetensors.torch import load_file
 from safetensors.torch import safe_open
@@ -18,8 +17,7 @@ def convert_keys(state_dict_b):
         new_k = new_k.replace("model.layers", "block")
         new_k = new_k.replace(".self_attn", ".attn")
         new_k = new_k.replace(".o_proj", ".out")
-        new_k = new_k.replace(".post_attention_layernorm.weight",
-                              ".mlp.norm.scale")
+        new_k = new_k.replace(".post_attention_layernorm.weight", ".mlp.norm.scale")
         new_k = new_k.replace(".experts.gate_up_proj_bias", ".mlp1_bias")
         new_k = new_k.replace(".experts.gate_up_proj", ".mlp1_weight")
         new_k = new_k.replace(".experts.down_proj_bias", ".mlp2_bias")
@@ -65,12 +63,12 @@ def reshape_mlp(state_dict, block_id):
     mlp2_weight = state_dict[f"block.{block_id}.mlp.mlp2_weight"]
 
     new_state_dict = OrderedDict(state_dict)
-    new_state_dict[
-        f"block.{block_id}.mlp.mlp1_weight"] = mlp1_weight.transpose(
-            1, 2).contiguous()
-    new_state_dict[
-        f"block.{block_id}.mlp.mlp2_weight"] = mlp2_weight.transpose(
-            1, 2).contiguous()
+    new_state_dict[f"block.{block_id}.mlp.mlp1_weight"] = mlp1_weight.transpose(
+        1, 2
+    ).contiguous()
+    new_state_dict[f"block.{block_id}.mlp.mlp2_weight"] = mlp2_weight.transpose(
+        1, 2
+    ).contiguous()
 
     return new_state_dict
 
@@ -87,18 +85,19 @@ def add_unembedding(state_dict):
 
 def parseCLIArgs():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i",
-                        "--input",
-                        type=str,
-                        required=True,
-                        help="Path to the original .safetensors file")
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=str,
+        required=True,
+        help="Path to the original .safetensors file",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=str,
         default="model.safetensors",
-        help=
-        "Path to save the converted .safetensors file (default: model.safetensors)"
+        help="Path to save the converted .safetensors file (default: model.safetensors)",
     )
     return parser.parse_args()
 

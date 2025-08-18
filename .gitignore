@@ -43,6 +43,7 @@
 
 # ----------------------------- Python -----------------------------------
 # Ignore files with no extension
+*
 !*/
 !*.*
 
@@ -73,3 +74,6 @@ build/
 # Binaries
 *.safetensors
 *.bin
+
+# Stuff
+uv.lock
