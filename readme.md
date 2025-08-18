@@ -1,8 +1,8 @@
 <div align="center">
 
-# gpt-oss inference
+# gpt-oss inference engine
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c3a44754-f045-485d-8b2a-6558d0fffbc8" />
+<img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" />
 
 </div>
 
@@ -63,6 +63,23 @@ This repository implements an inference serving system for **gpt-oss** models (2
 - **CPU toolchain:** GCC/Clang with **OpenMP** and/or **pthreads**.
 - **OS/Cluster:** Slurm for job execution.
 
+### slurm cluster
+
+Login:
+
+```bash
+ssh getp<XX>@203.205.18.240
+```
+
+Run jobs with GPUs:
+
+```bash
+# Request N GPUs (default: 1)
+srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
+```
+
+> The training cluster provides up to **4 nodes** for experimentation, but the **project deliverable focuses on single-node, multi-GPU execution**.
+
 ---
 
 ## build & run
@@ -72,7 +89,6 @@ This repository implements an inference serving system for **gpt-oss** models (2
 ```bash
 # Build the baseline runner (uses provided Makefile)
 make
-# Produces: ./run
 ```
 
 > If you add new source files (e.g., HIP kernels and orchestration in `run_exec.cpp`), keep the Makefile unchanged by including new code through headers or `run_exec.cpp`.
@@ -113,28 +129,7 @@ make
 | `generate` | Single prompt → completion              | `./run model.bin -m generate -i "..."`                  |
 | `getp`     | Multi-prompt batch for final evaluation | `./run model.bin -m getp -i prompts.txt -o outputs.txt` |
 
----
-
-## cluster Access (Slurm)
-
-Login:
-
-```bash
-ssh getp<XX>@203.205.18.240
-```
-
-Run jobs with GPUs:
-
-```bash
-# Request N GPUs (default: 1)
-srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
-```
-
-> The training cluster provides up to **4 nodes** for experimentation, but the **project deliverable focuses on single-node, multi-GPU execution**.
-
----
-
-## performance & Correctness
+### performance & correctness
 
 - Maintain **correctness metrics** (e.g., checksum/sanity prompts).
 - Report **tokens/sec** for each mode and model size.
@@ -155,7 +150,7 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 
 ---
 
-## references
+## refs
 
 - [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
 - [llama2.c](https://github.com/karpathy/llama2.c)
