@@ -19,10 +19,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
 
-      # Install pre-commit
       - name: Install pre-commit
         run: pip install pre-commit
 
-      # Run pre-commit checks
       - name: Run pre-commit checks
         run: pre-commit run --all-files
