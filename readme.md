@@ -52,6 +52,7 @@ This repository implements an inference serving system for **gpt-oss** models (2
     - `gpt-oss-7m.bin` (debug only)
     - `gpt-oss-20b.bin`
     - `gpt-oss-120b.bin`
+
 - **Tokenizer:** compatible with OpenAI **`o200k_harmony`** (via `tiktoken`).
 
 ---
@@ -84,11 +85,19 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 
 ## build & run
 
+- [run docs](docs/setup.md)
+
+```bash
+export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
+export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
+```
+
 ### build
 
 ```bash
-# Build the baseline runner (uses provided Makefile)
-make
+make run      # Default compilation, very slow
+make runfast  # Compiled with -O3 optimization
+make runomp   # Compiled with -O3 and -fopenmp
 ```
 
 > If you add new source files (e.g., HIP kernels and orchestration in `run_exec.cpp`), keep the Makefile unchanged by including new code through headers or `run_exec.cpp`.
@@ -100,21 +109,19 @@ make
 **Chat mode**
 
 ```bash
-./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20b.bin -m chat
+./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m chat
 ```
 
 **Single-prompt generate**
 
 ```bash
-./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20b.bin -m generate \
-  -i "Write a haiku about parallelism."
+./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m generate -i "Write a haiku about parallelism."
 ```
 
 **Batch evaluation (“getp”)**
 
 ```bash
-./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20b.bin -m getp \
-  -i input_prompts.txt -o outputs.txt
+./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m getp -i data/input.txt -o data/output.txt
 ```
 
 > Your extended paths (e.g., GPU/multi-GPU) should be wired through `run_exec.cpp` and invoked by flags you define (keep CLI consistent with `run.cpp` semantics).

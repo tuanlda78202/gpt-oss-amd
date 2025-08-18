@@ -1,0 +1,17 @@
+{
+  "vocab_size": 201088,
+  "hidden_size": 32,
+  "num_experts": 32,
+  "experts_per_token": 4,
+  "intermediate_size": 64,
+  "num_hidden_layers": 2,
+  "head_dim": 32,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+	"max_seq_len": 2048,
+  "initial_context_length": 4096,
+  "rope_theta": 150000.0,
+  "rope_scaling_factor": 32.0,
+  "sliding_window": 128,
+  "swiglu_limit": 7.0
+}

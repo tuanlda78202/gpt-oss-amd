@@ -1,3 +1,4 @@
+# ----------------------------- C -----------------------------------
 # Prerequisites
 *.d
 
@@ -39,3 +40,36 @@
 
 # debug information files
 *.dwo
+
+# ----------------------------- Python -----------------------------------
+# Ignore files with no extension
+!*/
+!*.*
+
+# Virtual env
+.venv/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Tools & test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Env & OS bits
+.env
+.env.*
+.DS_Store
+
+# Binaries
+*.safetensors
+*.bin
