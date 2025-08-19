@@ -1,4 +1,4 @@
-#include "tokenizer.hpp"
+#include "../include/tokenizer.hpp"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -18,12 +18,11 @@ python export_model_bin.py \
 """
 
 import argparse
-from collections import OrderedDict
 import json
 import math
 import re
 import struct
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List
 
 import numpy as np
 from safetensors.torch import safe_open
@@ -32,11 +31,21 @@ import torch
 # ---- Config keys & ordering buckets ----
 
 KEYS = [
-    "vocab_size", "hidden_size", "num_experts", "experts_per_token",
-    "intermediate_size", "num_hidden_layers", "head_dim",
-    "num_attention_heads", "num_key_value_heads", "max_seq_len",
-    "initial_context_length", "rope_theta", "rope_scaling_factor",
-    "sliding_window", "swiglu_limit"
+    "vocab_size",
+    "hidden_size",
+    "num_experts",
+    "experts_per_token",
+    "intermediate_size",
+    "num_hidden_layers",
+    "head_dim",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "max_seq_len",
+    "initial_context_length",
+    "rope_theta",
+    "rope_scaling_factor",
+    "sliding_window",
+    "swiglu_limit",
 ]
 
 CATEGORIES = [
@@ -91,8 +100,9 @@ def dequantize_fp4(
 ) -> torch.Tensor:
     """Dequantize MXFP4 blocks/scales into `dtype` (default bfloat16)"""
     scales = scales.to(torch.int32) - 127
-    assert blocks.shape[:-1] == scales.shape, (
-        f"{blocks.shape=} does not match {scales.shape=}")
+    assert (
+        blocks.shape[:-1] == scales.shape
+    ), f"{blocks.shape=} does not match {scales.shape=}"
     lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
 
     *prefix_shape, G, B = blocks.shape
@@ -151,12 +161,11 @@ def collect_effective_keys(f) -> Dict[str, TensorProvider]:
     # First pass: set up FP4 pairs
     for key in keys:
         if key.endswith(".blocks"):
-            base = key[:-len(".blocks")]
+            base = key[: -len(".blocks")]
             scales = base + ".scales"
             if scales in keys:
                 # Create a provider that dequantizes on demand
                 def make_loader(blocks_key=key, scales_key=scales):
-
                     def _ld():
                         blk = f.get_tensor(blocks_key)
                         scl = f.get_tensor(scales_key)
@@ -171,13 +180,12 @@ def collect_effective_keys(f) -> Dict[str, TensorProvider]:
         if key.endswith(".scales"):
             continue  # consumed
         if key.endswith(".blocks"):
-            base = key[:-len(".blocks")]
+            base = key[: -len(".blocks")]
             if base in effective:
                 continue  # already have the dequantized provider
         if key not in effective:
             # Plain tensor passthrough
             def make_plain_loader(k=key):
-
                 def _ld():
                     return f.get_tensor(k)
 
@@ -244,15 +252,16 @@ def write_weights_streaming(
     Stream tensors to file in the specified order.
     out_dtype: "float32" (default) or "bfloat16"
     """
-    np_dtype = np.float32 if out_dtype == "float32" else np.uint16  # bf16 stored as uint16 payload
+    # np_dtype = (
+    # np.float32 if out_dtype == "float32" else np.uint16
+    # )  # bf16 stored as uint16 payload
     torch_cast = torch.float32 if out_dtype == "float32" else torch.bfloat16
 
     for name in ordered_keys:
         tens = providers[name].load().to(torch_cast).cpu()
         # For bfloat16, write the raw 16-bit payload (view as uint16) to avoid accidental conversion.
         if torch_cast == torch.bfloat16:
-            np_arr = tens.view(torch.uint16).numpy().astype(np.uint16,
-                                                            copy=False)
+            np_arr = tens.view(torch.uint16).numpy().astype(np.uint16, copy=False)
         else:
             np_arr = tens.numpy().astype(np.float32, copy=False)
 
@@ -265,20 +274,21 @@ def write_weights_streaming(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description=
-        "Export GPT-OSS to single .bin (config + weights) in one step.")
+        description="Export GPT-OSS to single .bin (config + weights) in one step."
+    )
     p.add_argument(
         "--input",
         required=True,
-        help="Path to input .safetensors (may contain .blocks/.scales)")
+        help="Path to input .safetensors (may contain .blocks/.scales)",
+    )
     p.add_argument("--config", required=True, help="Path to config.json")
     p.add_argument("--output", required=True, help="Output .bin path")
     p.add_argument(
         "--dtype",
         choices=["float32", "bfloat16"],
         default="float32",
-        help=
-        "Output weights dtype (default float32, matching previous pipeline)")
+        help="Output weights dtype (default float32, matching previous pipeline)",
+    )
     return p.parse_args()
 
 
@@ -298,10 +308,7 @@ def main():
         # Write binary in one pass
         with open(args.output, "wb") as fout:
             write_config_header(config, fout)
-            write_weights_streaming(providers,
-                                    ordered,
-                                    fout,
-                                    out_dtype=args.dtype)
+            write_weights_streaming(providers, ordered, fout, out_dtype=args.dtype)
 
     print(f"Done. Wrote {args.output}")
 

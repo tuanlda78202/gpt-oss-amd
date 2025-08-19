@@ -125,8 +125,9 @@ def build_token_records(
     return records, max_len
 
 
-def write_tokenizer_binary(out_path: Path, records: List[TokenRecord],
-                           max_token_length: int) -> None:
+def write_tokenizer_binary(
+    out_path: Path, records: List[TokenRecord], max_token_length: int
+) -> None:
     """Write the tokenizer.bin file atomically."""
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     with tmp_path.open("wb") as f:
@@ -148,13 +149,8 @@ def parse_args() -> argparse.Namespace:
         description="Export tiktoken vocab to tokenizer.bin",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-o",
-                        "--out",
-                        required=True,
-                        help="Output tokenizer.bin path")
-    parser.add_argument("--encoding",
-                        default="o200k_harmony",
-                        help="tiktoken encoding")
+    parser.add_argument("-o", "--out", required=True, help="Output tokenizer.bin path")
+    parser.add_argument("--encoding", default="o200k_harmony", help="tiktoken encoding")
     parser.add_argument(
         "--check-vocab",
         type=int,
@@ -165,8 +161,10 @@ def parse_args() -> argparse.Namespace:
         "--max-len",
         type=int,
         default=None,
-        help=("Override max_token_length. Must be >= longest token; "
-              "otherwise the program exits with error."),
+        help=(
+            "Override max_token_length. Must be >= longest token; "
+            "otherwise the program exits with error."
+        ),
     )
     return parser.parse_args()
 
@@ -177,15 +175,19 @@ def main() -> None:
     try:
         enc = tiktoken.get_encoding(args.encoding)
         for name in [
-                "<|start|>", "<|end|>", "<|return|>", "<|message|>",
-                "<|channel|>", "<|constrain|>", "<|endoftext|>"
+            "<|start|>",
+            "<|end|>",
+            "<|return|>",
+            "<|message|>",
+            "<|channel|>",
+            "<|constrain|>",
+            "<|endoftext|>",
         ]:
             tid = enc._special_tokens.get(name)
             if tid is not None:
                 print(f"{name}: {tid}")
     except Exception as e:
-        print(f"[ERROR] Unknown encoding '{args.encoding}': {e}",
-              file=sys.stderr)
+        print(f"[ERROR] Unknown encoding '{args.encoding}': {e}", file=sys.stderr)
         sys.exit(2)
 
     if args.check_vocab is not None and enc.n_vocab != args.check_vocab:
@@ -196,8 +198,7 @@ def main() -> None:
         sys.exit(3)
 
     id_to_bytes, id_to_text = build_id_maps(enc)
-    records, computed_max_len = build_token_records(enc, id_to_bytes,
-                                                    id_to_text)
+    records, computed_max_len = build_token_records(enc, id_to_bytes, id_to_text)
 
     max_token_length = computed_max_len if args.max_len is None else args.max_len
     if max_token_length < computed_max_len:
@@ -212,8 +213,10 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_tokenizer_binary(out_path, records, max_token_length)
 
-    print(f"[OK] Wrote tokenizer with {len(records)} tokens to {out_path} "
-          f"(max_token_length={max_token_length})")
+    print(
+        f"[OK] Wrote tokenizer with {len(records)} tokens to {out_path} "
+        f"(max_token_length={max_token_length})"
+    )
 
 
 if __name__ == "__main__":
