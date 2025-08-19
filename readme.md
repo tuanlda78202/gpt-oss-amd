@@ -8,12 +8,10 @@
 
 ## abstract
 
-This repository implements an inference serving system for **gpt-oss** models (20B & 120B parameters) using a minimal C/C++ runtime derived from **`llama2.c`**. It targets **single-node, multi-GPU** execution on AMD MI250 with custom HIP kernels, and supports CPU execution with OpenMP/pthreads.
+This repository implements an inference serving system for **gpt-oss** models (20B & 120B) using a minimal C/C++ runtime derived from `llama2.c`. It targets **single-node, multi-GPU** execution on AMD MI250 with custom HIP kernels, and supports CPU execution with OpenMP/pthreads.
 
-- **Baseline:** CPU-only C/C++ code (single-prompt, greedy decoding).
-- **Extension:** HIP GPU execution and multi-GPU parallelism on a single node.
-- **Weights:** Pre-exported binary weights (e.g., from Hugging Face checkpoints).
-- **Tokenizer:** OpenAI `o200k_harmony`-compatible.
+- **Baseline:** CPU-only C/C++ code (single-prompt, greedy decoding)
+- **Extension:** HIP GPU execution and multi-GPU parallelism on a single node
 
 ---
 
@@ -21,13 +19,13 @@ This repository implements an inference serving system for **gpt-oss** models (2
 
 - ✅ **Correctness first** — keep simple checks/metrics to verify output validity.
 - 🚀 **Throughput** — maximize tokens/sec via CPU threading + HIP GPU kernels.
-- 🧱 **Scope** — single node, multi-GPU execution for 20B and 120B models.
+- 📚 **Scope** — single node, multi-GPU execution for 20B and 120B models.
 
 ---
 
 ## resources
 
-- **Model binaries (internal/shared path):**
+- **Model binaries:**
   - `/nfs/gpu_trainee/final-project/modelbin/`
     - `gpt-oss-7m.bin` (debug only)
     - `gpt-oss-20b.bin`
@@ -35,27 +33,24 @@ This repository implements an inference serving system for **gpt-oss** models (2
 
 - **Tokenizer:** compatible with OpenAI **`o200k_harmony`** (via `tiktoken`).
 
----
-
-### environment
+### env
 
 - **Hardware:** single node with up to **8× AMD MI250 GPUs**.
-- **GPU toolchain:** HIP/ROCm (write **all GPU kernels from scratch**, no GPU libs).
-- **CPU toolchain:** GCC/Clang with **OpenMP** and/or **pthreads**.
-- **OS/Cluster:** Slurm for job execution.
+- **GPU:** HIP/ROCm (write **all GPU kernels from scratch**, no GPU libs).
+- **CPU:** GCC/Clang with **OpenMP**/**pthreads**.
+- **OS:** Slurm for job execution.
 
 ### slurm cluster
 
-Login:
+Login node:
 
 ```bash
 ssh getp<XX>@203.205.18.240
 ```
 
-Run jobs with GPUs:
+Compute node:
 
 ```bash
-# Request N GPUs (default: 1)
 srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 ```
 
@@ -65,58 +60,41 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 
 ## build & run
 
-- [run docs](docs/setup.md)
-
-```bash
-export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
-export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
-```
-
 ### build
 
 ```bash
-make run      # Default compilation, very slow
-make runfast  # Compiled with -O3 optimization
-make runomp   # Compiled with -O3 and -fopenmp
+./run.sh build [default|fast|omp]
 ```
-
-> If you add new source files (e.g., HIP kernels and orchestration in `run_exec.cpp`), keep the Makefile unchanged by including new code through headers or `run_exec.cpp`.
-
----
 
 ## run
 
 **Chat mode**
 
 ```bash
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m chat
+./run.sh -m chat
 ```
 
 **Single-prompt generate**
 
 ```bash
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m generate -i "Write a haiku about parallelism."
+./run.sh -m generate -i "Write a haiku about parallelism."
 ```
 
-**Batch evaluation (“getp”)**
+**Batch evaluation**
 
 ```bash
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m getp -i data/input.txt -o data/output.txt
+./run.sh -m getp
 ```
-
-> Your extended paths (e.g., GPU/multi-GPU) should be wired through `run_exec.cpp` and invoked by flags you define (keep CLI consistent with `run.cpp` semantics).
 
 ---
 
-## evaluation
+## eval
 
-| Mode       | Description                             | Example                                                 |
-| ---------- | --------------------------------------- | ------------------------------------------------------- |
-| `chat`     | Interactive turn-based generation       | `./run model.bin -m chat`                               |
-| `generate` | Single prompt → completion              | `./run model.bin -m generate -i "..."`                  |
-| `getp`     | Multi-prompt batch for final evaluation | `./run model.bin -m getp -i prompts.txt -o outputs.txt` |
-
-### performance & correctness
+| Mode       | Description                             | Example                                                       |
+| ---------- | --------------------------------------- | ------------------------------------------------------------- |
+| `chat`     | Interactive turn-based generation       | `./run.sh -c model.bin -m chat`                               |
+| `generate` | Single prompt → completion              | `./run.sh -c model.bin -m generate -i "..."`                  |
+| `getp`     | Multi-prompt batch for final evaluation | `./run.sh -c model.bin -m getp -i prompts.txt -o outputs.txt` |
 
 - Maintain **correctness metrics** (e.g., checksum/sanity prompts).
 - Report **tokens/sec** for each mode and model size.
@@ -129,10 +107,9 @@ make runomp   # Compiled with -O3 and -fopenmp
 
 ## rules
 
-- **Do not modify:** `run.cpp`, `run_eval.cpp`, `Makefile`.
+- **Do not modify:** `run.cpp`, `getp_eval.cpp`, `Makefile`.
 - **Implement all GPU kernels from scratch** — **no external GPU libraries**.
 - **Target:** single-node, multi-GPU execution.
-- Keep tokenizer compatibility (`o200k_harmony`) and weight I/O format intact.
 
 ---
 
