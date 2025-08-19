@@ -25,24 +25,6 @@ This repository implements an inference serving system for **gpt-oss** models (2
 
 ---
 
-## tree
-
-```
-.
-├─ run.cpp               # DO NOT MODIFY (entry for single-prompt)
-├─ run_eval.cpp          # DO NOT MODIFY (evaluation runner)
-├─ Makefile              # DO NOT MODIFY
-├─ run_exec.cpp          # Add new execution paths / orchestrations here
-├─ include/              # Common headers
-├─ cpu/                  # CPU ops (OpenMP / pthreads)
-├─ hip/                  # HIP GPU kernels (implement from scratch)
-└─ tools/                # Utility scripts (optional)
-```
-
-> **Do not** edit `run.cpp`, `run_eval.cpp`, or `Makefile`. Add new logic in `run_exec.cpp` and new source files as needed.
-
----
-
 ## resources
 
 - **Model binaries (internal/shared path):**
