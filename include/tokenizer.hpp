@@ -10,22 +10,22 @@
 #ifndef TOKENINDEX_DEFINED
 #define TOKENINDEX_DEFINED
 typedef struct {
-  const char* str;
-  int len;
-  int id;
+    const char* str;
+    int len;
+    int id;
 } TokenIndex;
-#endif  // TOKENINDEX_DEFINED
+#endif // TOKENINDEX_DEFINED
 
 // Tokenizer struct
 typedef struct {
-  char** vocab;
-  int* lengths;
-  float* scores;
-  int vocab_size;
-  int max_token_length;
-  TokenIndex* sorted_vocab;
-  int byte_tokens[256];
-  unsigned char byte_pieces[512];
+    char** vocab;
+    int* lengths;
+    float* scores;
+    int vocab_size;
+    int max_token_length;
+    TokenIndex* sorted_vocab;
+    int byte_tokens[256];
+    unsigned char byte_pieces[512];
 } Tokenizer;
 
 // Function declarations
@@ -47,4 +47,4 @@ void encode(Tokenizer* t, const char* text, int bos_id, int eos_id, int* out, in
 const char* decode_piece(Tokenizer* t, int prev_token, int token);
 void safe_printf(const char* s);
 
-#endif  // TOKENIZER_H
+#endif // TOKENIZER_H
