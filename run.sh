@@ -13,7 +13,7 @@ Usage:
   ./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]
                 [-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED]
       - Default checkpoint (if not provided): ${MODELBIN_ROOT}/gpt-oss-20b.bin
-      - In getp mode: -i defaults to data/input.txt, -o defaults to data/output.txt
+      - In getp mode: -i defaults to tests/data/input.txt, -o defaults to tests/data/output.txt
   ./run.sh decode [-i OUTPUT_FILE]
   ./run.sh tokenizer export (builds tokenizer.bin)
   ./run.sh tokenizer test [-t TOKENIZER_BIN] [-i PROMPT] (builds and runs the C++ tokenizer test)
@@ -97,8 +97,8 @@ cmd_run() {
 
   # Mode-specific defaults for getp
   if [[ "${mode:-}" == "getp" ]]; then
-    [[ -z "${inp}" ]] && inp="data/input.txt"
-    [[ -z "${out}" ]] && out="data/output.txt"
+    [[ -z "${inp}" ]] && inp="tests/data/input.txt"
+    [[ -z "${out}" ]] && out="tests/data/output.txt"
   fi
 
   echo "[RUN] $(now)"
@@ -108,8 +108,8 @@ cmd_run() {
   print_kv "mode"          "${mode:-generate}" $([[ -z "${mode:-}" ]] && echo "(run.cpp default)" || echo "")
 
   if [[ "${mode:-}" == "getp" ]]; then
-    print_kv "input(-i)"  "${inp}"  $([[ "${inp}" == "data/input.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")
-    print_kv "output(-o)" "${out}"  $([[ "${out}" == "data/output.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")
+    print_kv "input(-i)"  "${inp}"  $([[ "${inp}" == "tests/data/input.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")
+    print_kv "output(-o)" "${out}"  $([[ "${out}" == "tests/data/output.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")
   else
     [[ -n "${inp:-}"  ]] && print_kv "input(-i)"  "${inp}" "(provided)"
     [[ -n "${out:-}"  ]] && print_kv "output(-o)" "${out}" "(provided)"
@@ -121,9 +121,9 @@ cmd_run() {
   print_kv "steps(-n)"     "${steps:-1024}" $([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")
   print_kv "seed(-s)"      "${seed:-time(NULL)}" $([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")
 
-  # Optional helpful hint if ./run doesn't exist or isn't executable
-  if [[ ! -x ./run ]]; then
-    echo "[hint] ./run not found or not executable. Build it via: ./run.sh build" >&2
+  # Optional helpful hint if build/run doesn't exist or isn't executable
+  if [[ ! -x build/run ]]; then
+    echo "[hint] build/run not found or not executable. Build it via: ./run.sh build" >&2
   fi
 
   # Build command line (only pass provided flags; plus getp defaults)
@@ -138,12 +138,12 @@ cmd_run() {
   [[ -n "${steps}" ]] && args+=(-n "${steps}")
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
 
-  echo "+ ./run \"${ckpt}\" ${args[*]:-}"
-  ./run "${ckpt}" "${args[@]:-}"
+  echo "+ build/run \"${ckpt}\" ${args[*]:-}"
+  build/run "${ckpt}" "${args[@]:-}"
 }
 
 cmd_decode() {
-  local infile="data/output.txt"
+  local infile="tests/data/output.txt"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -i) infile="$2"; shift 2 ;;
@@ -152,11 +152,11 @@ cmd_decode() {
     esac
   done
   echo "[DECODE] $(now)"
-  print_kv "input(-i)" "${infile}" $([[ "${infile}" == "data/output.txt" ]] && echo "(run.sh default)" || echo "(provided)")
+  print_kv "input(-i)" "${infile}" $([[ "${infile}" == "tests/data/output.txt" ]] && echo "(run.sh default)" || echo "(provided)")
   echo "+ make decode"
   make decode
-  echo "+ ./decode -1 -i \"${infile}\""
-  ./decode -1 -i "${infile}"
+  echo "+ build/decode -1 -i \"${infile}\""
+  build/decode -1 -i "${infile}"
 }
 
 cmd_tokenizer() {
@@ -169,7 +169,7 @@ cmd_tokenizer() {
       make tokenizer-bin
       ;;
     test)
-      local tokbin="tokenizer.bin"
+      local tokbin="build/tokenizer.bin"
       local prompt="Hello world"
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -180,17 +180,17 @@ cmd_tokenizer() {
         esac
       done
       echo "[TOKENIZER test] $(now)"
-      print_kv "tokbin" "${tokbin}" $([[ "${tokbin}" == "tokenizer.bin" ]] && echo "(default)" || echo "(provided)")
+      print_kv "tokbin" "${tokbin}" $([[ "${tokbin}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")
       print_kv "prompt" "${prompt}" $([[ "${prompt}" == "Hello world" ]] && echo "(default)" || echo "(provided)")
       echo "+ make tokenizer-test"
       make tokenizer-test
-      echo "+ ./test_tokenizer -t \"${tokbin}\" -i \"${prompt}\""
-      ./test_tokenizer -t "${tokbin}" -i "${prompt}"
+      echo "+ build/test_tokenizer -t \"${tokbin}\" -i \"${prompt}\""
+      build/test_tokenizer -t "${tokbin}" -i "${prompt}"
       ;;
     verify)
-      local bin="./test_tokenizer"
-      local tok="./tokenizer.bin"
-      local prompt="data/input.txt"
+      local bin="build/test_tokenizer"
+      local tok="build/tokenizer.bin"
+      local prompt="tests/data/input.txt"
       local verbose="--verbose"
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -203,12 +203,12 @@ cmd_tokenizer() {
         esac
       done
       echo "[TOKENIZER verify] $(now)"
-      print_kv "bin"    "${bin}" $([[ "${bin}" == "./test_tokenizer" ]] && echo "(default)" || echo "(provided)")
-      print_kv "tok"    "${tok}" $([[ "${tok}" == "./tokenizer.bin" ]] && echo "(default)" || echo "(provided)")
-      print_kv "prompt" "${prompt}" $([[ "${prompt}" == "data/input.txt" ]] && echo "(default)" || echo "(provided)")
+      print_kv "bin"    "${bin}" $([[ "${bin}" == "build/test_tokenizer" ]] && echo "(default)" || echo "(provided)")
+      print_kv "tok"    "${tok}" $([[ "${tok}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")
+      print_kv "prompt" "${prompt}" $([[ "${prompt}" == "tests/data/input.txt" ]] && echo "(default)" || echo "(provided)")
       print_kv "flags"  "${verbose:-<none>}"
-      echo "+ python3 test_tokenizer.py --bin \"${bin}\" --tok \"${tok}\" ${verbose} --prompt \"${prompt}\""
-      python3 test_tokenizer.py --bin "${bin}" --tok "${tok}" ${verbose} --prompt "${prompt}"
+      echo "+ python3 tests/test_tokenizer.py --bin \"${bin}\" --tok \"${tok}\" ${verbose} --prompt \"${prompt}\""
+      python3 tests/test_tokenizer.py --bin "${bin}" --tok "${tok}" ${verbose} --prompt "${prompt}"
       ;;
     *)
       echo "Usage: ./run.sh tokenizer {export|test|verify}"; exit 1 ;;
