@@ -92,6 +92,8 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
     long long num_token_out = 0;
+
+    // ! TODO: implement batch processing (only sequential now)
     for (int idx = 0; idx < requests->num_reqs; ++idx) {
         const char* input_seq = get_str_req_ptr(requests, idx);
         int* output_tokens = get_tok_gen_ptr(requests, idx);

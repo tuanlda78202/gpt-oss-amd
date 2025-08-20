@@ -6,6 +6,7 @@
 #ifndef GETP_EVAL
 #define GETP_EVAL
 
+// ! -----------------------------Request Management---------------------------------------
 typedef struct {
     int num_reqs;      // number of requests;
     int max_token_len; // maximum size of token
@@ -36,6 +37,7 @@ char* get_str_req_ptr(Requests* reqs, int idx) {
 
 int* get_tok_gen_ptr(Requests* reqs, int idx) { return reqs->tok_gens + idx * reqs->max_seq_len; }
 
+// ! ------------------------------File I/O---------------------------------------
 int read_inputfile(const char* input_filename, int max_token_len, int max_seq_len, Requests* reqs) {
     std::string filename = input_filename;
     int num_reqs = 0;
@@ -91,6 +93,7 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
     return 0;
 }
 
+// ! -----------------------------Eval Functions---------------------------------------
 void warm_up(Transformer* transformer, Tokenizer* tokenizer);
 void finish(Transformer* transformer, Tokenizer* tokenizer);
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sample,
@@ -98,6 +101,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
 void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* input_filename,
           char* output_filename, int steps) {
+    // ! I/O
     Requests requests;
     int num_reqs;
     if (steps == 0 || steps > transformer->config.seq_len)
@@ -113,13 +117,17 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
 
     long start, end;
 
+    // ! Warm up
     start = time_in_ms();
+    printf("🔥 warming up...\n");
     warm_up(transformer, tokenizer);
     end = time_in_ms();
     printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
+    // ! Inference
     start = time_in_ms();
+    printf("⚡️ running inference...\n");
     long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
     end = time_in_ms();
     // Your goal is to achieve best throughput(=reduce elapsed time)!
@@ -132,6 +140,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
         exit(EXIT_FAILURE);
     }
 
+    // ! Finish
     start = time_in_ms();
     finish(transformer, tokenizer);
     end = time_in_ms();

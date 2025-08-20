@@ -20,17 +20,20 @@
 
 #include "../include/tokenizer.hpp"
 
-// ----------------------------------------------------------------------------
+// ! -----------------------------------Data Structures-----------------------------------------
 
+// ! Model Hyperparameters
 typedef struct {
     // Model Config
     int vocab_size; // vocabulary size
     int hidden_dim; // model dim
+
     // MLP Config
     int n_experts;         // number of experts
     int experts_per_token; // num top-k
     int intermediate_dim;  // for ffn layers
     int n_layers;          // num hidden layers
+
     // Attention Config
     int head_dim;               // head dimension
     int n_attn_heads;           // number of query heads
@@ -44,12 +47,15 @@ typedef struct {
     float swiglu_limit;         // e.g., 7.0
 } Config;
 
+// ! Learned parameters
 typedef struct {
-    // token_embedding_table - embedding.weight
+    // token_embedding_table (2D (vocab_size, hidden_dim) -> flat to 1D) - embedding.weight
     float* token_embedding_table; // (vocab_size, hidden_dim) (in, out)
+
     // weights for rmsnorms
     float* rms_attn_w; // (n_layers, hidden_dim) [attn.norm.scale]
     float* rms_ffn_w;  // (n_layers, hidden_dim) [mlp.norm.scale]
+
     // weights for attention [attn.qkv.weight & attn.qkv.bias]
     float* w_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
                        // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
@@ -62,24 +68,30 @@ typedef struct {
                        // (head_dim * n_kv_heads)
     float* b_o;        // (n_layers, hidden_dim)
     float* attn_sinks; // (n_layers, n_attn_heads)
+
     // weights for router [mlp.gate.weight & mlp.gate.bias]
     float* w_router; // (n_layers, hidden_dim, n_experts)
     float* b_router; // (n_layers, n_experts)
+
     // weights for MoE [mlp.mlp1_weight & mlp.mlp1_bias & mlp.mlp2_weight &
     // mlp.mlp2_bias] NOTE: gate_up projects from hidden_dim to intermediate_dim,
     // the shape is kinda reverted because the original code use einsum to reduce
     // over hidden_dim
+
     float* w_mlp1; // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
                    // hidden_dim)
     float* w_mlp2; // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
     float* b_mlp1; // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
     float* b_mlp2; // down_proj (n_layers, n_experts, hidden_dim)
+
     // final norm [norm.scale]
     float* rms_out_w; // (hidden_dim, )
+
     // classifier weights for the logits [unembedding.weight]
     float* out; // (vocab_size, hidden_dim) (out, in)
 } TransformerWeights;
 
+// ! Scratch buffers for forward pass computation
 typedef struct {
     // current wave of activations
     float* x;            // activation at current time stamp (hidden_dim, )
@@ -101,12 +113,14 @@ typedef struct {
     float* v;      // value (n_kv_heads * head_dim,)
     float* att;    // buffer for scores/attention values (n_heads, seq_len)
     float* logits; // output logits
-    // kv cache
+
+    // ! kv cache (largest memory consumer)
     float* key_cache;   // (layer, seq_len, kv_dim)
     float* value_cache; // (layer, seq_len, kv_dim)
     float* mask;
 } RunState;
 
+// ! Main Transformer struct
 typedef struct {
     Config config;
     TransformerWeights weights;
@@ -116,6 +130,7 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
+// ! -----------------------------------Memory Management-----------------------------------------
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = p->head_dim * p->n_kv_heads;
@@ -155,6 +170,7 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+
     // initialize mask
     for (int i = 0; i < p->seq_len; i++) {
         for (int j = 0; j < p->seq_len; j++) {
@@ -233,6 +249,7 @@ void memory_map_weights(TransformerWeights* w, Config* cfg, float* ptr) {
     ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
+// ! -----------------------------------Model Loading-----------------------------------------
 void load_checkpoint(char* ckpt, Config* config, TransformerWeights* weights, int* fd, float** data,
                      ssize_t* file_size) {
     FILE* file = fopen(ckpt, "rb");
@@ -283,8 +300,9 @@ void load_checkpoint(char* ckpt, Config* config, TransformerWeights* weights, in
 
 void build_transformer(Transformer* t, char* ckpt_path) {
     // read in the Config and the Weights from the checkpoint
-    load_checkpoint(ckpt_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
-    malloc_run_state(&t->state, &t->config);
+    load_checkpoint(ckpt_path, &t->config, &t->weights, &t->fd, &t->data,
+                    &t->file_size);          // load model
+    malloc_run_state(&t->state, &t->config); // allocate buffers
 }
 
 void free_transformer(Transformer* t) {
@@ -295,12 +313,12 @@ void free_transformer(Transformer* t) {
     if (t->fd != -1) {
         close(t->fd);
     }
+
     // free the RunState buffers
     free_run_state(&t->state);
 }
 
-// ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the Transformer
+// ! -----------------------------------LLMs-----------------------------------
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
@@ -311,6 +329,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     ss /= size;
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
+
     // normalize and scale
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
@@ -368,7 +387,7 @@ int compare_desc(const void* a, const void* b) {
     return 0;
 }
 
-// topk function: returns top-k values and their indices
+// ! topk: returns top-k values and their indices (expert selection)
 void topk(float* topk_values, int* topk_indices, float* router_score, int num_experts,
           int experts_per_token) {
     if (num_experts <= 0 || experts_per_token <= 0 || experts_per_token > num_experts) {
@@ -402,6 +421,7 @@ void topk(float* topk_values, int* topk_indices, float* router_score, int num_ex
     free(pairs);
 }
 
+// ! RoPE
 void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_factor,
                                         float initial_context_length, float ntk_beta,
                                         float ntk_alpha, float* concentration_out,
@@ -499,6 +519,7 @@ void apply_rotary_emb(float* x, float* cos, float* sin, int n_heads, int head_di
     }
 }
 
+// ! FORWARD
 float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -513,31 +534,33 @@ float* forward(Transformer* transformer, int token, int pos) {
     int intermediate_dim = p->intermediate_dim;
     int n_experts = p->n_experts;
 
-    // copy the token embedding into x
+    // ! token embedding: copy the token embedding into x
     float* content_row = w->token_embedding_table + token * hidden_dim;
     memcpy(x, content_row, hidden_dim * sizeof(*x));
 
     // forward all the layers
     for (unsigned long long l = 0; l < p->n_layers; l++) {
-        // s->t (hidden_dim, )
+        // ! s->t (hidden_dim, )
         rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
-        // key and value point to the kv cache
+        // ! kv cache managerment: key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
-        // s->qkv = w->w_qkv * s->t = (head_dim * (n_attn_heads + 2 * n_kv_heads),
+        // ! qkv project: s->qkv = w->w_qkv * s->t = (head_dim * (n_attn_heads + 2 * n_kv_heads),
         // hidden_dim) * (hidden_dim, ) = head_dim * (n_attn_heads + 2 * n_kv_heads)
         float* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
         float* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
         matmul(s->qkv, s->t, w_qkv, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+
         // add bias
         for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
             s->qkv[i] += b_qkv[i];
         }
+
         // Separate q, k, v
         memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float)); // gate
         memcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
@@ -545,7 +568,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         memcpy(s->v, s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
                head_dim * p->n_kv_heads * sizeof(float)); // gate
 
-        // RoPE relative positional encoding: complex-valued rotate q and k in each
+        // ! RoPE relative positional encoding: complex-valued rotate q and k in each
         // head Adapted from
         // https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
         // RoPE with YaRN scaling adapted from Python code
@@ -561,56 +584,66 @@ float* forward(Transformer* transformer, int token, int pos) {
         free(cos_vals);
         free(sin_vals);
 
-        // multihead attention. iterate over all heads
+        // ! multihead attention. iterate over all heads
         int h;
 #pragma omp parallel for private(h)
         for (h = 0; h < p->n_attn_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_dim;
+
             // attention scores for this head
             float* att = s->att + h * p->seq_len;
+
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
                 // GQA
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+
                 // calculate the attention score as the dot product of q and k
                 double score = 0.0f;
                 for (int i = 0; i < head_dim; i++) {
-                    score += q[i] * k[i];
+                    score += q[i] * k[i]; // ! Dot product
                 }
                 score /= sqrtf(head_dim);
-                // Apply sliding window mask if enabled
+
+                // ! Apply sliding window mask if enabled
                 if (p->sliding_window > 0 && (l % 2 == 0)) {
                     score += s->mask[pos * p->seq_len + t];
                 }
+
                 // save the score to the attention buffer
                 att[t] = score;
             }
-            // Add attention sink score
+
+            // ! Add attention sink score
             att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
-            // softmax the scores to get attention weights, from 0..pos inclusively
+
+            // ! softmax the scores to get attention weights, from 0..pos inclusively
             softmax(att, pos + 2);
 
-            // weighted sum of the values
-            float* tb = s->tb + h * head_dim;
+            // ! weighted sum of the values
+            float* tb = s->tb + h * head_dim; // concat outputs from all attn_heads
             memset(tb, 0, head_dim * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
-                // GQA
+                // ! GQA
                 float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+
                 // get the attention weight for this timestep
                 float a = att[t];
+
                 // accumulate the weighted value into xb
                 for (int i = 0; i < head_dim; i++) {
                     tb[i] += a * v[i];
                 }
             }
         }
-        // final matmul to get the output of the attention
+        // ! linear: final matmul to get the output of the attention
         float* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         float* b_o = w->b_o + 1ll * l * hidden_dim;
         matmul(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
+
         // add bias b_o
         for (int i = 0; i < hidden_dim; i++) {
             s->tb2[i] += b_o[i];
@@ -621,29 +654,34 @@ float* forward(Transformer* transformer, int token, int pos) {
             x[i] += s->tb2[i];
         }
 
-        // ffn rmsnorm
+        // ! ffn rmsnorm
         rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
 
-        // MoE
+        // ! --------------------MoE--------------------
+        // ! Router
         // Compute router_score
         float* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         float* b_router = w->b_router + 1ll * l * n_experts;
         matmul(s->router_score, s->t, w_router, hidden_dim,
                n_experts); // s->router_score now stores router_score (n_experts, )
+
         // add bias b_router
         for (int i = 0; i < n_experts; i++) {
             s->router_score[i] += b_router[i];
         }
+
         // Select top-k experts
         topk(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
+
         // Normalize selected experts using softmax or sigmoid
         softmax(s->topk_v, p->experts_per_token); // expert
 
-        // Route the tokens to their corresponding top-k experts
+        // ! expert: Route the tokens to their corresponding top-k experts
         memset(s->e_agg, 0, hidden_dim * sizeof(float));
         for (int e = 0; e < n_experts; e++) {
             float expert_w = 0;
             int in_topk = 0;
+
             // Check if expert i is in top-k experts
             for (int idx = 0; idx < p->experts_per_token; idx++) {
                 if (s->topk_i[idx] == e) {
@@ -654,6 +692,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
 
             if (in_topk) {
+                // ! Linear 1 (Gated MLP)
                 float* w_mlp1 =
                     w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
                 float* b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
@@ -662,17 +701,20 @@ float* forward(Transformer* transformer, int token, int pos) {
                 for (int i = 0; i < 2 * p->intermediate_dim; i++) {
                     s->mlp1_out[i] += b_mlp1[i];
                 }
+
                 // Split mlp1_out into gate and up
                 for (int j = 0; j < p->intermediate_dim; j++) {
-                    s->gate[j] = s->mlp1_out[2 * j];
-                    s->up[j] = s->mlp1_out[2 * j + 1];
+                    s->gate[j] =
+                        s->mlp1_out[2 * j]; // even -> gate (controls what information flow through)
+                    s->up[j] = s->mlp1_out[2 * j + 1]; // odd -> up projection (feature transform)
                 }
 
-                // SwiGLU non-linearity
+                // ! SwiGLU non-linearity (SwiGLU(x) = Swish(gate(x)) ⊙ up(x))
                 const float alpha = 1.702f;
                 for (int i = 0; i < p->intermediate_dim; i++) {
                     float val = s->gate[i];
                     float up_val = s->up[i];
+
                     // Clamping
                     if (val > p->swiglu_limit)
                         val = p->swiglu_limit;
@@ -680,14 +722,16 @@ float* forward(Transformer* transformer, int token, int pos) {
                         up_val = p->swiglu_limit;
                     if (up_val < -p->swiglu_limit)
                         up_val = -p->swiglu_limit;
+
                     // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
                     val *= (1.0f / (1.0f + expf(-alpha * val)));
+
                     // elementwise multiply with w_gate(x)
                     val *= (up_val + 1.0f); // gpt-oss adds an extra bias of 1 to the up layer
                     s->gate_up[i] = val;
                 }
 
-                // final matmul to get the output of the ffn
+                // ! final matmul to get the output of the ffn (down project)
                 float* w_mlp2 =
                     w->w_mlp2 + 1ll * (l * n_experts + e) * hidden_dim *
                                     p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
@@ -698,22 +742,23 @@ float* forward(Transformer* transformer, int token, int pos) {
                     s->tb2[i] += b_mlp2[i];
                 }
 
-                // aggregate topk experts using weighted sum
+                // ! reduce: aggregate topk experts using weighted sum
                 for (int i = 0; i < hidden_dim; i++) {
                     s->e_agg[i] += s->tb2[i] * expert_w;
                 }
             }
         }
 
-        // residual connection
+        // ! residual connection (before rms2 to after MoE)
         for (int i = 0; i < hidden_dim; i++) {
             x[i] += s->e_agg[i];
         }
     }
-    // final rmsnorm
+
+    // ! final rmsnorm
     rmsnorm(x, x, w->rms_out_w, hidden_dim);
 
-    // classifier into logits
+    // ! linear: classifier into logits
     matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);
     return s->logits;
 }
@@ -721,7 +766,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
-// ----------------------------------------------------------------------------
+// ! ---------------------------------Sampling-------------------------------------------
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
@@ -852,10 +897,13 @@ int sample(Sampler* sampler, float* logits) {
         for (int q = 0; q < sampler->vocab_size; q++) {
             logits[q] /= sampler->temperature;
         }
+
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, sampler->vocab_size);
+
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&sampler->rng_state);
+
         // we sample from this distribution to get the next token
         if (sampler->topp <= 0 || sampler->topp >= 1) {
             // simply sample from the predicted probability distribution
@@ -869,7 +917,7 @@ int sample(Sampler* sampler, float* logits) {
     return next;
 }
 
-// ----------------------------------------------------------------------------
+// ! --------------------------------------------------------------------------------------
 // utilities: time
 
 long time_in_ms() {
@@ -879,8 +927,7 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-// ----------------------------------------------------------------------------
-// generation loop
+// ! ------------------------------------Generation----------------------------------------
 
 void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, const char* prompt,
               int steps) {
@@ -902,6 +949,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
     int* prompt_tokens =
         (int*)malloc((strlen(prompt) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
 
+    // ! tokenization
     encode(tokenizer, prompt, -1, -1, prompt_tokens, &num_prompt_tokens,
            transformer->config.initial_context_length);
     if (num_prompt_tokens < 1) {
@@ -975,7 +1023,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
     }
 }
 
-// ----------------------------------------------------------------------------
+// ! -----------------------------------Chat-----------------------------------------
 // chat loop
 // I manually inspected the tokens for a few chat conversations compared to
 // python reference and that seemed ok, but this was not thoroughly tested and
@@ -1073,7 +1121,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
 #include "getp-csrc/getp_eval.cpp"
 #include "getp-csrc/getp_run.cpp"
 
-// ----------------------------------------------------------------------------
+// ! --------------------------------CLI--------------------------------------------
 // CLI, include only if not testing
 #ifndef TESTING
 

@@ -77,3 +77,4 @@ build/
 
 # Stuff
 uv.lock
+.vscode/
