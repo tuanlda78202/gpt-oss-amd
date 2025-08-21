@@ -1,3 +1,5 @@
+# ! DO NOT MODIFY THIS FILE
+
 # Use hipcc by default.
 # If hipcc isn't available, fall back to g++.
 CC := $(shell command -v hipcc 2>/dev/null || echo g++)
@@ -6,7 +8,7 @@ ifneq ($(CC),g++)
 CFLAGS += --offload-arch=gfx90a
 endif
 
-CPP_FILES = src/run.cpp src/tokenizer.cpp src/sampler.cpp src/forward.cpp # ! TODO: need to remove later
+CPP_FILES = src/run.cpp src/tokenizer.cpp src/sampler.cpp src/forward.cpp # ! TODO: remember to remove later
 
 # Basic build that should work on most systems.
 .PHONY: run

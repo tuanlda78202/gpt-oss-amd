@@ -60,10 +60,15 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 
 ## build & run
 
+```bash
+chmod +x run.sh
+ln -s run.sh run
+```
+
 ### build
 
 ```bash
-./run.sh build [default|fast|omp]
+./runh build [default|fast|omp]
 ```
 
 ## run
@@ -71,19 +76,19 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 **Chat mode**
 
 ```bash
-./run.sh -m chat
+./run run -m chat
 ```
 
 **Single-prompt generate**
 
 ```bash
-./run.sh -m generate -i "Write a haiku about parallelism."
+./run run -m generate -i "Write a haiku about parallelism."
 ```
 
 **Batch evaluation**
 
 ```bash
-./run.sh -m getp
+./run run -m getp
 ```
 
 ---
@@ -101,7 +106,7 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 - Optimize across:
   - CPU threading (OpenMP/pthreads)
   - HIP kernels (coalescing, tiling, occupancy)
-  - Multi-GPU parallelization (pipeline/tensor-level where appropriate)
+  - Multi-GPU parallelization (pipeline/tensor-level)
 
 ---
 

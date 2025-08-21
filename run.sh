@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Default-if-unset, but allow user override: MODELBIN_ROOT=/my/path ./run.sh run
 : "${MODELBIN_ROOT:=/nfs/gpu_trainee/final-project/modelbin}"
 export MODELBIN_ROOT
 export OMP_NUM_THREADS=96
 
 usage() {
-  # Double-quoted to expand ${MODELBIN_ROOT} for clarity
   cat <<USAGE
 Usage:
   ./run.sh build [default|fast|omp]         (default: omp)

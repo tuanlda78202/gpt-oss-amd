@@ -1,3 +1,4 @@
+// ! DO NOT MODIFY THIS FILE
 /* Inference for gpt-oss model in pure C */
 
 #include <assert.h>

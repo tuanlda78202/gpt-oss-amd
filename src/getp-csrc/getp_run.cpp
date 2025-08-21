@@ -1,18 +1,14 @@
-// TODO: Modify this file to optimize end-to-end throughput
-#define GETP_SKIP_TYPEDEFS
-#include "getp_eval.cpp"
-#include "../../include/model.hpp"
-#include "../../include/tokenizer.hpp"
-#include "../../include/sampler.hpp"
+#pragma once
+
 #include "../../include/forward.hpp"
-// #include "../../include/utils.hpp"
-#include <cstring>
+#include "../../include/model.hpp"
+#include "../../include/sampler.hpp"
+#include "../../include/tokenizer.hpp"
+#include "getp_eval.cpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <omp.h>
-
-#ifndef GETP_RUN
-#define GETP_RUN
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // Do not inference here
@@ -113,5 +109,3 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     }
     return num_token_out;
 }
-
-#endif // GETP_RUN
