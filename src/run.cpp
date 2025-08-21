@@ -936,9 +936,9 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
         }
         pos++;
 
-        // data-dependent terminating condition: the BOS (=1) token delimits
-        // sequences
-        if (next == 1) {
+        // data-dependent terminating condition: the EOS (=199999 or =200002) token
+        // delimits sequences
+        if (next == 199999 || next == 200002) {
             break;
         }
 
