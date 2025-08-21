@@ -1,5 +1,13 @@
 // TODO: Modify this file to optimize end-to-end throughput
+#include "../../include/forward.hpp"
+#include "../../include/model.hpp"
+#include "../../include/sampler.hpp"
+#include "../../include/tokenizer.hpp"
 #include "getp_eval.cpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <omp.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
