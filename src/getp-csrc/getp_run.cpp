@@ -51,17 +51,17 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
         float* logits = forward(transformer, token, pos);
 
         // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
+        pos++;
+        if (pos < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next prompt
             // token
-            next = prompt_tokens[pos + 1];
+            next = prompt_tokens[pos];
         } else {
             // otherwise sample the next token from the logits
             next = sample(sampler, logits);
             // save the output token, it will be printed to file
-            output_tokens[pos - num_prompt_tokens - 1] = next;
+            output_tokens[pos - num_prompt_tokens] = next;
         }
-        pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits
         // sequences
@@ -82,18 +82,17 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     printf("\n");
 
     // Marker for end of sequence
-    output_tokens[pos - num_prompt_tokens] = -1;
+    output_tokens[pos - num_prompt_tokens + 1] = -1;
 
     free(prompt_tokens);
 
-    return pos - num_prompt_tokens;
+    return pos - num_prompt_tokens + 1;
 }
 
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
     long long num_token_out = 0;
 
-    // ! TODO: implement batch processing (only sequential now)
     for (int idx = 0; idx < requests->num_reqs; ++idx) {
         const char* input_seq = get_str_req_ptr(requests, idx);
         int* output_tokens = get_tok_gen_ptr(requests, idx);
