@@ -1,5 +1,12 @@
 # Data Flow
 
+- [Data Flow](#data-flow)
+  - [Entry point](#entry-point)
+  - [Batch Processing](#batch-processing)
+  - [Forward](#forward)
+  - [Memory Usage](#memory-usage)
+  - [Computational Hotspots](#computational-hotspots)
+  - [Visualization](#visualization)
 
 ## Entry point
 
@@ -64,15 +71,15 @@ Activations: ~hidden_dim × multiple buffers = ~10-100MB per request
 
 1. Matrix Multiplications (80% of time):
 
-- QKV projections: hidden_dim × (n_heads × head_dim)
-- Attention outputs: (n_heads × head_dim) × hidden_dim
-- MoE projections: hidden_dim × (2 × intermediate_dim) per expert
-- Final output: hidden_dim × vocab_size
+- QKV projections: `hidden_dim × (n_heads × head_dim)`
+- Attention outputs: `(n_heads × head_dim) × hidden_dim`
+- MoE projections: `hidden_dim × (2 × intermediate_dim)` per expert
+- Final output: `hidden_dim × vocab_size`
 
 2. Attention Computation (15% of time):
 
-- Q·K^T: seq_len × seq_len × n_heads × head_dim
-- Attention×V: seq_len × n_heads × head_dim
+- Q·K^T: `seq_len × seq_len × n_heads × head_dim`
+- Attention×V: `seq_len × n_heads × head_dim`
 
 3. Memory Bandwidth (5% of time):
 
