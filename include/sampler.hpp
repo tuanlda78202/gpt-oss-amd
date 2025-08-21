@@ -3,7 +3,7 @@
 typedef struct {
     float prob;
     int index;
-} OssProbIndex; // struct used when sorting probabilities during top-p sampling
+} OssProbIndex; // struct used when sorting probabilities in top-p sampling
 
 typedef struct {
     int vocab_size;
@@ -22,7 +22,7 @@ int compare_oss(const void* a, const void* b);
 int sample_topp_oss(float* probabilities, int n, float topp, OssProbIndex* probindex, float coin);
 
 void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, float topp,
-                   unsigned long long rng_seed);
+                       unsigned long long rng_seed);
 
 void free_sampler_oss(OssSampler* sampler);
 
