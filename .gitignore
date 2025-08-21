@@ -78,3 +78,4 @@ build/
 # Stuff
 uv.lock
 .vscode/
+output.txt
