@@ -7,7 +7,7 @@
 #include <omp.h>
 
 // ! -----------------------------------LLMs-----------------------------------
-void rmsnorm(float* o, float* x, float* weight, int size) {
+void rmsnorm_cpu(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     double ss = 0.0f;
     for (int j = 0; j < size; j++) {
@@ -23,7 +23,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     }
 }
 
-void softmax(float* x, int size) {
+void softmax_cpu(float* x, int size) {
     // find max value (for numerical stability)
     double max_val = x[0];
     for (int i = 1; i < size; i++) {
@@ -43,7 +43,7 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
+void matmul_cpu(float* xout, float* x, float* w, int n, int d) {
     // n := in_features, d := out_features
     // W (out,in) @ x (in,) -> xout (out,)
     // by far the most amount of time is spent inside this little function
@@ -59,8 +59,8 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 }
 
 // Comparator for descending sort (largest value first)
-int compare_desc(const void* a, const void* b) {
-    float diff = ((Pair*)b)->value - ((Pair*)a)->value;
+int compare_desc_cpu(const void* a, const void* b) {
+    float diff = ((OssPair*)b)->value - ((OssPair*)a)->value;
     if (diff > 0)
         return 1;
     if (diff < 0)
@@ -69,7 +69,7 @@ int compare_desc(const void* a, const void* b) {
 }
 
 // ! topk: returns top-k values and their indices (expert selection)
-void topk(float* topk_values, int* topk_indices, float* router_score, int num_experts,
+void topk_cpu(float* topk_values, int* topk_indices, float* router_score, int num_experts,
           int experts_per_token) {
     if (num_experts <= 0 || experts_per_token <= 0 || experts_per_token > num_experts) {
         fprintf(stderr, "Invalid parameters: num_experts=%d, experts_per_token=%d\n", num_experts,
@@ -81,7 +81,7 @@ void topk(float* topk_values, int* topk_indices, float* router_score, int num_ex
         return;
     }
     // Allocate temp array to store (value, index) pairs
-    Pair* pairs = reinterpret_cast<Pair*>(malloc(num_experts * sizeof(Pair)));
+    OssPair* pairs = reinterpret_cast<OssPair*>(malloc(num_experts * sizeof(OssPair)));
     if (!pairs) {
         fprintf(stderr, "Memory allocation failed for pairs\n");
         return;
@@ -92,7 +92,7 @@ void topk(float* topk_values, int* topk_indices, float* router_score, int num_ex
     }
 
     // Sort in descending order of value
-    qsort(pairs, num_experts, sizeof(Pair), compare_desc);
+    qsort(pairs, num_experts, sizeof(OssPair), compare_desc_cpu);
 
     // Fill output arrays
     for (int i = 0; i < experts_per_token; ++i) {
@@ -103,7 +103,7 @@ void topk(float* topk_values, int* topk_indices, float* router_score, int num_ex
 }
 
 // ! RoPE
-void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_factor,
+void compute_concentration_and_inv_freq_cpu(float base, int head_dim, float scaling_factor,
                                         float initial_context_length, float ntk_beta,
                                         float ntk_alpha, float* concentration_out,
                                         float* inv_freq_out // length head_dim/2
@@ -154,7 +154,7 @@ void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_
     free(freq);
 }
 
-void compute_cos_sin(int pos, // position index
+void compute_cos_sin_cpu(int pos, // position index
                      float base, int head_dim, float scaling_factor, float initial_context_length,
                      float ntk_beta, float ntk_alpha,
                      float* cos_out, // shape: head_dim/2
@@ -166,7 +166,7 @@ void compute_cos_sin(int pos, // position index
     float concentration;
     float* inv_freq = (float*)malloc(d_half * sizeof(float));
 
-    compute_concentration_and_inv_freq(base, head_dim, scaling_factor, initial_context_length,
+    compute_concentration_and_inv_freq_cpu(base, head_dim, scaling_factor, initial_context_length,
                                        ntk_beta, ntk_alpha, &concentration, inv_freq);
 
     // Compute cos and sin for this position
@@ -179,7 +179,7 @@ void compute_cos_sin(int pos, // position index
     free(inv_freq);
 }
 
-void apply_rotary_emb(float* x, float* cos, float* sin, int n_heads, int head_dim) {
+void apply_rotary_emb_cpu(float* x, float* cos, float* sin, int n_heads, int head_dim) {
     int half = head_dim / 2;
 
     for (int h = 0; h < n_heads; h++) {
@@ -201,10 +201,10 @@ void apply_rotary_emb(float* x, float* cos, float* sin, int n_heads, int head_di
 }
 
 // ! FORWARD
-float* forward(Transformer* transformer, int token, int pos) {
-    Config* p = &transformer->config;
-    TransformerWeights* w = &transformer->weights;
-    RunState* s = &transformer->state;
+float* forward_cpu(OssTransformer* transformer, int token, int pos) {
+    OssConfig* p = &transformer->config;
+    OssTransformerWeights* w = &transformer->weights;
+    OssRunState* s = &transformer->state;
 
     float* x = s->x;
     int head_dim = p->head_dim;
@@ -222,7 +222,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     // forward all the layers
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! s->t (hidden_dim, )
-        rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
+        rmsnorm_cpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
         // ! kv cache managerment: key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -235,7 +235,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
         float* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-        matmul(s->qkv, s->t, w_qkv, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        matmul_cpu(s->qkv, s->t, w_qkv, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
         // add bias
         for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
@@ -257,10 +257,10 @@ float* forward(Transformer* transformer, int token, int pos) {
         float ntk_alpha = 1.0f;
         float* cos_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
         float* sin_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
-        compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+        compute_cos_sin_cpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
                         p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
-        apply_rotary_emb(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
-        apply_rotary_emb(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
+        apply_rotary_emb_cpu(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
+        apply_rotary_emb_cpu(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
 
         free(cos_vals);
         free(sin_vals);
@@ -301,7 +301,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
 
             // ! softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 2);
+            softmax_cpu(att, pos + 2);
 
             // ! weighted sum of the values
             float* tb = s->tb + h * head_dim; // concat outputs from all attn_heads
@@ -323,7 +323,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         // ! linear: final matmul to get the output of the attention
         float* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         float* b_o = w->b_o + 1ll * l * hidden_dim;
-        matmul(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
+        matmul_cpu(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
 
         // add bias b_o
         for (int i = 0; i < hidden_dim; i++) {
@@ -336,14 +336,14 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // ! ffn rmsnorm
-        rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
+        rmsnorm_cpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
 
         // ! --------------------MoE--------------------
         // ! Router
         // Compute router_score
         float* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         float* b_router = w->b_router + 1ll * l * n_experts;
-        matmul(s->router_score, s->t, w_router, hidden_dim,
+        matmul_cpu(s->router_score, s->t, w_router, hidden_dim,
                n_experts); // s->router_score now stores router_score (n_experts, )
 
         // add bias b_router
@@ -352,10 +352,10 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // Select top-k experts
-        topk(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
+        topk_cpu(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
 
         // Normalize selected experts using softmax or sigmoid
-        softmax(s->topk_v, p->experts_per_token); // expert
+        softmax_cpu(s->topk_v, p->experts_per_token); // expert
 
         // ! expert: Route the tokens to their corresponding top-k experts
         memset(s->e_agg, 0, hidden_dim * sizeof(float));
@@ -377,7 +377,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 float* w_mlp1 =
                     w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
                 float* b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-                matmul(s->mlp1_out, s->t, w_mlp1, hidden_dim,
+                matmul_cpu(s->mlp1_out, s->t, w_mlp1, hidden_dim,
                        2 * p->intermediate_dim); // (2 * intermediate_dim, )
                 for (int i = 0; i < 2 * p->intermediate_dim; i++) {
                     s->mlp1_out[i] += b_mlp1[i];
@@ -417,7 +417,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                     w->w_mlp2 + 1ll * (l * n_experts + e) * hidden_dim *
                                     p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
                 float* b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
-                matmul(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
+                matmul_cpu(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
                        hidden_dim); // (hidden_dim, )
                 for (int i = 0; i < hidden_dim; i++) {
                     s->tb2[i] += b_mlp2[i];
@@ -437,9 +437,9 @@ float* forward(Transformer* transformer, int token, int pos) {
     }
 
     // ! final rmsnorm
-    rmsnorm(x, x, w->rms_out_w, hidden_dim);
+    rmsnorm_cpu(x, x, w->rms_out_w, hidden_dim);
 
     // ! linear: classifier into logits
-    matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);
+    matmul_cpu(s->logits, x, w->out, hidden_dim, p->vocab_size);
     return s->logits;
 }

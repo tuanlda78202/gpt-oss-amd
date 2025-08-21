@@ -2,10 +2,6 @@
 // #include <ctype.h>
 #include <stdlib.h>
 
-#ifndef MODEL_HPP
-#define MODEL_HPP
-
-// ! -----------------------------------Data Structures-----------------------------------------
 
 // ! Model Hyperparameters
 typedef struct {
@@ -30,7 +26,7 @@ typedef struct {
     float rope_scaling_factor;  // e.g., 32.0
     int sliding_window;         // e.g., 128
     float swiglu_limit;         // e.g., 7.0
-} Config;
+} OssConfig;
 
 // ! Learned parameters
 typedef struct {
@@ -74,7 +70,7 @@ typedef struct {
 
     // classifier weights for the logits [unembedding.weight]
     float* out; // (vocab_size, hidden_dim) (out, in)
-} TransformerWeights;
+} OssTransformerWeights;
 
 // ! Scratch buffers for forward pass computation
 typedef struct {
@@ -103,19 +99,17 @@ typedef struct {
     float* key_cache;   // (layer, seq_len, kv_dim)
     float* value_cache; // (layer, seq_len, kv_dim)
     float* mask;
-} RunState;
+} OssRunState;
 
 // ! Main Transformer struct
 typedef struct {
-    Config config;
-    TransformerWeights weights;
-    RunState state;    // buffers for the "wave" of activations in the forward pass
+    OssConfig config;
+    OssTransformerWeights weights;
+    OssRunState state;    // buffers for the "wave" of activations in the forward pass
     int fd;            // file descriptor for memory mapping
     float* data;       // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
-} Transformer;
+} OssTransformer;
 
-#endif
-
-void copy_transformer_to_device(Transformer* t_h, Transformer* t_d);
-void copy_weights_to_device(TransformerWeights* w_h, TransformerWeights* w_d);
+void copy_transformer_to_device(OssTransformer* t_h, OssTransformer* t_d);
+void copy_weights_to_device(OssTransformerWeights* w_h, OssTransformerWeights* w_d);
