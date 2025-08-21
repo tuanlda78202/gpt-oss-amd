@@ -1,9 +1,11 @@
+// ! Token Decoder
+
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 
-#include "tokenizer.hpp"
+#include "../include/tokenizer.hpp"
 
 void error_usage() {
     fprintf(stderr, "Usage:   decode <line_number> [options]\n<line_number> can "

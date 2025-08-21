@@ -1,8 +1,14 @@
-// TODO: Modify this file to optimize end-to-end throughput
-#include "getp_eval.cpp"
+#pragma once
 
-#ifndef GETP_RUN
-#define GETP_RUN
+#include "../../include/forward.hpp"
+#include "../../include/model.hpp"
+#include "../../include/sampler.hpp"
+#include "../../include/tokenizer.hpp"
+#include "getp_eval.cpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <omp.h>
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // Do not inference here
@@ -24,7 +30,17 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                                const char* input_seq, int* output_tokens, int steps) {
+    // <|start|>: 200006
+    // <|end|>: 200007
+    // <|return|>: 200002
+    // <|message|>: 200008
+    // <|channel|>: 200005
+    // <|constrain|>: 200003
+    // <|endoftext|>: 199999
+
     // Inference here
+    OssTransformer* transformer_oss = (OssTransformer*)transformer;
+    OssSampler* sampler_oss = (OssSampler*)sampler;
 
     const char* empty_prompt = "";
     if (input_seq == NULL) {
@@ -36,7 +52,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int* prompt_tokens =
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
-           transformer->config.initial_context_length);
+           transformer_oss->config.initial_context_length);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -48,24 +64,24 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int pos = 0;                  // position in the sequence
     while (pos < steps) {
         // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        float* logits = forward_cpu(transformer_oss, token, pos);
 
         // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
+        pos++;
+        if (pos < num_prompt_tokens) {
             // if we are still processing the input prompt, force the next prompt
             // token
-            next = prompt_tokens[pos + 1];
+            next = prompt_tokens[pos];
         } else {
             // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
+            next = sample_oss(sampler_oss, logits);
             // save the output token, it will be printed to file
-            output_tokens[pos - num_prompt_tokens - 1] = next;
+            output_tokens[pos - num_prompt_tokens] = next;
         }
-        pos++;
 
-        // data-dependent terminating condition: the BOS (=1) token delimits
-        // sequences
-        if (next == 1) {
+        // data-dependent terminating condition: the EOS (=199999 or =200002) token
+        // delimits sequences
+        if (next == 199999 || next == 200002) {
             break;
         }
 
@@ -82,16 +98,17 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     printf("\n");
 
     // Marker for end of sequence
-    output_tokens[pos - num_prompt_tokens] = -1;
+    output_tokens[pos - num_prompt_tokens + 1] = -1;
 
     free(prompt_tokens);
 
-    return pos - num_prompt_tokens;
+    return pos - num_prompt_tokens + 1;
 }
 
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
     long long num_token_out = 0;
+
     for (int idx = 0; idx < requests->num_reqs; ++idx) {
         const char* input_seq = get_str_req_ptr(requests, idx);
         int* output_tokens = get_tok_gen_ptr(requests, idx);
@@ -100,5 +117,3 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     }
     return num_token_out;
 }
-
-#endif // GETP_RUN

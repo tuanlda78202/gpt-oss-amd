@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Default-if-unset, but allow user override: MODELBIN_ROOT=/my/path ./run.sh run
 : "${MODELBIN_ROOT:=/nfs/gpu_trainee/final-project/modelbin}"
 export MODELBIN_ROOT
-export OMP_NUM_THREADS=48
+export OMP_NUM_THREADS=96
 
 usage() {
-  # Double-quoted to expand ${MODELBIN_ROOT} for clarity
   cat <<USAGE
 Usage:
   ./run.sh build [default|fast|omp]         (default: omp)
@@ -106,21 +104,21 @@ cmd_run() {
   print_kv "cwd"           "$(pwd)"
   print_kv "MODELBIN_ROOT" "${MODELBIN_ROOT:-<unset>}"
   print_kv "checkpoint"    "${ckpt}"
-  print_kv "mode"          "${mode:-generate}" $([[ -z "${mode:-}" ]] && echo "(run.cpp default)" || echo "")
+  print_kv "mode"          "${mode:-generate}" "$([[ -z "${mode:-}" ]] && echo "(run.cpp default)" || echo "")"
 
   if [[ "${mode:-}" == "getp" ]]; then
-    print_kv "input(-i)"  "${inp}"  $([[ "${inp}" == "tests/data/input.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")
-    print_kv "output(-o)" "${out}"  $([[ "${out}" == "tests/data/output.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")
+    print_kv "input(-i)"  "${inp}"  "$([[ "${inp}" == "tests/data/input.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
+    print_kv "output(-o)" "${out}"  "$([[ "${out}" == "tests/data/output.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
   else
     [[ -n "${inp:-}"  ]] && print_kv "input(-i)"  "${inp}" "(provided)"
     [[ -n "${out:-}"  ]] && print_kv "output(-o)" "${out}" "(provided)"
   fi
   print_kv "tokenizer(-z)" "${tok:-<unset>}"
   print_kv "system(-y)"    "${sys:-<unset>}"
-  print_kv "temp(-t)"      "${temp:-0.0}"   $([[ -z "${temp:-}" ]] && echo "(run.cpp default)" || echo "(provided)")
-  print_kv "top_p(-p)"     "${top_p:-0.9}"  $([[ -z "${top_p:-}" ]] && echo "(run.cpp default)" || echo "(provided)")
-  print_kv "steps(-n)"     "${steps:-1024}" $([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")
-  print_kv "seed(-s)"      "${seed:-time(NULL)}" $([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")
+  print_kv "temp(-t)"      "${temp:-0.0}"   "$([[ -z "${temp:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "top_p(-p)"     "${top_p:-0.9}"  "$([[ -z "${top_p:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "steps(-n)"     "${steps:-1024}" "$([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "seed(-s)"      "${seed:-time(NULL)}" "$([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
   if [[ ! -x build/run ]]; then
@@ -153,7 +151,7 @@ cmd_decode() {
     esac
   done
   echo "[DECODE] $(now)"
-  print_kv "input(-i)" "${infile}" $([[ "${infile}" == "tests/data/output.txt" ]] && echo "(run.sh default)" || echo "(provided)")
+  print_kv "input(-i)" "${infile}" "$([[ "${infile}" == "tests/data/output.txt" ]] && echo "(run.sh default)" || echo "(provided)")"
   echo "+ make decode"
   make decode
   echo "+ build/decode -1 -i \"${infile}\""
@@ -181,8 +179,8 @@ cmd_tokenizer() {
         esac
       done
       echo "[TOKENIZER test] $(now)"
-      print_kv "tokbin" "${tokbin}" $([[ "${tokbin}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")
-      print_kv "prompt" "${prompt}" $([[ "${prompt}" == "Hello world" ]] && echo "(default)" || echo "(provided)")
+      print_kv "tokbin" "${tokbin}" "$([[ "${tokbin}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")"
+      print_kv "prompt" "${prompt}" "$([[ "${prompt}" == "Hello world" ]] && echo "(default)" || echo "(provided)")"
       echo "+ make tokenizer-test"
       make tokenizer-test
       echo "+ build/test_tokenizer -t \"${tokbin}\" -i \"${prompt}\""
@@ -204,9 +202,9 @@ cmd_tokenizer() {
         esac
       done
       echo "[TOKENIZER verify] $(now)"
-      print_kv "bin"    "${bin}" $([[ "${bin}" == "build/test_tokenizer" ]] && echo "(default)" || echo "(provided)")
-      print_kv "tok"    "${tok}" $([[ "${tok}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")
-      print_kv "prompt" "${prompt}" $([[ "${prompt}" == "tests/data/input.txt" ]] && echo "(default)" || echo "(provided)")
+      print_kv "bin"    "${bin}" "$([[ "${bin}" == "build/test_tokenizer" ]] && echo "(default)" || echo "(provided)")"
+      print_kv "tok"    "${tok}" "$([[ "${tok}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")"
+      print_kv "prompt" "${prompt}" "$([[ "${prompt}" == "tests/data/input.txt" ]] && echo "(default)" || echo "(provided)")"
       print_kv "flags"  "${verbose:-<none>}"
       echo "+ python3 tests/test_tokenizer.py --bin \"${bin}\" --tok \"${tok}\" ${verbose} --prompt \"${prompt}\""
       python3 tests/test_tokenizer.py --bin "${bin}" --tok "${tok}" ${verbose} --prompt "${prompt}"

@@ -1,5 +1,4 @@
-#ifndef TOKENIZER_H
-#define TOKENIZER_H
+#pragma once
 
 #include <errno.h>
 #include <stdio.h>
@@ -7,14 +6,11 @@
 #include <string.h>
 
 // TokenIndex definition
-#ifndef TOKENINDEX_DEFINED
-#define TOKENINDEX_DEFINED
 typedef struct {
     const char* str;
     int len;
     int id;
 } TokenIndex;
-#endif // TOKENINDEX_DEFINED
 
 // Tokenizer struct
 typedef struct {
@@ -46,5 +42,3 @@ void encode(Tokenizer* t, const char* text, int bos_id, int eos_id, int* out, in
             int max_tokens);
 const char* decode_piece(Tokenizer* t, int prev_token, int token);
 void safe_printf(const char* s);
-
-#endif // TOKENIZER_H
