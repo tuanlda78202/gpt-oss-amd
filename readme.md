@@ -1,6 +1,6 @@
 <div align="center">
 
-# gpt-oss inference engine
+# gpt-oss-c
 
 [🌊 flow](#flow) | [🖥️ slurm](#slurm-cluster) | [⚒️ build & run](#build--run) | 🤗 <a href="https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4">hf</a> | 📑 <a href="https://openai.com/index/introducing-gpt-oss/">blog</a> |
 
