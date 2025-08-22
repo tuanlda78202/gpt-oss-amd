@@ -29,7 +29,6 @@
 //     }                                                                          \
 //   } while (0)
 
-
 // ! Model Hyperparameters
 typedef struct {
     // Model Config
@@ -203,7 +202,7 @@ typedef struct {
 typedef struct {
     OssConfig config;
     OssTransformerWeights weights;
-    OssRunState state;    // buffers for the "wave" of activations in the forward pass
+    OssRunState state; // buffers for the "wave" of activations in the forward pass
     int fd;            // file descriptor for memory mapping
     float* data;       // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes

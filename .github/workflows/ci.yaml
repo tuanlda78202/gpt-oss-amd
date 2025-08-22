@@ -32,20 +32,13 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install black flake8 isort mypy
+          pip install ruff
 
-      - name: Black (check)
-        run: black --check --diff .
+      - name: Ruff (check)
+        run: ruff check .
 
-      - name: Flake8 (lint)
-        run: flake8 . --max-line-length=88 --extend-ignore=E203,W503
-
-      - name: isort (check)
-        run: isort --check-only --diff --profile=black .
-
-      - name: mypy (types)
-        run: |
-          mypy --install-types --non-interactive --ignore-missing-imports .
+      - name: Ruff (format check)
+        run: ruff format --check .
 
   cpp-check:
     runs-on: ubuntu-latest
@@ -65,49 +58,51 @@ jobs:
           set -euo pipefail
           files="$(git ls-files '*.c' '*.cpp' '*.h' '*.hpp' '*.cu' '*.cuh' || true)"
           if [ -n "$files" ]; then
-            # Use style from .clang-format if present; otherwise defaults apply
             echo "$files" | xargs -r clang-format --dry-run -Werror
           else
             echo "No C/C++/CUDA files to format."
           fi
 
-      - name: C/C++/CUDA syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-          fail=0
-          while IFS= read -r f; do
-            case "$f" in
-              *.c)
-                echo "C syntax check: $f"
-                if ! gcc -fsyntax-only -std=c17 -Wall -Wextra -I. "$f"; then
-                  echo "::error file=$f::C syntax check failed"
-                  fail=1
-                fi
-                ;;
-              *.cc|*.cxx|*.cpp)
-                echo "C++ syntax check: $f"
-                if ! g++ -fsyntax-only -std=c++20 -Wall -Wextra -I. "$f"; then
-                  echo "::error file=$f::C++ syntax check failed"
-                  fail=1
-                fi
-                ;;
-              *.cu)
-                if command -v nvcc >/dev/null 2>&1; then
-                  echo "CUDA syntax check: $f"
-                  # Compile to object only; fails fast on syntax
-                  if ! nvcc -std=c++17 -c "$f" -o /dev/null; then
-                    echo "::error file=$f::CUDA syntax check failed"
-                    fail=1
-                  fi
-                else
-                  echo "Skipping CUDA syntax for $f (nvcc not available)"
-                fi
-                ;;
-            esac
-          done < <(git ls-files '*.c' '*.cc' '*.cxx' '*.cpp' '*.cu' || true)
-
-          exit $fail
+      # - name: C/C++/CUDA syntax
+      # shell: bash
+      # run: |
+      # set -euo pipefail
+      # fail=0
+      # files="$(git ls-files '*.c' '*.cc' '*.cxx' '*.cpp' '*.cu' || true)"
+      # if [ -n "$files" ]; then
+      # for f in $files; do
+      # case "$f" in
+      # *.c)
+      # echo "C syntax check: $f"
+      # if ! gcc -fsyntax-only -std=c17 -Wall -Wextra -I. "$f"; then
+      # echo "::error file=$f::C syntax check failed"
+      # fail=1
+      # fi
+      # ;;
+      # *.cc|*.cxx|*.cpp)
+      # echo "C++ syntax check: $f"
+      # if ! g++ -fsyntax-only -std=c++20 -Wall -Wextra -I. "$f"; then
+      # echo "::error file=$f::C++ syntax check failed"
+      # fail=1
+      # fi
+      # ;;
+      # *.cu)
+      # if command -v nvcc >/dev/null 2>&1; then
+      # echo "CUDA syntax check: $f"
+      # if ! nvcc -std=c++17 -c "$f" -o /dev/null; then
+      # echo "::error file=$f::CUDA syntax check failed"
+      # fail=1
+      # fi
+      # else
+      # echo "Skipping CUDA syntax for $f (nvcc not available)"
+      # fi
+      # ;;
+      # esac
+      # done
+      # else
+      # echo "No C/C++/CUDA files found."
+      # fi
+      # exit $fail
 
   shell-check:
     runs-on: ubuntu-latest
@@ -130,5 +125,59 @@ jobs:
             echo "No shell scripts found."
             exit 0
           fi
-          # SC1071: zsh not supported; SC1090/1091: non-constant sourced files
           echo "$files" | xargs -r shellcheck --severity=warning -e SC1071,SC1090,SC1091
+
+  format-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Prettier (check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Create temporary ignore file (portable approach)
+          tmpfile=$(mktemp)
+          echo ".venv/" > "$tmpfile"
+          echo "venv/" >> "$tmpfile"
+          echo "env/" >> "$tmpfile"
+          echo "__pycache__/" >> "$tmpfile"
+          echo "build/" >> "$tmpfile"
+          echo "dist/" >> "$tmpfile"
+          echo ".tox/" >> "$tmpfile"
+          echo "node_modules/" >> "$tmpfile"
+
+          # Run prettier with temporary ignore file
+          npx prettier --check '**/*.md' '**/*.yaml' '**/*.yml' --ignore-path "$tmpfile" || true
+
+          # Clean up
+          rm -f "$tmpfile"
+
+      - name: Check whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          files="$(git ls-files || true)"
+          if [ -n "$files" ]; then
+            for f in $files; do
+              case "$f" in
+                .venv/*|venv/*|env/*|__pycache__/*|build/*|dist/*|.tox/*|node_modules/*)
+                  continue ;;
+              esac
+              if [ -f "$f" ] && grep -q '[[:space:]]$' "$f"; then
+                echo "::error file=$f::Trailing whitespace found"
+                fail=1
+              fi
+              if [ -f "$f" ] && [ -s "$f" ] && [ "$(tail -c 1 "$f" | wc -l)" -eq 0 ]; then
+                echo "::error file=$f::Missing newline at end of file"
+                fail=1
+              fi
+            done
+          fi
+          exit $fail

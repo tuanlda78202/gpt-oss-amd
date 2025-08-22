@@ -1,9 +1,7 @@
 import os
 
 import torch
-from transformers import AutoModelForCausalLM
-from transformers import AutoTokenizer
-from transformers import TextStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
 # Threads
 os.environ.setdefault("OMP_NUM_THREADS", "16")
@@ -24,7 +22,7 @@ model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
     attn_implementation="eager",
 )
-model.to(torch.float32)
+model.to(torch.float32)  # type: ignore[arg-type]
 
 prompt = "Tell me a joke"
 enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)

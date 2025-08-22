@@ -25,8 +25,8 @@ import struct
 from typing import Callable, Dict, List
 
 import numpy as np
-from safetensors.torch import safe_open
 import torch
+from safetensors.torch import safe_open
 
 # ---- Config keys & ordering buckets ----
 
@@ -100,9 +100,9 @@ def dequantize_fp4(
 ) -> torch.Tensor:
     """Dequantize MXFP4 blocks/scales into `dtype` (default bfloat16)"""
     scales = scales.to(torch.int32) - 127
-    assert (
-        blocks.shape[:-1] == scales.shape
-    ), f"{blocks.shape=} does not match {scales.shape=}"
+    assert blocks.shape[:-1] == scales.shape, (
+        f"{blocks.shape=} does not match {scales.shape=}"
+    )
     lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
 
     *prefix_shape, G, B = blocks.shape
@@ -151,7 +151,8 @@ def collect_effective_keys(f) -> Dict[str, TensorProvider]:
     Build a mapping:
       effective_name -> TensorProvider
     where:
-      - If we see "X.blocks" and "X.scales", we expose "X" that returns dequantized tensor.
+      - If we see "X.blocks" and "X.scales", we expose "X" that returns
+        dequantized tensor.
       - We skip publishing ".scales" keys themselves.
       - All other keys are exposed as-is.
     """
@@ -259,7 +260,8 @@ def write_weights_streaming(
 
     for name in ordered_keys:
         tens = providers[name].load().to(torch_cast).cpu()
-        # For bfloat16, write the raw 16-bit payload (view as uint16) to avoid accidental conversion.
+        # For bfloat16, write the raw 16-bit payload (view as uint16) to avoid
+        # accidental conversion.
         if torch_cast == torch.bfloat16:
             np_arr = tens.view(torch.uint16).numpy().astype(np.uint16, copy=False)
         else:

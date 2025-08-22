@@ -11,9 +11,6 @@
 #include <cstdlib>
 #include <omp.h>
 
-#ifndef GETP_RUN
-#define GETP_RUN
-
 OssTransformer* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
@@ -42,6 +39,14 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                                const char* input_seq, int* output_tokens, int steps) {
+    // <|start|>: 200006
+    // <|end|>: 200007
+    // <|return|>: 200002
+    // <|message|>: 200008
+    // <|channel|>: 200005
+    // <|constrain|>: 200003
+    // <|endoftext|>: 199999
+
     // Inference here
     OssSampler* sampler_oss = (OssSampler*)sampler;
 
@@ -58,6 +63,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
            t_d->config.initial_context_length);
+  
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -84,9 +90,9 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
             output_tokens[pos - num_prompt_tokens] = next;
         }
 
-        // data-dependent terminating condition: the BOS (=1) token delimits
-        // sequences
-        if (next == 1) {
+        // data-dependent terminating condition: the EOS (=199999 or =200002) token
+        // delimits sequences
+        if (next == 199999 || next == 200002) {
             break;
         }
 
@@ -122,5 +128,3 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     }
     return num_token_out;
 }
-
-#endif // GETP_RUN

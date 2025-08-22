@@ -31,12 +31,14 @@ void softmax_cpu(float* x, int size) {
             max_val = x[i];
         }
     }
+
     // exp and sum
     double sum = 0.0f;
     for (int i = 0; i < size; i++) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
     }
+
     // normalize
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
@@ -70,7 +72,7 @@ int compare_desc_cpu(const void* a, const void* b) {
 
 // ! topk: returns top-k values and their indices (expert selection)
 void topk_cpu(float* topk_values, int* topk_indices, float* router_score, int num_experts,
-          int experts_per_token) {
+              int experts_per_token) {
     if (num_experts <= 0 || experts_per_token <= 0 || experts_per_token > num_experts) {
         fprintf(stderr, "Invalid parameters: num_experts=%d, experts_per_token=%d\n", num_experts,
                 experts_per_token);
@@ -80,6 +82,7 @@ void topk_cpu(float* topk_values, int* topk_indices, float* router_score, int nu
         fprintf(stderr, "Null pointer detected in topk\n");
         return;
     }
+
     // Allocate temp array to store (value, index) pairs
     OssPair* pairs = reinterpret_cast<OssPair*>(malloc(num_experts * sizeof(OssPair)));
     if (!pairs) {
@@ -104,9 +107,9 @@ void topk_cpu(float* topk_values, int* topk_indices, float* router_score, int nu
 
 // ! RoPE
 void compute_concentration_and_inv_freq_cpu(float base, int head_dim, float scaling_factor,
-                                        float initial_context_length, float ntk_beta,
-                                        float ntk_alpha, float* concentration_out,
-                                        float* inv_freq_out // length head_dim/2
+                                            float initial_context_length, float ntk_beta,
+                                            float ntk_alpha, float* concentration_out,
+                                            float* inv_freq_out // length head_dim/2
 ) {
     int d_half = head_dim / 2;
 
@@ -155,10 +158,10 @@ void compute_concentration_and_inv_freq_cpu(float base, int head_dim, float scal
 }
 
 void compute_cos_sin_cpu(int pos, // position index
-                     float base, int head_dim, float scaling_factor, float initial_context_length,
-                     float ntk_beta, float ntk_alpha,
-                     float* cos_out, // shape: head_dim/2
-                     float* sin_out  // shape: head_dim/2
+                         float base, int head_dim, float scaling_factor,
+                         float initial_context_length, float ntk_beta, float ntk_alpha,
+                         float* cos_out, // shape: head_dim/2
+                         float* sin_out  // shape: head_dim/2
 ) {
     int d_half = head_dim / 2;
 
@@ -167,7 +170,7 @@ void compute_cos_sin_cpu(int pos, // position index
     float* inv_freq = (float*)malloc(d_half * sizeof(float));
 
     compute_concentration_and_inv_freq_cpu(base, head_dim, scaling_factor, initial_context_length,
-                                       ntk_beta, ntk_alpha, &concentration, inv_freq);
+                                           ntk_beta, ntk_alpha, &concentration, inv_freq);
 
     // Compute cos and sin for this position
     for (int j = 0; j < d_half; j++) {
@@ -235,7 +238,9 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
         float* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-        matmul_cpu(s->qkv, s->t, w_qkv, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+      
+        matmul_cpu(s->qkv, s->t, w_qkv, hidden_dim,
+                   (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
         // add bias
         for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
@@ -258,7 +263,7 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         float* cos_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
         float* sin_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
         compute_cos_sin_cpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                        p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
+                            p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
         apply_rotary_emb_cpu(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
         apply_rotary_emb_cpu(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
 
@@ -344,7 +349,7 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         float* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         float* b_router = w->b_router + 1ll * l * n_experts;
         matmul_cpu(s->router_score, s->t, w_router, hidden_dim,
-               n_experts); // s->router_score now stores router_score (n_experts, )
+                   n_experts); // s->router_score now stores router_score (n_experts, )
 
         // add bias b_router
         for (int i = 0; i < n_experts; i++) {
@@ -378,7 +383,7 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                     w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
                 float* b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
                 matmul_cpu(s->mlp1_out, s->t, w_mlp1, hidden_dim,
-                       2 * p->intermediate_dim); // (2 * intermediate_dim, )
+                           2 * p->intermediate_dim); // (2 * intermediate_dim, )
                 for (int i = 0; i < 2 * p->intermediate_dim; i++) {
                     s->mlp1_out[i] += b_mlp1[i];
                 }
@@ -418,7 +423,7 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                                     p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
                 float* b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
                 matmul_cpu(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
-                       hidden_dim); // (hidden_dim, )
+                           hidden_dim); // (hidden_dim, )
                 for (int i = 0; i < hidden_dim; i++) {
                     s->tb2[i] += b_mlp2[i];
                 }

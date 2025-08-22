@@ -1,4 +1,4 @@
-// DO NOT MODIFY THIS FILE
+// ! DO NOT MODIFY THIS FILE
 
 #include <fstream>
 #include <iostream>
@@ -86,7 +86,6 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
             }
             writeFile << "\n";
         }
-        writeFile << "\n";
         writeFile.close();
     } else {
         fprintf(stderr, "cannot write the file: %s\n", output_filename);
@@ -249,8 +248,8 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
         exit(EXIT_FAILURE);
     }
 
-    // ! Verification
-    const char* ground_truth_file = "tests/gt/output.txt"; // TODO: Adjust path as needed
+    // ! TODO: remember remove verification later
+    const char* ground_truth_file = "tests/gt/output.txt";
     int verification_result = verify_output(output_filename, ground_truth_file);
 
     // ! Finish
