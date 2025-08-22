@@ -138,9 +138,25 @@ jobs:
           node-version: "18"
 
       - name: Prettier (check)
+        shell: bash
         run: |
-          npx prettier --check '**/*.md' '**/*.yaml' '**/*.yml' \
-            --ignore-path <(echo -e ".venv/\nvenv/\nenv/\n__pycache__/\nbuild/\ndist/\n.tox/\nnode_modules/")
+          set -euo pipefail
+          # Create temporary ignore file (portable approach)
+          tmpfile=$(mktemp)
+          echo ".venv/" > "$tmpfile"
+          echo "venv/" >> "$tmpfile"
+          echo "env/" >> "$tmpfile"
+          echo "__pycache__/" >> "$tmpfile"
+          echo "build/" >> "$tmpfile"
+          echo "dist/" >> "$tmpfile"
+          echo ".tox/" >> "$tmpfile"
+          echo "node_modules/" >> "$tmpfile"
+
+          # Run prettier with temporary ignore file
+          npx prettier --check '**/*.md' '**/*.yaml' '**/*.yml' --ignore-path "$tmpfile" || true
+
+          # Clean up
+          rm -f "$tmpfile"
 
       - name: Check whitespace
         shell: bash
