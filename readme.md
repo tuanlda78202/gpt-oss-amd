@@ -220,6 +220,9 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 ## build & run
 
 ```bash
+uv sync
+pre-commit install
+
 chmod +x run.sh
 ln -s run.sh run
 ```
