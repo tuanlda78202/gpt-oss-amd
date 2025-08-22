@@ -1,14 +1,17 @@
-#pragma once
-
-#include "../../include/forward.hpp"
-#include "../../include/model.hpp"
-#include "../../include/sampler.hpp"
-#include "../../include/tokenizer.hpp"
+// TODO: Modify this file to optimize end-to-end throughput
+#define GETP_SKIP_TYPEDEFS
 #include "getp_eval.cpp"
+#include "../model.cpp"
+#include "../../include/tokenizer.hpp"
+#include "../sampler.cpp"
+#include "../forward.cpp"
+
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <omp.h>
+
+OssTransformer* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // Do not inference here
@@ -17,6 +20,9 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // - Memory allocation
     // - Load model
     // - ...
+    // OssTransformer* transformer_oss = (OssTransformer*)transformer;
+
+    // copy_transformer_to_device(transformer_oss, t_d);
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
@@ -26,6 +32,9 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     // - Memory deallocation
     // - Unload model
     // - ...
+
+    
+    // free_transformer_on_device(t_d);
 }
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
@@ -39,8 +48,9 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     // <|endoftext|>: 199999
 
     // Inference here
-    OssTransformer* transformer_oss = (OssTransformer*)transformer;
     OssSampler* sampler_oss = (OssSampler*)sampler;
+
+    t_d = (OssTransformer*)transformer;  // ! TODO: replace this with allocation on device
 
     const char* empty_prompt = "";
     if (input_seq == NULL) {
@@ -52,7 +62,8 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int* prompt_tokens =
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
-           transformer_oss->config.initial_context_length);
+           t_d->config.initial_context_length);
+  
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -64,7 +75,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int pos = 0;                  // position in the sequence
     while (pos < steps) {
         // forward the transformer to get logits for the next token
-        float* logits = forward_cpu(transformer_oss, token, pos);
+        float* logits = forward_cpu(t_d, token, pos);
 
         // advance the state machine
         pos++;

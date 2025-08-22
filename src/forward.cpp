@@ -238,6 +238,7 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
         float* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+      
         matmul_cpu(s->qkv, s->t, w_qkv, hidden_dim,
                    (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 

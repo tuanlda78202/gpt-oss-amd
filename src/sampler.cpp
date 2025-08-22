@@ -98,15 +98,16 @@ void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, f
 
 void free_sampler_oss(OssSampler* sampler) { free(sampler->probindex); }
 
-inline unsigned int random_u32(unsigned long long* state) {
+unsigned int random_u32_oss(unsigned long long* state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
     *state ^= *state << 25;
     *state ^= *state >> 27;
     return (*state * 0x2545F4914F6CDD1Dull) >> 32;
 }
-inline float random_f32(unsigned long long* state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
+
+float random_f32_oss(unsigned long long* state) { // random float32 in [0,1)
+    return (random_u32_oss(state) >> 8) / 16777216.0f;
 }
 
 int sample_oss(OssSampler* sampler, float* logits) {
@@ -125,7 +126,7 @@ int sample_oss(OssSampler* sampler, float* logits) {
         softmax_cpu(logits, sampler->vocab_size);
 
         // flip a (float) coin (this is our source of entropy for sampling)
-        float coin = random_f32(&sampler->rng_state);
+        float coin = random_f32_oss(&sampler->rng_state);
 
         // we sample from this distribution to get the next token
         if (sampler->topp <= 0 || sampler->topp >= 1) {

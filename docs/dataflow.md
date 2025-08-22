@@ -87,8 +87,6 @@ Activations: ~hidden_dim × multiple buffers = ~10-100MB per request
 - Weight loading
 - Activation transfers
 
-## Visualization
-
 ## Modularization
 
 ```mermaid

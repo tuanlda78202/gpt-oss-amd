@@ -8,7 +8,7 @@ ifneq ($(CC),g++)
 CFLAGS += --offload-arch=gfx90a
 endif
 
-CPP_FILES = src/run.cpp src/tokenizer.cpp src/sampler.cpp src/forward.cpp # ! TODO: remember to remove later
+CPP_FILES = src/run.cpp src/tokenizer.cpp
 
 # Basic build that should work on most systems.
 .PHONY: run
