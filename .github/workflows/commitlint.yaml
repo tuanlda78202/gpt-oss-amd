@@ -17,3 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: wagoid/commitlint-github-action@v6
+# feat: New features
+# fix: Bug fixes
+# docs: Documentation changes
+# style: Code style changes (formatting, etc.)
+# refactor: Code refactoring
+# test: Adding or updating tests
+# chore: Routine tasks, maintenance
+# ci: CI/CD related changes
+# build: Build system or dependency changes
+# perf: Performance improvements
+# revert: Reverting previous commits

@@ -26,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "tokenizer.hpp"
+#include "../include/tokenizer.hpp"
 
 // ---------- Exit codes ----------
 enum { EXIT_OK = 0, EXIT_USAGE = 2, EXIT_IO = 3, EXIT_BADFILE = 4, EXIT_NOMEM = 5 };

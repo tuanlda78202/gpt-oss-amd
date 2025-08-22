@@ -1,10 +1,8 @@
 import argparse
 from collections import OrderedDict
 
-from safetensors.torch import load_file
-from safetensors.torch import safe_open
-from safetensors.torch import save_file
 import torch
+from safetensors.torch import load_file, safe_open, save_file
 
 
 def convert_keys(state_dict_b):
@@ -97,7 +95,9 @@ def parseCLIArgs():
         "--output",
         type=str,
         default="model.safetensors",
-        help="Path to save the converted .safetensors file (default: model.safetensors)",
+        help=(
+            "Path to save the converted .safetensors file (default: model.safetensors)"
+        ),
     )
     return parser.parse_args()
 
