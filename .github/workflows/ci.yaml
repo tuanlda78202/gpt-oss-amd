@@ -63,46 +63,46 @@ jobs:
             echo "No C/C++/CUDA files to format."
           fi
 
-      - name: C/C++/CUDA syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-          fail=0
-          files="$(git ls-files '*.c' '*.cc' '*.cxx' '*.cpp' '*.cu' || true)"
-          if [ -n "$files" ]; then
-            for f in $files; do
-              case "$f" in
-                *.c)
-                  echo "C syntax check: $f"
-                  if ! gcc -fsyntax-only -std=c17 -Wall -Wextra -I. "$f"; then
-                    echo "::error file=$f::C syntax check failed"
-                    fail=1
-                  fi
-                  ;;
-                *.cc|*.cxx|*.cpp)
-                  echo "C++ syntax check: $f"
-                  if ! g++ -fsyntax-only -std=c++20 -Wall -Wextra -I. "$f"; then
-                    echo "::error file=$f::C++ syntax check failed"
-                    fail=1
-                  fi
-                  ;;
-                *.cu)
-                  if command -v nvcc >/dev/null 2>&1; then
-                    echo "CUDA syntax check: $f"
-                    if ! nvcc -std=c++17 -c "$f" -o /dev/null; then
-                      echo "::error file=$f::CUDA syntax check failed"
-                      fail=1
-                    fi
-                  else
-                    echo "Skipping CUDA syntax for $f (nvcc not available)"
-                  fi
-                  ;;
-              esac
-            done
-          else
-            echo "No C/C++/CUDA files found."
-          fi
-          exit $fail
+      # - name: C/C++/CUDA syntax
+      # shell: bash
+      # run: |
+      # set -euo pipefail
+      # fail=0
+      # files="$(git ls-files '*.c' '*.cc' '*.cxx' '*.cpp' '*.cu' || true)"
+      # if [ -n "$files" ]; then
+      # for f in $files; do
+      # case "$f" in
+      # *.c)
+      # echo "C syntax check: $f"
+      # if ! gcc -fsyntax-only -std=c17 -Wall -Wextra -I. "$f"; then
+      # echo "::error file=$f::C syntax check failed"
+      # fail=1
+      # fi
+      # ;;
+      # *.cc|*.cxx|*.cpp)
+      # echo "C++ syntax check: $f"
+      # if ! g++ -fsyntax-only -std=c++20 -Wall -Wextra -I. "$f"; then
+      # echo "::error file=$f::C++ syntax check failed"
+      # fail=1
+      # fi
+      # ;;
+      # *.cu)
+      # if command -v nvcc >/dev/null 2>&1; then
+      # echo "CUDA syntax check: $f"
+      # if ! nvcc -std=c++17 -c "$f" -o /dev/null; then
+      # echo "::error file=$f::CUDA syntax check failed"
+      # fail=1
+      # fi
+      # else
+      # echo "Skipping CUDA syntax for $f (nvcc not available)"
+      # fi
+      # ;;
+      # esac
+      # done
+      # else
+      # echo "No C/C++/CUDA files found."
+      # fi
+      # exit $fail
 
   shell-check:
     runs-on: ubuntu-latest

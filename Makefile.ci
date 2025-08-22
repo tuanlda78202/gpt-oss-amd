@@ -1,5 +1,5 @@
 # ci.Makefile - Local CI checks and fixes
-# Run 'make -f .github/ci.Makefile help' to see available targets
+# Run 'make -f ci.Makefile help' to see available targets
 
 .PHONY: help check fix check-all fix-all
 .PHONY: check-python fix-python check-cpp fix-cpp check-shell check-pre-commit fix-pre-commit
