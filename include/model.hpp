@@ -1,8 +1,8 @@
 #pragma once
 // #include <ctype.h>
-#include <stdlib.h>
-#include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <stdlib.h>
 
 #define MAX_NUM_SUPPORTED_GPUS 32
 #define WARP_SIZE 64
@@ -108,14 +108,14 @@ typedef struct {
 
     // weights for attention [attn.qkv.weight & attn.qkv.bias]
     __half* w_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
-                       // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
-                       // (out_features, in_features) w_k (head_dim * n_kv_heads,
-                       // hidden_dim)  (out_features, in_features) w_v (head_dim *
-                       // n_kv_heads, hidden_dim)  (out_features, in_features)
+                        // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
+                        // (out_features, in_features) w_k (head_dim * n_kv_heads,
+                        // hidden_dim)  (out_features, in_features) w_v (head_dim *
+                        // n_kv_heads, hidden_dim)  (out_features, in_features)
     __half* w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
     __half* b_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
-                       // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
-                       // (head_dim * n_kv_heads)
+                        // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
+                        // (head_dim * n_kv_heads)
     __half* b_o;        // (n_layers, hidden_dim)
     __half* attn_sinks; // (n_layers, n_attn_heads)
 
@@ -129,7 +129,7 @@ typedef struct {
     // over hidden_dim
 
     __half* w_mlp1; // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
-                   // hidden_dim)
+                    // hidden_dim)
     __half* w_mlp2; // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
     __half* b_mlp1; // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
     __half* b_mlp2; // down_proj (n_layers, n_experts, hidden_dim)
@@ -178,14 +178,14 @@ typedef struct {
     __half* tb2;          // (hidden_dim, )
     __half* router_score; // router score (n_experts, )
     __half* topk_v;       // topk expert weights (experts_per_token, )
-    int* topk_i;         // topk expert indices (experts_per_token, )
+    int* topk_i;          // topk expert indices (experts_per_token, )
     __half* mlp1_out;
     __half* gate;
     __half* up;
     __half* gate_up;
     __half* e_agg;
     __half* qkv;    // an additional buffer just for convenience (head_dim *
-                   // (n_attn_heads + 2 * n_kv_heads), )
+                    // (n_attn_heads + 2 * n_kv_heads), )
     __half* q;      // query (n_attn_heads * head_dim,)
     __half* k;      // key (n_kv_heads * head_dim,)
     __half* v;      // value (n_kv_heads * head_dim,)

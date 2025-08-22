@@ -1,14 +1,14 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #define GETP_SKIP_TYPEDEFS
-#include "getp_eval.cpp"
-#include "../model.cpp"
 #include "../../include/tokenizer.hpp"
-#include "../sampler.cpp"
 #include "../forward.cpp"
+#include "../model.cpp"
+#include "../sampler.cpp"
+#include "getp_eval.cpp"
 
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <omp.h>
 
 OssTransformer* t_d;
@@ -33,7 +33,6 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     // - Unload model
     // - ...
 
-    
     // free_transformer_on_device(t_d);
 }
 
@@ -50,7 +49,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     // Inference here
     OssSampler* sampler_oss = (OssSampler*)sampler;
 
-    t_d = (OssTransformer*)transformer;  // ! TODO: replace this with allocation on device
+    t_d = (OssTransformer*)transformer; // ! TODO: replace this with allocation on device
 
     const char* empty_prompt = "";
     if (input_seq == NULL) {
@@ -63,7 +62,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
            t_d->config.initial_context_length);
-  
+
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);

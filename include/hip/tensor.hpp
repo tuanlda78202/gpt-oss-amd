@@ -1,10 +1,10 @@
 #pragma once
 
 #include <cstdio>
-#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <hip/hip_runtime.h>
+#include <vector>
 
 using namespace std;
 
