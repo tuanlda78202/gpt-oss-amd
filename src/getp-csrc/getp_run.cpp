@@ -41,6 +41,14 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                                const char* input_seq, int* output_tokens, int steps) {
+    // <|start|>: 200006
+    // <|end|>: 200007
+    // <|return|>: 200002
+    // <|message|>: 200008
+    // <|channel|>: 200005
+    // <|constrain|>: 200003
+    // <|endoftext|>: 199999
+
     // Inference here
     OssSampler* sampler_oss = (OssSampler*)sampler;
 
@@ -84,9 +92,9 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
             output_tokens[pos - num_prompt_tokens] = next;
         }
 
-        // data-dependent terminating condition: the BOS (=1) token delimits
-        // sequences
-        if (next == 1) {
+        // data-dependent terminating condition: the EOS (=199999 or =200002) token
+        // delimits sequences
+        if (next == 199999 || next == 200002) {
             break;
         }
 
