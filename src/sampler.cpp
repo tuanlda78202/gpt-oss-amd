@@ -86,7 +86,7 @@ int sample_topp_oss(float* probabilities, int n, float topp, OssProbIndex* probi
 }
 
 void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, float topp,
-                   unsigned long long rng_seed) {
+                       unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
     sampler->topp = topp;
@@ -133,8 +133,8 @@ int sample_oss(OssSampler* sampler, float* logits) {
             next = sample_mult_oss(logits, sampler->vocab_size, coin);
         } else {
             // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next =
-                sample_topp_oss(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+            next = sample_topp_oss(logits, sampler->vocab_size, sampler->topp, sampler->probindex,
+                                   coin);
         }
     }
     return next;

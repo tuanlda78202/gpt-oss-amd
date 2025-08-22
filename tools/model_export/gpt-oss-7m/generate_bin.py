@@ -1,14 +1,14 @@
 # Wrapping config and weights in to a .bin file
 
 import argparse
-from collections import OrderedDict
 import json
 import re
 import struct
+from collections import OrderedDict
 
 import numpy as np
-from safetensors.torch import load_file
 import torch
+from safetensors.torch import load_file
 
 # Explicit list to ensure correct keys order
 KEYS = [
@@ -127,5 +127,5 @@ if __name__ == "__main__":
     state_dict = load_file(inp)
     weights_bin = binarize_weights(state_dict)
     print("Writing to file ...")
-    with open(out, "wb") as f:
+    with open(out, "wb") as f:  # type: ignore[assignment]
         f.write(config_bin + weights_bin)

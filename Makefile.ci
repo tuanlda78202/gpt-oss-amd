@@ -1,0 +1,309 @@
+# ci.Makefile - Local CI checks and fixes
+# Run 'make -f .github/ci.Makefile help' to see available targets
+
+.PHONY: help check fix check-all fix-all
+.PHONY: check-python fix-python check-cpp fix-cpp check-shell check-pre-commit fix-pre-commit
+.PHONY: check-black fix-black check-flake8 check-isort fix-isort check-mypy
+.PHONY: check-ruff fix-ruff check-clang-format fix-clang-format check-syntax
+.PHONY: check-shellcheck check-prettier fix-prettier check-whitespace fix-whitespace
+
+# Default target
+help:
+	@echo "CI Makefile - Local checks before pushing"
+	@echo ""
+	@echo "Main targets:"
+	@echo "  check     - Run all CI checks (no fixes)"
+	@echo "  fix       - Run all possible fixes"
+	@echo "  check-all - Same as 'check'"
+	@echo "  fix-all   - Same as 'fix'"
+	@echo ""
+	@echo "Language-specific targets:"
+	@echo "  check-python     - Run all Python checks"
+	@echo "  fix-python       - Run all Python fixes"
+	@echo "  check-cpp        - Run all C/C++/CUDA checks"
+	@echo "  fix-cpp          - Run all C/C++/CUDA fixes"
+	@echo "  check-shell      - Run shell script checks"
+	@echo ""
+	@echo "Individual check targets:"
+	@echo "  check-ruff       - Check Python code with ruff (format + lint)"
+	@echo "  check-clang-format - Check C/C++/CUDA formatting"
+	@echo "  check-syntax     - Check C/C++/CUDA syntax"
+	@echo "  check-shellcheck - Check shell scripts"
+	@echo "  check-prettier   - Check Markdown/YAML formatting"
+	@echo "  check-whitespace - Check trailing whitespace"
+	@echo ""
+	@echo "Individual fix targets:"
+	@echo "  fix-ruff         - Fix Python issues with ruff (format + lint)"
+	@echo "  fix-clang-format - Fix C/C++/CUDA formatting"
+	@echo "  fix-prettier     - Fix Markdown/YAML formatting"
+	@echo "  fix-whitespace   - Fix trailing whitespace"
+	@echo ""
+	@echo "Pre-commit targets:"
+	@echo "  check-pre-commit - Run pre-commit checks"
+	@echo "  fix-pre-commit   - Run pre-commit fixes"
+
+# Main targets
+check: check-all
+fix: fix-all
+
+check-all: check-python check-cpp check-shell check-prettier check-whitespace
+	@echo "✅ All CI checks completed!"
+
+fix-all: fix-python fix-cpp fix-prettier fix-whitespace
+	@echo "✅ All fixes applied!"
+
+# Python targets (CI workflow style)
+check-python: check-ruff
+	@echo "✅ Python checks completed!"
+
+fix-python: fix-ruff
+	@echo "✅ Python fixes applied!"
+
+# Python individual checks (matching CI workflow)
+check-black:
+	@echo "🔍 Running black check..."
+	@black --check --diff --exclude='/(\.venv|venv|env|\.git|__pycache__|\.pytest_cache|build|dist|\.tox|node_modules)/' .
+
+fix-black:
+	@echo "🔧 Fixing with black..."
+	@black --exclude='/(\.venv|venv|env|\.git|__pycache__|\.pytest_cache|build|dist|\.tox|node_modules)/' .
+
+check-flake8:
+	@echo "🔍 Running flake8..."
+	@flake8 . --max-line-length=88 --extend-ignore=E203,W503 \
+		--exclude=.venv,venv,env,.git,__pycache__,.pytest_cache,build,dist,.tox,node_modules,.eggs,*.egg-info
+
+check-isort:
+	@echo "🔍 Running isort check..."
+	@isort --check-only --diff --profile=black \
+		--skip-glob='**/.venv/**' --skip-glob='**/venv/**' --skip-glob='**/env/**' \
+		--skip-glob='**/__pycache__/**' --skip-glob='**/build/**' --skip-glob='**/dist/**' \
+		--skip-glob='**/.tox/**' --skip-glob='**/node_modules/**' .
+
+fix-isort:
+	@echo "🔧 Fixing with isort..."
+	@isort --profile=black \
+		--skip-glob='**/.venv/**' --skip-glob='**/venv/**' --skip-glob='**/env/**' \
+		--skip-glob='**/__pycache__/**' --skip-glob='**/build/**' --skip-glob='**/dist/**' \
+		--skip-glob='**/.tox/**' --skip-glob='**/node_modules/**' .
+
+check-mypy:
+	@echo "🔍 Running mypy..."
+	@mypy --install-types --non-interactive --ignore-missing-imports \
+		--exclude='(\.venv|venv|env|__pycache__|\.pytest_cache|build|dist|\.tox|node_modules)' .
+
+# Alternative Python checks (pre-commit style with ruff)
+check-ruff:
+	@echo "🔍 Running ruff check..."
+	@ruff check . --exclude='.venv,venv,env,__pycache__,.pytest_cache,build,dist,.tox,node_modules'
+	@ruff format --check . --exclude='.venv,venv,env,__pycache__,.pytest_cache,build,dist,.tox,node_modules'
+
+fix-ruff:
+	@echo "🔧 Fixing with ruff..."
+	@ruff check --fix . --exclude='.venv,venv,env,__pycache__,.pytest_cache,build,dist,.tox,node_modules'
+	@ruff format . --exclude='.venv,venv,env,__pycache__,.pytest_cache,build,dist,.tox,node_modules'
+
+# C/C++/CUDA targets
+check-cpp: check-clang-format check-syntax
+	@echo "✅ C/C++/CUDA checks completed!"
+
+fix-cpp: fix-clang-format
+	@echo "✅ C/C++/CUDA fixes applied!"
+
+check-clang-format:
+	@echo "🔍 Running clang-format check..."
+	@files=$$(git ls-files '*.c' '*.cpp' '*.h' '*.hpp' '*.cu' '*.cuh' || true); \
+	if [ -n "$$files" ]; then \
+		echo "$$files" | xargs -r clang-format --dry-run -Werror; \
+	else \
+		echo "No C/C++/CUDA files to format."; \
+	fi
+
+fix-clang-format:
+	@echo "🔧 Fixing with clang-format..."
+	@files=$$(git ls-files '*.c' '*.cpp' '*.h' '*.hpp' '*.cu' '*.cuh' || true); \
+	if [ -n "$$files" ]; then \
+		echo "$$files" | xargs -r clang-format -i; \
+	else \
+		echo "No C/C++/CUDA files to format."; \
+	fi
+
+check-syntax:
+	@echo "🔍 Running C/C++/CUDA syntax checks..."
+	@fail=0; \
+	files=$$(git ls-files '*.c' '*.cc' '*.cxx' '*.cpp' '*.cu' 2>/dev/null || true); \
+	if [ -n "$$files" ]; then \
+		for f in $$files; do \
+			case "$$f" in \
+				*.c) \
+					echo "C syntax check: $$f"; \
+					if ! gcc -fsyntax-only -std=c17 -Wall -Wextra -I. "$$f"; then \
+						echo "❌ C syntax check failed: $$f"; \
+						fail=1; \
+					fi \
+					;; \
+				*.cc|*.cxx|*.cpp) \
+					echo "C++ syntax check: $$f"; \
+					if ! g++ -fsyntax-only -std=c++20 -Wall -Wextra -I. "$$f"; then \
+						echo "❌ C++ syntax check failed: $$f"; \
+						fail=1; \
+					fi \
+					;; \
+				*.cu) \
+					if command -v nvcc >/dev/null 2>&1; then \
+						echo "CUDA syntax check: $$f"; \
+						if ! nvcc -std=c++17 -c "$$f" -o /dev/null; then \
+							echo "❌ CUDA syntax check failed: $$f"; \
+							fail=1; \
+						fi; \
+					else \
+						echo "⚠️  Skipping CUDA syntax for $$f (nvcc not available)"; \
+					fi \
+					;; \
+			esac; \
+		done; \
+	else \
+		echo "No C/C++/CUDA files found."; \
+	fi; \
+	exit $$fail
+
+# Shell script targets
+check-shell: check-shellcheck
+	@echo "✅ Shell script checks completed!"
+
+check-shellcheck:
+	@echo "🔍 Running shellcheck..."
+	@files=$$(git ls-files '*.sh' '*.bash' '*.zsh' || true); \
+	if [ -z "$$files" ]; then \
+		echo "No shell scripts found."; \
+	else \
+		echo "$$files" | xargs -r shellcheck --severity=warning -e SC1071,SC1090,SC1091; \
+	fi
+
+# Prettier targets (for Markdown and YAML)
+check-prettier:
+	@echo "🔍 Running prettier check..."
+	@if command -v npx >/dev/null 2>&1; then \
+		tmpfile=$$(mktemp); \
+		echo ".venv/" > "$$tmpfile"; \
+		echo "venv/" >> "$$tmpfile"; \
+		echo "env/" >> "$$tmpfile"; \
+		echo "__pycache__/" >> "$$tmpfile"; \
+		echo "build/" >> "$$tmpfile"; \
+		echo "dist/" >> "$$tmpfile"; \
+		echo ".tox/" >> "$$tmpfile"; \
+		echo "node_modules/" >> "$$tmpfile"; \
+		npx prettier --check '**/*.md' '**/*.yaml' '**/*.yml' --ignore-path "$$tmpfile" || true; \
+		rm -f "$$tmpfile"; \
+	else \
+		echo "⚠️  npx not found, skipping prettier check"; \
+	fi
+
+fix-prettier:
+	@echo "🔧 Fixing with prettier..."
+	@if command -v npx >/dev/null 2>&1; then \
+		tmpfile=$$(mktemp); \
+		echo ".venv/" > "$$tmpfile"; \
+		echo "venv/" >> "$$tmpfile"; \
+		echo "env/" >> "$$tmpfile"; \
+		echo "__pycache__/" >> "$$tmpfile"; \
+		echo "build/" >> "$$tmpfile"; \
+		echo "dist/" >> "$$tmpfile"; \
+		echo ".tox/" >> "$$tmpfile"; \
+		echo "node_modules/" >> "$$tmpfile"; \
+		npx prettier --write '**/*.md' '**/*.yaml' '**/*.yml' --ignore-path "$$tmpfile"; \
+		rm -f "$$tmpfile"; \
+	else \
+		echo "⚠️  npx not found, skipping prettier fix"; \
+	fi
+
+# Whitespace targets
+check-whitespace:
+	@echo "🔍 Checking trailing whitespace and end-of-file..."
+	@fail=0; \
+	files=$$(git ls-files 2>/dev/null || true); \
+	if [ -n "$$files" ]; then \
+		for f in $$files; do \
+			case "$$f" in \
+				.venv/*|venv/*|env/*|__pycache__/*|build/*|dist/*|.tox/*|node_modules/*) \
+					continue ;; \
+			esac; \
+			if [ -f "$$f" ] && grep -q '[[:space:]]$$' "$$f"; then \
+				echo "❌ Trailing whitespace found in: $$f"; \
+				fail=1; \
+			fi; \
+			if [ -f "$$f" ] && [ -s "$$f" ] && [ "$$(tail -c 1 "$$f" | wc -l)" -eq 0 ]; then \
+				echo "❌ Missing newline at end of file: $$f"; \
+				fail=1; \
+			fi; \
+		done; \
+	fi; \
+	if [ $$fail -eq 0 ]; then \
+		echo "✅ No whitespace issues found"; \
+	fi; \
+	exit $$fail
+
+fix-whitespace:
+	@echo "🔧 Fixing whitespace issues..."
+	@files=$$(git ls-files 2>/dev/null || true); \
+	if [ -n "$$files" ]; then \
+		for f in $$files; do \
+			case "$$f" in \
+				.venv/*|venv/*|env/*|__pycache__/*|build/*|dist/*|.tox/*|node_modules/*) \
+					continue ;; \
+			esac; \
+			if [ -f "$$f" ]; then \
+				sed -i 's/[[:space:]]*$$//' "$$f"; \
+				if [ -s "$$f" ] && [ "$$(tail -c 1 "$$f" | wc -l)" -eq 0 ]; then \
+					echo "" >> "$$f"; \
+				fi; \
+			fi; \
+		done; \
+	fi
+
+# Pre-commit targets
+check-pre-commit:
+	@echo "🔍 Running pre-commit checks..."
+	@if command -v pre-commit >/dev/null 2>&1; then \
+		pre-commit run --all-files; \
+	else \
+		echo "⚠️  pre-commit not found. Install with: pip install pre-commit"; \
+		exit 1; \
+	fi
+
+fix-pre-commit:
+	@echo "🔧 Running pre-commit fixes..."
+	@if command -v pre-commit >/dev/null 2>&1; then \
+		pre-commit run --all-files || true; \
+	else \
+		echo "⚠️  pre-commit not found. Install with: pip install pre-commit"; \
+		exit 1; \
+	fi
+
+# Install dependencies
+install-deps:
+	@echo "📦 Installing CI dependencies..."
+	@echo "Installing Python dependencies..."
+	@pip install ruff pre-commit
+	@echo "Installing system dependencies (requires sudo)..."
+	@if command -v apt-get >/dev/null 2>&1; then \
+		sudo apt-get update && sudo apt-get install -y shellcheck clang-format; \
+	elif command -v brew >/dev/null 2>&1; then \
+		brew install shellcheck clang-format; \
+	else \
+		echo "⚠️  Please install shellcheck and clang-format manually"; \
+	fi
+	@if command -v npm >/dev/null 2>&1; then \
+		npm install -g prettier; \
+	else \
+		echo "⚠️  npm not found, please install prettier manually"; \
+	fi
+	@echo "✅ Dependencies installed!"
+
+# Quick check before commit (most important checks)
+quick-check: check-python check-clang-format check-whitespace
+	@echo "✅ Quick pre-commit checks completed!"
+
+# Quick fix before commit
+quick-fix: fix-python fix-clang-format fix-whitespace
+	@echo "✅ Quick pre-commit fixes applied!"
