@@ -11,7 +11,10 @@
 #include <cstring>
 #include <omp.h>
 
-OssTransformer* t_d;
+#ifndef GETP_RUN
+#define GETP_RUN
+
+OssTransformerHalf* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // Do not inference here
@@ -20,9 +23,21 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // - Memory allocation
     // - Load model
     // - ...
-    // OssTransformer* transformer_oss = (OssTransformer*)transformer;
+    OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
-    // copy_transformer_to_device(transformer_oss, t_d);
+    t_d = (OssTransformerHalf*)malloc(sizeof(OssTransformerHalf));
+
+    copy_transformer_to_device_half(transformer_oss, t_d);
+
+    size_t free_mem, total_mem;
+    CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
+    size_t used_mem = total_mem - free_mem;
+    printf("\n=== WARM-UP COMPLETE ===\n");
+    printf("GPU Memory Status:\n");
+    printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("========================\n");
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
@@ -33,7 +48,7 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     // - Unload model
     // - ...
 
-    // free_transformer_on_device(t_d);
+    free(t_d);
 }
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
@@ -49,7 +64,8 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     // Inference here
     OssSampler* sampler_oss = (OssSampler*)sampler;
 
-    t_d = (OssTransformer*)transformer; // ! TODO: replace this with allocation on device
+    OssTransformer* t_d =
+        (OssTransformer*)transformer; // ! TODO: replace this with allocation on device
 
     const char* empty_prompt = "";
     if (input_seq == NULL) {
@@ -62,7 +78,6 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
            t_d->config.initial_context_length);
-
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -127,3 +142,5 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     }
     return num_token_out;
 }
+
+#endif // GETP_RUN
