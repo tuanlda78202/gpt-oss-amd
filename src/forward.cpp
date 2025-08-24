@@ -6,6 +6,7 @@
 #include "hip/rope.hip"
 #include "hip/softmax.hip"
 #include "hip/swilglu.hip"
+#include "hip/topk.hip"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -291,9 +292,10 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         // }
 
         // residual connection back into x
-        for (int i = 0; i < hidden_dim; i++) {
-            x[i] += s->tb2[i];
-        }
+        // for (int i = 0; i < hidden_dim; i++) {
+        //     x[i] += s->tb2[i];
+        // }
+        vecaddvec_hip(x, s->tb2, 1.0f, hidden_dim);
 
         // ! ffn rmsnorm
         rmsnorm_hip(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
@@ -312,7 +314,7 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         // }
 
         // Select top-k experts
-        topk_cpu(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
+        topk_hip(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
 
         // Normalize selected experts using softmax or sigmoid
         softmax_hip(s->topk_v, p->experts_per_token); // expert
@@ -366,16 +368,18 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                 // }
 
                 // ! reduce: aggregate topk experts using weighted sum
-                for (int i = 0; i < hidden_dim; i++) {
-                    s->e_agg[i] += s->tb2[i] * expert_w;
-                }
+                // for (int i = 0; i < hidden_dim; i++) {
+                //     s->e_agg[i] += s->tb2[i] * expert_w;
+                // }
+                vecaddvec_hip(s->e_agg, s->tb2, expert_w, hidden_dim);
             }
         }
 
         // ! residual connection (before rms2 to after MoE)
-        for (int i = 0; i < hidden_dim; i++) {
-            x[i] += s->e_agg[i];
-        }
+        // for (int i = 0; i < hidden_dim; i++) {
+        //     x[i] += s->e_agg[i];
+        // }
+        vecaddvec_hip(x, s->e_agg, 1.0f, hidden_dim);
     }
 
     // ! final rmsnorm
