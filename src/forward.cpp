@@ -1,6 +1,7 @@
 #include "../include/forward.hpp"
 #include "hip/matvec.cpp"
 #include "hip/rmsnorm.cpp"
+#include "hip/rope.cpp"
 #include "hip/softmax.cpp"
 #include "hip/swilglu.cpp"
 #include <cassert>
@@ -242,13 +243,13 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         float* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-        matmul_hip(s->qkv, s->t, w_qkv, hidden_dim,
+        matmul_hip(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
                    (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
-        // add bias
-        for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
-            s->qkv[i] += b_qkv[i];
-        }
+        // add bias (already added in matmul_hip)
+        // for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
+        //     s->qkv[i] += b_qkv[i];
+        // }
 
         // Separate q, k, v
         memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float)); // gate
@@ -265,10 +266,10 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         float ntk_alpha = 1.0f;
         float* cos_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
         float* sin_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
-        compute_cos_sin_cpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+        compute_cos_sin_hip(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
                             p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
-        apply_rotary_emb_cpu(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
-        apply_rotary_emb_cpu(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
+        apply_rotary_emb_hip(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
+        apply_rotary_emb_hip(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
 
         free(cos_vals);
         free(sin_vals);
@@ -331,12 +332,12 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         // ! linear: final matmul to get the output of the attention
         float* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         float* b_o = w->b_o + 1ll * l * hidden_dim;
-        matmul_hip(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
+        matmul_hip(s->tb2, s->tb, w_o, b_o, head_dim * p->n_attn_heads, hidden_dim);
 
-        // add bias b_o
-        for (int i = 0; i < hidden_dim; i++) {
-            s->tb2[i] += b_o[i];
-        }
+        // add bias b_o (already added in matmul_hip)
+        // for (int i = 0; i < hidden_dim; i++) {
+        //     s->tb2[i] += b_o[i];
+        // }
 
         // residual connection back into x
         for (int i = 0; i < hidden_dim; i++) {
@@ -351,13 +352,13 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         // Compute router_score
         float* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         float* b_router = w->b_router + 1ll * l * n_experts;
-        matmul_hip(s->router_score, s->t, w_router, hidden_dim,
+        matmul_hip(s->router_score, s->t, w_router, b_router, hidden_dim,
                    n_experts); // s->router_score now stores router_score (n_experts, )
 
-        // add bias b_router
-        for (int i = 0; i < n_experts; i++) {
-            s->router_score[i] += b_router[i];
-        }
+        // add bias b_router (already added in matmul_hip)
+        // for (int i = 0; i < n_experts; i++) {
+        //     s->router_score[i] += b_router[i];
+        // }
 
         // Select top-k experts
         topk_cpu(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
@@ -385,11 +386,11 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                 float* w_mlp1 =
                     w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
                 float* b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-                matmul_hip(s->mlp1_out, s->t, w_mlp1, hidden_dim,
+                matmul_hip(s->mlp1_out, s->t, w_mlp1, b_mlp1, hidden_dim,
                            2 * p->intermediate_dim); // (2 * intermediate_dim, )
-                for (int i = 0; i < 2 * p->intermediate_dim; i++) {
-                    s->mlp1_out[i] += b_mlp1[i];
-                }
+                // for (int i = 0; i < 2 * p->intermediate_dim; i++) {
+                //     s->mlp1_out[i] += b_mlp1[i];
+                // }
 
                 // Split mlp1_out into gate and up
                 for (int j = 0; j < p->intermediate_dim; j++) {
@@ -407,11 +408,11 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
                     w->w_mlp2 + 1ll * (l * n_experts + e) * hidden_dim *
                                     p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
                 float* b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
-                matmul_hip(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
-                           hidden_dim); // (hidden_dim, )
-                for (int i = 0; i < hidden_dim; i++) {
-                    s->tb2[i] += b_mlp2[i];
-                }
+                matmul_hip(s->tb2, s->gate_up, w_mlp2, b_mlp2, hidden_dim,
+                           p->intermediate_dim); // (hidden_dim, )
+                // for (int i = 0; i < hidden_dim; i++) {
+                //     s->tb2[i] += b_mlp2[i];
+                // }
 
                 // ! reduce: aggregate topk experts using weighted sum
                 for (int i = 0; i < hidden_dim; i++) {
@@ -430,6 +431,6 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
     rmsnorm_hip(x, x, w->rms_out_w, hidden_dim);
 
     // ! linear: classifier into logits
-    matmul_hip(s->logits, x, w->out, hidden_dim, p->vocab_size);
+    matmul_hip(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
     return s->logits;
 }

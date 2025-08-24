@@ -43,29 +43,38 @@ __global__ void matvec_tiled(const float* A, const float* B, float* C, int M, in
     }
 }
 
-void matvec_tiled_hip(const float* A, const float* B, float* C, int M, int K) {
+void matvec_tiled_hip(const float* A, const float* B, float* C, float* bias, int M, int K) {
     dim3 block_dim(TILE_SIZE, TILE_SIZE);
     dim3 grid_dim((K + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
     hipLaunchKernelGGL(matvec_tiled, grid_dim, block_dim, 0, 0, A, B, C, M, K);
+
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
 }
 
 // Wrapper function that matches matmul_cpu signature
-void matmul_hip(float* xout, float* x, float* w, int n, int d) {
+void matmul_hip(float* xout, float* x, float* w, float* bias, int n, int d) {
     // Allocate device memory
-    float *x_d, *w_d, *xout_d;
+    float *x_d, *w_d, *xout_d, *bias_d;
     CHECK_HIP(hipMalloc(&x_d, n * sizeof(float)));
     CHECK_HIP(hipMalloc(&w_d, n * d * sizeof(float)));
     CHECK_HIP(hipMalloc(&xout_d, d * sizeof(float)));
+    if (bias != nullptr) {
+        CHECK_HIP(hipMalloc(&bias_d, d * sizeof(float)));
+    }
 
     // Copy data to device
     CHECK_HIP(hipMemcpy(x_d, x, n * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(w_d, w, n * d * sizeof(float), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemset(xout_d, 0, d * sizeof(float)));
+    if (bias != nullptr) {
+        CHECK_HIP(hipMemcpy(bias_d, bias, d * sizeof(float), hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(xout_d, bias_d, d * sizeof(float), hipMemcpyDeviceToDevice));
+    } else {
+        CHECK_HIP(hipMemset(xout_d, 0, d * sizeof(float)));
+    }
 
     // Call the HIP kernel
-    matvec_tiled_hip(w_d, x_d, xout_d, d, n);
+    matvec_tiled_hip(w_d, x_d, xout_d, bias_d, d, n);
 
     // Copy result back to host
     CHECK_HIP(hipMemcpy(xout, xout_d, d * sizeof(float), hipMemcpyDeviceToHost));
@@ -74,4 +83,7 @@ void matmul_hip(float* xout, float* x, float* w, int n, int d) {
     CHECK_HIP(hipFree(x_d));
     CHECK_HIP(hipFree(w_d));
     CHECK_HIP(hipFree(xout_d));
+    if (bias != nullptr) {
+        CHECK_HIP(hipFree(bias_d));
+    }
 }
