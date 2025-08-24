@@ -1,9 +1,9 @@
 #pragma once
 // #include <ctype.h>
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
 #include <cstdlib>
 #include <cstring>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #define MAX_NUM_SUPPORTED_GPUS 32
 #define WARP_SIZE 64
@@ -218,12 +218,10 @@ typedef struct {
     ssize_t file_size;     // size of the checkpoint file in bytes
 } OssTransformerHalf;
 
-void copy_transformer_to_device(OssTransformer* t_h, OssTransformer* t_d);
-void copy_weights_to_device(OssTransformer* t_h, OssTransformerWeights* w_d);
-void copy_state_to_device(OssTransformer* t_h, OssRunState* s_d);
-void free_transformer_on_device(OssTransformer* t_d);
+void copy_transformer_to_device_full(OssTransformer* t_h, OssTransformer* t_d);
+void free_transformer_on_device_full(OssTransformer* t_d);
 
+void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
+                                 const char* tensor_name);
 void copy_transformer_to_device_half(OssTransformerHalf* t_h, OssTransformerHalf* t_d);
-void copy_weights_to_device_half(OssTransformerHalf* t_h, OssTransformerWeightsHalf* w_d);
-void copy_state_to_device_half(OssTransformerHalf* t_h, OssRunStateHalf* s_d);
 void free_transformer_on_device_half(OssTransformerHalf* t_d);

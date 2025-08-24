@@ -23,13 +23,21 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // - Memory allocation
     // - Load model
     // - ...
-    OssTransformerHalf* transformer_oss = (OssTransformerHalf*)transformer;
+    OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
-    // Pre-allocate the device transformer structure
     t_d = (OssTransformerHalf*)malloc(sizeof(OssTransformerHalf));
 
-    //  Allocates GPU mem
     copy_transformer_to_device_half(transformer_oss, t_d);
+
+    size_t free_mem, total_mem;
+    CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
+    size_t used_mem = total_mem - free_mem;
+    printf("\n=== WARM-UP COMPLETE ===\n");
+    printf("GPU Memory Status:\n");
+    printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("========================\n");
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
@@ -40,7 +48,6 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     // - Unload model
     // - ...
 
-    free_transformer_on_device_half(t_d);
     free(t_d);
 }
 
