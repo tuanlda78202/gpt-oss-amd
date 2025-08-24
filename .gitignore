@@ -79,4 +79,5 @@ build/
 uv.lock
 .vscode/
 output.txt
+note.txt
 legacy.hip/

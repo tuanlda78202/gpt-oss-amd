@@ -25,6 +25,10 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // - ...
     OssTransformerHalf* transformer_oss = (OssTransformerHalf*)transformer;
 
+    // Pre-allocate the device transformer structure
+    t_d = (OssTransformerHalf*)malloc(sizeof(OssTransformerHalf));
+
+    //  Allocates GPU mem
     copy_transformer_to_device_half(transformer_oss, t_d);
 }
 
@@ -37,6 +41,7 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     // - ...
 
     free_transformer_on_device_half(t_d);
+    free(t_d);
 }
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
