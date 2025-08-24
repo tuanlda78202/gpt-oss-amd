@@ -3,11 +3,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
-
-#define MAX_NUM_SUPPORTED_GPUS 32
-#define WARP_SIZE 64
-#define MAX_BLOCK_SIZE 1024
 
 #define CHECK_HIP(cmd)                                                                             \
     do {                                                                                           \

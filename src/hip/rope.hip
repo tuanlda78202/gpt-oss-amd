@@ -1,11 +1,7 @@
 #include "../../include/hip_helper.hpp"
+#include "../BLAS.hip"
 #include <cmath>
 #include <cstdio>
-#include <hip/hip_runtime.h>
-#include <omp.h>
-
-#define WARP_SIZE 64
-#define MAX_BLOCK_SIZE 1024
 
 // ====== COMPUTE CONCENTRATION AND INV_FREQ KERNEL ======
 __global__ void compute_concentration_and_inv_freq_kernel(

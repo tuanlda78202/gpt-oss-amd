@@ -1,37 +1,8 @@
-#include <omp.h>
+#include "../../include/hip_helper.hpp"
+#include "../BLAS.hip"
 
-#define WARP_SIZE 64
-#define MAX_BLOCK_SIZE 1024
 
-__device__ float warp_reduce_sum(float val) {
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        val += __shfl_xor(val, offset);
 
-    return val;
-}
-
-__device__ float block_reduce_sum(float val) {
-    static __shared__ float shared[MAX_BLOCK_SIZE / WARP_SIZE];
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-
-    val = warp_reduce_sum(val);
-
-    if (lane == 0)
-        shared[wid] = val;
-
-    __syncthreads();
-
-    val = (threadIdx.x < blockDim.x / WARP_SIZE) ? shared[lane] : 0;
-
-    if (wid == 0)
-        val = warp_reduce_sum(val);
-
-    return val;
-}
-
-// modify deviceReduceBlockAtomicKernel to caculate sum of squares
 __global__ void thaDNN_s_rmsnorm_kernel_v2(float* o, float* x, float* weight, int size) {
     int lx = threadIdx.x;
     float tmp;

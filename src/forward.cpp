@@ -1,9 +1,11 @@
 #include "../include/forward.hpp"
-#include "hip/matvec.cpp"
-#include "hip/rmsnorm.cpp"
-#include "hip/rope.cpp"
-#include "hip/softmax.cpp"
-#include "hip/swilglu.cpp"
+#include "hip/attention.hip"
+#include "hip/matvec.hip"
+#include "hip/prim_add.hip"
+#include "hip/rmsnorm.hip"
+#include "hip/rope.hip"
+#include "hip/softmax.hip"
+#include "hip/swilglu.hip"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -274,61 +276,10 @@ float* forward_cpu(OssTransformer* transformer, int token, int pos) {
         free(cos_vals);
         free(sin_vals);
 
-        // ! multihead attention. iterate over all heads
-        int h;
-#pragma omp parallel for private(h)
-        for (h = 0; h < p->n_attn_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_dim;
-
-            // attention scores for this head
-            float* att = s->att + h * p->seq_len;
-
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                // GQA
-                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-
-                // calculate the attention score as the dot product of q and k
-                double score = 0.0f;
-                for (int i = 0; i < head_dim; i++) {
-                    score += q[i] * k[i]; // ! Dot product
-                }
-                score /= sqrtf(head_dim);
-
-                // ! Apply sliding window mask if enabled
-                if (p->sliding_window > 0 && (l % 2 == 0)) {
-                    score += s->mask[pos * p->seq_len + t];
-                }
-
-                // save the score to the attention buffer
-                att[t] = score;
-            }
-
-            // ! Add attention sink score
-            att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
-
-            // ! softmax the scores to get attention weights, from 0..pos inclusively
-            softmax_hip(att, pos + 2);
-
-            // ! weighted sum of the values
-            float* tb = s->tb + h * head_dim; // concat outputs from all attn_heads
-            memset(tb, 0, head_dim * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                // ! GQA
-                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-
-                // get the attention weight for this timestep
-                float a = att[t];
-
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_dim; i++) {
-                    tb[i] += a * v[i];
-                }
-            }
-        }
+        // ! multihead attention using HIP
+        multihead_attention_hip(s->q, s->key_cache + loff, s->value_cache + loff, s->att, s->tb,
+                                s->mask, w->attn_sinks + l * p->n_attn_heads, pos, p->seq_len,
+                                head_dim, kv_dim, kv_mul, p->sliding_window, l, p->n_attn_heads);
         // ! linear: final matmul to get the output of the attention
         float* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         float* b_o = w->b_o + 1ll * l * hidden_dim;

@@ -81,3 +81,5 @@ uv.lock
 output.txt
 note.txt
 legacy.hip/
+
+tests/
