@@ -1,4 +1,4 @@
-#include "../include/forward.hpp"
+#include "../include/model.hpp"
 #include "hip/attention.hip"
 #include "hip/matvec.hip"
 #include "hip/prim_add.hip"
@@ -15,7 +15,7 @@
 #include <omp.h>
 
 // ! FORWARD
-float* forward_hip(OssTransformer* transformer, int token, int pos) {
+float* forward_full(OssTransformer* transformer, int token, int pos) {
     OssConfig* p = &transformer->config;
     OssTransformerWeights* w = &transformer->weights;
     OssRunState* s = &transformer->state;
@@ -101,11 +101,6 @@ float* forward_hip(OssTransformer* transformer, int token, int pos) {
 
         // ! ffn rmsnorm
         rmsnorm_hip(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
-        printf("ffn rmsnorm\n");
-        for (int i = 0; i < 20; i++) {
-            printf("%f ", s->t[i]);
-        }
-        printf("\n");
 
         // ! --------------------MoE--------------------
         // ! Router
@@ -187,3 +182,140 @@ float* forward_hip(OssTransformer* transformer, int token, int pos) {
 
     return s->logits;
 }
+
+// ! FORWARD (half-precision path)
+// float* forward_half(OssTransformerHalf* transformer, int token, int pos) {
+//     OssConfig* p = &transformer->config;
+//     OssTransformerWeightsHalf* w = &transformer->weights;
+//     OssRunStateHalf* s = &transformer->state;
+
+//     float* x_d = s->x; // device
+//     int head_dim = p->head_dim;
+//     int hidden_dim = p->hidden_dim;
+//     int kv_dim = p->head_dim * p->n_kv_heads;
+//     int kv_mul = p->n_attn_heads / p->n_kv_heads;
+//     int intermediate_dim = p->intermediate_dim;
+//     int n_experts = p->n_experts;
+
+//     // token embedding row copy on device
+//     float* content_row_d = w->token_embedding_table + token * hidden_dim;
+//     CHECK_HIP(hipMemcpy(x_d, content_row_d, hidden_dim * sizeof(float),
+//     hipMemcpyDeviceToDevice));
+
+//     for (unsigned long long l = 0; l < p->n_layers; l++) {
+//         // rmsnorm
+//         thaDNN_s_rmsnorm_v2(s->t, x_d, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
+
+//         // kv cache pointers
+//         int loff = l * p->seq_len * kv_dim;
+//         s->k = s->key_cache + loff + pos * kv_dim;
+//         s->v = s->value_cache + loff + pos * kv_dim;
+
+//         // qkv matmul + bias
+//         float* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
+//                                       (head_dim * p->n_attn_heads + 2 * head_dim *
+//                                       p->n_kv_heads);
+//         float* b_qkv =
+//             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+//         matmul_hip_device(s->qkv, s->t, w_qkv, hidden_dim,
+//                           (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+//         vecaddvec_device(s->qkv, b_qkv, 1.0f, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+
+//         // split q,k,v on device
+//         CHECK_HIP(hipMemcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float),
+//                             hipMemcpyDeviceToDevice));
+//         CHECK_HIP(hipMemcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
+//                             head_dim * p->n_kv_heads * sizeof(float), hipMemcpyDeviceToDevice));
+//         CHECK_HIP(hipMemcpy(s->v, s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
+//                             head_dim * p->n_kv_heads * sizeof(float), hipMemcpyDeviceToDevice));
+
+//         // RoPE
+//         float ntk_beta = 32.0f;
+//         float ntk_alpha = 1.0f;
+//         compute_cos_sin_device(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+//                                p->initial_context_length, ntk_beta, ntk_alpha,
+//                                s->tb2 /* reuse as cos */, s->tb /* reuse as sin */);
+//         apply_rotary_emb_device(s->q, s->tb2, s->tb, p->n_attn_heads, head_dim);
+//         apply_rotary_emb_device(s->k, s->tb2, s->tb, p->n_kv_heads, head_dim);
+
+//         // attention
+//         CHECK_HIP(hipMemset(s->att, 0, p->n_attn_heads * p->seq_len * sizeof(float)));
+//         compute_attention_scores_device(s->q, s->key_cache + loff, s->att, s->mask, pos,
+//         p->seq_len,
+//                                         head_dim, kv_dim, kv_mul, p->sliding_window, l,
+//                                         p->n_attn_heads);
+//         add_attention_sink_device(s->att, w->attn_sinks + l * p->n_attn_heads, pos, p->seq_len,
+//                                   p->n_attn_heads, l);
+//         softmax_attention_device(s->att, pos, p->seq_len, p->n_attn_heads);
+//         weighted_value_accumulation_device(s->att, s->value_cache + loff, s->tb, pos, p->seq_len,
+//                                            head_dim, kv_dim, kv_mul, p->n_attn_heads);
+
+//         // output projection
+//         float* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+//         float* b_o = w->b_o + 1ll * l * hidden_dim;
+//         matmul_hip_device(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
+//         vecaddvec_device(s->tb2, b_o, 1.0f, hidden_dim);
+//         vecaddvec_device(x_d, s->tb2, 1.0f, hidden_dim);
+
+//         // FFN
+//         rmsnorm_device(s->t, x_d, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
+
+//         float* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
+//         float* b_router = w->b_router + 1ll * l * n_experts;
+//         matmul_hip_device(s->router_score, s->t, w_router, hidden_dim, n_experts);
+//         vecaddvec_device(s->router_score, b_router, 1.0f, n_experts);
+//         topk_device(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
+//         softmax_device(s->topk_v, p->experts_per_token);
+
+//         CHECK_HIP(hipMemset(s->e_agg, 0, hidden_dim * sizeof(float)));
+//         for (int e = 0; e < n_experts; e++) {
+//             int in_topk = 0;
+//             float expert_w = 0.0f;
+//             // Copy topk indices to host small array once per layer would be ideal; here we just
+//             // check on device by copying a single int
+//             for (int idx = 0; idx < p->experts_per_token; idx++) {
+//                 int ei;
+//                 CHECK_HIP(hipMemcpy(&ei, s->topk_i + idx, sizeof(int), hipMemcpyDeviceToHost));
+//                 if (ei == e) {
+//                     in_topk = 1;
+//                     float wv;
+//                     CHECK_HIP(
+//                         hipMemcpy(&wv, s->topk_v + idx, sizeof(float), hipMemcpyDeviceToHost));
+//                     expert_w = wv;
+//                     break;
+//                 }
+//             }
+//             if (in_topk) {
+//                 float* w_mlp1 =
+//                     w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) *
+//                     hidden_dim;
+//                 float* b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 *
+//                 p->intermediate_dim); matmul_hip_device(s->mlp1_out, s->t, w_mlp1, hidden_dim, 2
+//                 * p->intermediate_dim); vecaddvec_device(s->mlp1_out, b_mlp1, 1.0f, 2 *
+//                 p->intermediate_dim);
+//                 // split gate/up
+//                 CHECK_HIP(hipMemcpy2D(s->gate, sizeof(float), s->mlp1_out, 2 * sizeof(float),
+//                                       sizeof(float), p->intermediate_dim,
+//                                       hipMemcpyDeviceToDevice));
+//                 CHECK_HIP(hipMemcpy2D(s->up, sizeof(float), s->mlp1_out + 1, 2 * sizeof(float),
+//                                       sizeof(float), p->intermediate_dim,
+//                                       hipMemcpyDeviceToDevice));
+//                 const float alpha = 1.702f;
+//                 swiglu_device(s->gate, s->up, s->gate_up, p->intermediate_dim, alpha,
+//                               p->swiglu_limit);
+//                 float* w_mlp2 =
+//                     w->w_mlp2 + 1ll * (l * n_experts + e) * hidden_dim * p->intermediate_dim;
+//                 float* b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
+//                 matmul_hip_device(s->tb2, s->gate_up, w_mlp2, hidden_dim, p->intermediate_dim);
+//                 vecaddvec_device(s->tb2, b_mlp2, 1.0f, hidden_dim);
+//                 // accumulate
+//                 vecaddvec_device(s->e_agg, s->tb2, expert_w, hidden_dim);
+//             }
+//         }
+//         vecaddvec_device(x_d, s->e_agg, 1.0f, hidden_dim);
+//     }
+
+//     rmsnorm_device(x_d, x_d, w->rms_out_w, hidden_dim);
+//     matmul_hip_device(s->logits, x_d, w->out, hidden_dim, p->vocab_size);
+//     return s->logits;
+// }

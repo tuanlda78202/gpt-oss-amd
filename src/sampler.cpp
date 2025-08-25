@@ -1,5 +1,5 @@
 #include "../include/sampler.hpp"
-#include "../include/forward.hpp"
+#include "forward_cpu.cpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

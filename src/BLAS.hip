@@ -1,9 +1,19 @@
 #pragma once
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 // #include <hipblas.h>
 #include <omp.h>
 
-#include "../include/hip_helper.hpp"
+#define CHECK_HIP(cmd)                                                                             \
+    do {                                                                                           \
+        hipError_t error = cmd;                                                                    \
+        if (error != hipSuccess) {                                                                 \
+            fprintf(stderr, "HIP Error: %s (%d): %s:%d\n", hipGetErrorString(error), error,        \
+                    __FILE__, __LINE__);                                                           \
+            fflush(stdout);                                                                        \
+            exit(EXIT_FAILURE);                                                                    \
+        }                                                                                          \
+    } while (0)
 
 #define WARP_SIZE 64
 #define MAX_BLOCK_SIZE 1024

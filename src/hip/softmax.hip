@@ -1,4 +1,3 @@
-#include "../../include/hip_helper.hpp"
 #include "../BLAS.hip"
 #include <cstdio>
 #include <omp.h>

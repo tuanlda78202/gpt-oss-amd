@@ -10,10 +10,6 @@ void softmax_cpu(float* x, int size);
 void matmul_cpu(float* xout, float* x, float* w, int n, int d);
 
 // pair struct to store score and original index
-typedef struct {
-    float value;
-    int index;
-} OssPair;
 
 int compare_desc_cpu(const void* a, const void* b);
 

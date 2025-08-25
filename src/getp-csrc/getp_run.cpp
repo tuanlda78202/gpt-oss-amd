@@ -89,7 +89,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int pos = 0;                  // position in the sequence
     while (pos < steps) {
         // forward the transformer to get logits for the next token
-        float* logits = forward_cpu(t_d, token, pos);
+        float* logits = forward_full(t_d, token, pos);
 
         // advance the state machine
         pos++;

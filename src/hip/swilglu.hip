@@ -1,4 +1,3 @@
-#include "../../include/hip_helper.hpp"
 #include "../BLAS.hip"
 
 // '_s_' = single precision (float)

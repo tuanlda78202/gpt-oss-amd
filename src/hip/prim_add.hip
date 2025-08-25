@@ -1,4 +1,3 @@
-#include "../../include/hip_helper.hpp"
 #include "../BLAS.hip"
 
 __global__ void vecaddvec_kernel(float* a, float* b, float weight, int size) {

@@ -25,6 +25,11 @@
 //     }                                                                          \
 //   } while (0)
 
+typedef struct {
+    float value;
+    int index;
+} OssPair;
+
 // ! Model Hyperparameters
 typedef struct {
     // Model Config
