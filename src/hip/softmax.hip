@@ -51,7 +51,7 @@ void s_softmax_v2(float* x, int size) {
         return;
     }
 
-    dim3 blockDim(64);
+    dim3 blockDim(256);
     dim3 gridDim(1);
 
     hipLaunchKernelGGL(s_softmax_v2_kernel, gridDim, blockDim, 0, 0, x, size);
