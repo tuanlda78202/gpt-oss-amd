@@ -229,7 +229,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     start = time_in_ms();
     printf("------------------------------\n🔥 Warming up...");
     fflush(stdout);
-    // warm_up(transformer, tokenizer);
+    warm_up(transformer, tokenizer);
     end = time_in_ms();
     printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
