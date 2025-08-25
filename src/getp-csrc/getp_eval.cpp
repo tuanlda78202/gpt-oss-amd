@@ -82,9 +82,11 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
         for (int i = 0; i < reqs->num_reqs; i++) {
             int* output_tokens = get_tok_gen_ptr(reqs, i);
             for (int j = 0; output_tokens[j] >= 0; j++) {
-                writeFile << output_tokens[j] << ' ';
+                if (j > 0)
+                    writeFile << ' ';
+                writeFile << output_tokens[j];
             }
-            writeFile << "\n";
+            writeFile << '\n';
         }
         writeFile.close();
     } else {
