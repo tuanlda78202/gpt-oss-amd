@@ -1,8 +1,9 @@
 #pragma once
-// #include <ctype.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
 #define CHECK_HIP(cmd)                                                                             \
     do {                                                                                           \
@@ -218,10 +219,17 @@ typedef struct {
     ssize_t file_size;     // size of the checkpoint file in bytes
 } OssTransformerHalf;
 
-void copy_transformer_to_device_full(OssTransformer* t_h, OssTransformer* t_d);
-void free_transformer_on_device_full(OssTransformer* t_d);
+// ! Hybrid Precision Transformer
+typedef struct {
+    OssConfig config;
+    OssTransformerWeightsHalf weights; // FP16 weights for memory efficiency
+    OssRunState state;                 // FP32 activations for numerical stability
+    int fd;                            // file descriptor for memory mapping
+    float* data;                       // memory mapped data pointer
+    ssize_t file_size;                 // size of the checkpoint file in bytes
+} OssTransformerHybrid;
 
 void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name);
-void copy_transformer_to_device_half(OssTransformerHalf* t_h, OssTransformerHalf* t_d);
-void free_transformer_on_device_half(OssTransformerHalf* t_d);
+void copy_transformer_to_device_hybrid(OssTransformer* t_h, OssTransformerHybrid* t_d);
+void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d);

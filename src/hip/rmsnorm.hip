@@ -1,7 +1,5 @@
 #include "../BLAS.hip"
 
-
-
 __global__ void thaDNN_s_rmsnorm_kernel_v2(float* o, float* x, float* weight, int size) {
     int lx = threadIdx.x;
     float tmp;
@@ -65,56 +63,49 @@ void rmsnorm_hip(float* o, float* x, float* weight, int size) {
     CHECK_HIP(hipFree(weight_d));
 }
 
-// ====== BATCH VERSION ======
-// __global__ void thaDNN_s_rmsnorm_kernel_v2_batch(int n_batches, float* o_batch, float* x_batch,
-//                                                  float* weight, int size, int dim) {
-//     int lx = threadIdx.x;
-//     int b = blockIdx.x;
-//     float tmp;
-//     float ss = 0.0;
+// High-precision hybrid RMSNorm kernel for FP16 weights + FP32 activations
+__global__ void rmsnorm_hybrid_kernel(float* o, float* x, __half* weight_half, int size) {
+    int lx = threadIdx.x;
+    float tmp;
+    // Use double precision for sum accumulation to avoid rounding errors
+    double ss = 0.0;
+    __shared__ float total_sum;
 
-//     float* x = x_batch + b * dim;
-//     float* o = o_batch + b * dim;
-//     __shared__ float total_sum;
+    // Compute sum of squares with double precision
+    for (int i = lx; i < size; i += blockDim.x) {
+        tmp = x[i];
+        ss += (double)tmp * (double)tmp;
+    }
 
-//     for (int i = lx; i < size; i += blockDim.x) {
-//         tmp = x[i];
-//         ss += tmp * tmp;
-//     }
+    // Reduce with high precision
+    float ss_float = (float)ss;
+    ss_float = block_reduce_sum(ss_float);
 
-//     ss = block_reduce_sum(ss);
+    if (lx == 0) {
+        ss_float /= size;
+        ss_float += 1e-5f;
+        ss_float = 1.0f / sqrtf(ss_float);
+        total_sum = ss_float;
+    }
+    __syncthreads();
 
-//     if (lx == 0) {
-//         ss /= size;
-//         ss += 1e-5f;
-//         ss = 1.0f / sqrtf(ss);
-//         total_sum = ss;
-//     }
+    ss_float = total_sum;
+    for (int i = lx; i < size; i += blockDim.x) {
+        // Convert FP16 weight to FP32 with exact precision
+        // __half weight_val = weight_half[i];
+        // float weight_fp32 = __half2float(weight_val);
+        // Ensure exact computation order for reproducibility
+        // float scaled_x = ss_float * x[i];
+        // o[i] = weight_fp32 * scaled_x;
+        o[i] = __half2float(weight_half[i]) * ss_float * x[i];
+    }
+}
 
-//     __syncthreads();
+void rmsnorm_hip_hybrid_device(float* o, float* x, __half* weight, int size) {
+    dim3 blockDim(1024);
+    dim3 gridDim(1);
+    hipLaunchKernelGGL(rmsnorm_hybrid_kernel, gridDim, blockDim, 0, 0, o, x, weight, size);
 
-//     ss = total_sum;
-//     for (int i = lx; i < size; i += blockDim.x) {
-//         o[i] = weight[i] * (ss * x[i]);
-//     }
-// }
-
-// thablasStatus_t thaDNN_s_rmsnorm_v2_batch(thablasHandle_t* handle, int n_batches, float* o_batch,
-//                                           float* x_batch, float* weight, int size, int dim) {
-//     // if (size+dim==0 || o_batch == nullptr || x_batch == nullptr || weight == nullptr ||
-//     // handle.current_gpu_id < 0)
-//     // {
-//     //     printf("THABLAS RMSNORM V2 BATCH ERROR: INVALID ARGUMENT\n"); fflush(stdout);
-//     //     return THABLAS_STATUS_ALLOC_FAILED;
-//     // }
-
-//     // CHECK_HIP(hipSetDevice(handle.current_gpu_id));
-//     dim3 blockDim(1024);
-//     dim3 gridDim(n_batches);
-//     hipLaunchKernelGGL(thaDNN_s_rmsnorm_kernel_v2_batch, gridDim, blockDim, 0,
-//     handle->calc_stream,
-//                        n_batches, o_batch, x_batch, weight, size, dim);
-
-//     // CHECK_HIP(hipGetLastError());
-//     return THABLAS_STATUS_SUCCESS;
-// }
+    CHECK_HIP(hipGetLastError());
+    CHECK_HIP(hipDeviceSynchronize());
+}

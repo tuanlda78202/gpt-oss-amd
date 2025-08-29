@@ -229,3 +229,24 @@ void apply_rotary_emb_hip(float* x, float* cos, float* sin, int n_heads, int hea
     CHECK_HIP(hipFree(cos_d));
     CHECK_HIP(hipFree(sin_d));
 }
+
+void compute_cos_sin_hip_device(int pos, float base, int head_dim, float scaling_factor,
+                                float initial_context_length, float ntk_beta, float ntk_alpha,
+                                float* cos_out, float* sin_out) {
+    dim3 blockDim(1); // Single thread for this computation
+    dim3 gridDim(1);
+    hipLaunchKernelGGL(compute_cos_sin_kernel, gridDim, blockDim, 0, 0, pos, base, head_dim,
+                       scaling_factor, initial_context_length, ntk_beta, ntk_alpha, cos_out,
+                       sin_out);
+
+    CHECK_HIP(hipGetLastError());
+}
+
+void apply_rotary_emb_hip_device(float* x, float* cos, float* sin, int n_heads, int head_dim) {
+    dim3 blockDim(256);
+    dim3 gridDim((n_heads * (head_dim / 2) + blockDim.x - 1) / blockDim.x);
+    hipLaunchKernelGGL(apply_rotary_emb_kernel, gridDim, blockDim, 0, 0, x, cos, sin, n_heads,
+                       head_dim);
+
+    CHECK_HIP(hipGetLastError());
+}

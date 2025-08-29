@@ -84,3 +84,4 @@ legacy.hip/
 
 tests/
 *.txt
+time_log.py

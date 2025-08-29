@@ -96,3 +96,29 @@ void topk_hip(float* topk_values, int* topk_indices, float* router_score, int nu
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
 }
+
+void topk_hip_device(float* topk_values, int* topk_indices, float* router_score, int num_experts,
+                     int experts_per_token) {
+    if (num_experts <= 0 || experts_per_token <= 0 || experts_per_token > num_experts) {
+        fprintf(stderr, "TOPK DEVICE Invalid parameters: num_experts=%d, experts_per_token=%d\n",
+                num_experts, experts_per_token);
+        return;
+    }
+    if (!router_score || !topk_values || !topk_indices) {
+        fprintf(stderr, "TOPK DEVICE Null pointer detected\n");
+        return;
+    }
+
+    if (num_experts > 1024) {
+        fprintf(stderr, "TOPK DEVICE Warning: num_experts=%d exceeds 1024\n", num_experts);
+        return;
+    }
+
+    // Launch kernel directly on device data
+    dim3 blockDim(1024);
+    dim3 gridDim(1);
+    hipLaunchKernelGGL(topk_kernel, gridDim, blockDim, 0, 0, router_score, topk_values,
+                       topk_indices, num_experts, experts_per_token);
+
+    CHECK_HIP(hipGetLastError());
+}

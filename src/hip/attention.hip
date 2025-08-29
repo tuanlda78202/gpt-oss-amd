@@ -355,3 +355,78 @@ void weighted_value_accumulation_hip(float* att_scores, float* v_cache, float* t
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
 }
+
+// ! HYRBID
+void compute_attention_scores_hip_device(float* q, float* k_cache, float* att_scores, float* mask,
+                                         int pos, int seq_len, int head_dim, int kv_dim, int kv_mul,
+                                         int sliding_window, int layer_idx, int n_attn_heads) {
+    CHECK_HIP(hipMemset(att_scores, 0, n_attn_heads * seq_len * sizeof(float)));
+
+    dim3 block_dim_attn(256);
+    dim3 grid_dim_attn(n_attn_heads, pos + 1);
+    hipLaunchKernelGGL(compute_attention_scores_kernel, grid_dim_attn, block_dim_attn, 0, 0, q,
+                       k_cache, att_scores, mask, pos, seq_len, head_dim, kv_dim, kv_mul,
+                       sliding_window, layer_idx, n_attn_heads);
+
+    CHECK_HIP(hipGetLastError());
+}
+
+// Kernel to convert FP16 attention sinks to FP32
+__global__ void convert_attn_sinks_kernel(__half* attn_sinks_half, float* attn_sinks_fp32,
+                                          int n_attn_heads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_attn_heads) {
+        attn_sinks_fp32[idx] = __half2float(attn_sinks_half[idx]);
+    }
+}
+
+void add_attention_sink_hip_device(float* att_scores, __half* attn_sinks_half, int pos, int seq_len,
+                                   int n_attn_heads, int layer_idx) {
+    // Convert FP16 attention sinks to FP32 on-the-fly
+    if (n_attn_heads <= 0 || pos < 0 || seq_len <= 0) {
+        printf("ATTN SINK DEVICE ERROR: INVALID ARGUMENT\n");
+        fflush(stdout);
+        return;
+    }
+
+    // Allocate temporary FP32 buffer for converted attention sinks
+    float* attn_sinks_fp32;
+    CHECK_HIP(hipMalloc(&attn_sinks_fp32, n_attn_heads * sizeof(float)));
+
+    // Convert FP16 to FP32
+    dim3 convert_block(64);
+    dim3 convert_grid((n_attn_heads + 63) / 64);
+    hipLaunchKernelGGL(convert_attn_sinks_kernel, convert_grid, convert_block, 0, 0,
+                       attn_sinks_half, attn_sinks_fp32, n_attn_heads);
+
+    dim3 block_dim_sink(1);
+    dim3 grid_dim_sink(n_attn_heads);
+    hipLaunchKernelGGL(add_attention_sink_kernel, grid_dim_sink, block_dim_sink, 0, 0, att_scores,
+                       attn_sinks_fp32, pos, seq_len, n_attn_heads, layer_idx);
+
+    CHECK_HIP(hipFree(attn_sinks_fp32));
+    CHECK_HIP(hipGetLastError());
+}
+
+void softmax_attention_hip_device(float* att_scores, int pos, int seq_len, int n_attn_heads) {
+    for (int h = 0; h < n_attn_heads; h++) {
+        float* att_head_d = att_scores + h * seq_len;
+        dim3 blockDim(1024);
+        dim3 gridDim(1);
+        hipLaunchKernelGGL(attention_softmax_kernel, gridDim, blockDim, 0, 0, att_head_d, pos + 2);
+    }
+
+    CHECK_HIP(hipGetLastError());
+}
+
+void weighted_value_accumulation_hip_device(float* att_scores, float* v_cache, float* tb, int pos,
+                                            int seq_len, int head_dim, int kv_dim, int kv_mul,
+                                            int n_attn_heads) {
+    dim3 block_dim_accum(1024);
+    dim3 grid_dim_accum(n_attn_heads, (head_dim + block_dim_accum.x - 1) / block_dim_accum.x);
+    hipLaunchKernelGGL(weighted_value_accumulation_kernel, grid_dim_accum, block_dim_accum, 0, 0,
+                       att_scores, v_cache, tb, pos, seq_len, head_dim, kv_dim, kv_mul,
+                       n_attn_heads);
+
+    CHECK_HIP(hipGetLastError());
+}

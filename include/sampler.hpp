@@ -27,3 +27,5 @@ void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, f
 void free_sampler_oss(OssSampler* sampler);
 
 int sample_oss(OssSampler* sampler, float* logits);
+
+int sample_oss_gpu(OssSampler* sampler, float* logits_d);

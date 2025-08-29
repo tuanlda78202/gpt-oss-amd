@@ -63,3 +63,17 @@ void swiglu_hip(float* gate, float* up, float* gate_up, int intermediate_dim, fl
     CHECK_HIP(hipFree(up_d));
     CHECK_HIP(hipFree(gate_up_d));
 }
+
+void swiglu_hip_device(float* gate, float* up, float* gate_up, int intermediate_dim, float alpha,
+                       float swiglu_limit) {
+    // Copy gate to gate_up first
+    CHECK_HIP(hipMemcpy(gate_up, gate, intermediate_dim * sizeof(float), hipMemcpyDeviceToDevice));
+
+    // Apply swiglu operation
+    dim3 blockDim(64);
+    dim3 gridDim((intermediate_dim + blockDim.x - 1) / blockDim.x);
+    hipLaunchKernelGGL(thaDNN_s_swiglu_kernel, gridDim, blockDim, 0, 0, gate_up, up,
+                       intermediate_dim, alpha, swiglu_limit);
+
+    CHECK_HIP(hipGetLastError());
+}

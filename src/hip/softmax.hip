@@ -2,8 +2,6 @@
 #include <cstdio>
 #include <omp.h>
 
-
-
 __global__ void s_softmax_v2_kernel(float* x, int size) {
     int lx = threadIdx.x;
     int bDim = blockDim.x;
@@ -68,4 +66,12 @@ void softmax_hip(float* x, int size) {
 
     CHECK_HIP(hipMemcpy(x, x_d, size * sizeof(float), hipMemcpyDeviceToHost));
     CHECK_HIP(hipFree(x_d));
+}
+
+void softmax_hip_device(float* x, int size) {
+    dim3 blockDim(256);
+    dim3 gridDim(1);
+    hipLaunchKernelGGL(s_softmax_v2_kernel, gridDim, blockDim, 0, 0, x, size);
+
+    CHECK_HIP(hipGetLastError());
 }

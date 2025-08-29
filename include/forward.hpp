@@ -34,3 +34,5 @@ void apply_rotary_emb_cpu(float* x, float* cos, float* sin, int n_heads, int hea
 
 // ! Forward
 float* forward_cpu(OssTransformer* transformer, int token, int pos);
+float* forward_full(OssTransformer* transformer, int token, int pos);
+float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos);

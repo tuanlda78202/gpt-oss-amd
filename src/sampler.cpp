@@ -1,5 +1,6 @@
 #include "../include/sampler.hpp"
 #include "forward_cpu.cpp"
+#include "hip/sampling.hip"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -138,5 +139,29 @@ int sample_oss(OssSampler* sampler, float* logits) {
                                    coin);
         }
     }
+    return next;
+}
+
+int sample_oss_gpu(OssSampler* sampler, float* logits_d) {
+    // GPU-based sampling - no CPU transfers of logits
+    static int* result_d = nullptr;
+    if (result_d == nullptr) {
+        CHECK_HIP(hipMalloc(&result_d, sizeof(int)));
+    }
+
+    if (sampler->temperature == 0.0f) {
+        // GPU argmax sampling
+        sample_argmax_hip_device(logits_d, sampler->vocab_size, result_d);
+    } else {
+        // GPU multinomial sampling with temperature and softmax
+        sample_multinomial_hip_device(logits_d, sampler->vocab_size, sampler->temperature,
+                                      sampler->rng_state, result_d);
+        // Update RNG state
+        sampler->rng_state = (sampler->rng_state * 1103515245 + 12345) & 0x7fffffff;
+    }
+
+    // Only transfer the result (1 int) back to CPU
+    int next;
+    CHECK_HIP(hipMemcpy(&next, result_d, sizeof(int), hipMemcpyDeviceToHost));
     return next;
 }
