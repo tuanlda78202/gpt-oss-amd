@@ -39,5 +39,4 @@ void swiglu_gpu(float* hb, float* hb2, int hidden_dim, float alpha, float swiglu
                        swiglu_limit);
 
     CHECK_HIP(hipGetLastError());
-    CHECK_HIP(hipDeviceSynchronize());
 }

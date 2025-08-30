@@ -11,8 +11,8 @@ void vec_add_vec_gpu(float* a, float* b, float weight, int size) {
     dim3 blockDim(64);
     dim3 gridDim((size + 64 - 1) / 64);
     hipLaunchKernelGGL(vecaddvec_kernel, gridDim, blockDim, 0, 0, a, b, weight, size);
+
     CHECK_HIP(hipGetLastError());
-    CHECK_HIP(hipDeviceSynchronize());
 }
 
 // ! Split Gate Up
@@ -30,5 +30,6 @@ void split_gate_up_gpu(float* mlp1_out, float* gate, float* up, int intermediate
     dim3 gridDim((intermediate_dim + 255) / 256);
     hipLaunchKernelGGL(split_gate_up_kernel, gridDim, blockDim, 0, 0, mlp1_out, gate, up,
                        intermediate_dim);
+
     CHECK_HIP(hipGetLastError());
 }

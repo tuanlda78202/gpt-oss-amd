@@ -58,5 +58,4 @@ void matvec_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
     hipLaunchKernelGGL(matvec_hybrid_tiled, grid_dim, block_dim, 0, 0, w, x, xout, bias, d, n);
 
     CHECK_HIP(hipGetLastError());
-    CHECK_HIP(hipDeviceSynchronize());
 }

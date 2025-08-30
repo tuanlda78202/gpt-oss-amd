@@ -37,5 +37,4 @@ void rmsnorm_gpu(float* o, float* x, __half* weight, int size) {
     hipLaunchKernelGGL(rmsnorm_hybrid_kernel, gridDim, blockDim, 0, 0, o, x, weight, size);
 
     CHECK_HIP(hipGetLastError());
-    CHECK_HIP(hipDeviceSynchronize());
 }

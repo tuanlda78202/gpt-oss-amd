@@ -169,8 +169,6 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     // Linear: classifier into logits
     matvec_gpu(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
 
-    CHECK_HIP(hipDeviceSynchronize());
-
     if (cos_vals) {
         CHECK_HIP(hipFree(cos_vals));
     }
