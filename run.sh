@@ -5,19 +5,180 @@ set -euo pipefail
 export MODELBIN_ROOT
 export OMP_NUM_THREADS=96
 
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'              # No Color
+
+FOREST1='\033[38;5;22m'   # Dark forest green
+FOREST2='\033[38;5;28m'   # Medium forest green
+FOREST3='\033[38;5;34m'   # Bright forest green
+FOREST4='\033[38;5;40m'   # Light forest green
+FOREST5='\033[38;5;46m'   # Very light forest green
+
+print_fancy_header() {
+  echo -e "${FOREST1}                      __"
+  echo -e "${FOREST2}                     |  \\"
+  echo -e "${FOREST3}  ______    ______  _| \$\$_           ______    _______   _______"
+  echo -e "${FOREST4} /      \\  /      \\|   \$\$ \\ ______  /      \\  /       \\ /       \\"
+  echo -e "${FOREST5}|  \$\$\$\$\$\$\\|  \$\$\$\$\$\$\\\\\$\$\$\$\$\$|      \\|  \$\$\$\$\$\$\\|  \$\$\$\$\$\$\$\$"
+  echo -e "${FOREST4}| \$\$  | \$\$| \$\$  | \$\$ | \$\$ __\\\$\$\$\$\$\$| \$\$  | \$\$ \\\$\$    \\  \\\$\$\$    \\"
+  echo -e "${FOREST3}| \$\$__| \$\$| \$\$__/ \$\$ | \$\$|  \\      | \$\$__/ \$\$ _\\\$\$\$\$\$\$\\ _\\\$\$\$\$\$\$\\"
+  echo -e "${FOREST2} \\\$\$    \$\$| \$\$    \$\$  \\\$\$  \$\$       \\\$\$    \$\$|       \$\$|       \$\$"
+  echo -e "${FOREST1} _\\\$\$\$\$\$\$\$| \$\$\$\$\$\$\$\$    \\\$\$\$\$         \\\$\$\$\$\$\$  \\\$\$\$\$\$\$\$  \\\$\$\$\$\$\$\$"
+  echo -e "${FOREST2}|  \\__| \$\$| \$\$"
+  echo -e "${FOREST3} \\\$\$    \$\$| \$\$"
+  echo -e "${FOREST4}  \\\$\$\$\$\$\$  \\\$\$"
+  echo -e "${FOREST5}  ════════════════════════════════════════════════════════════════"
+  echo -e "${FOREST4}                         gpt-oss-c (moreh)"
+  echo -e "${FOREST3}              https://github.com/tuanlda78202/gpt-oss-c"
+  echo -e "${FOREST2}  ════════════════════════════════════════════════════════════════"
+  echo -e "${NC}"
+  echo ""
+}
+
+# Color functions
+print_header() {
+  local color="$1"
+  local title="$2"
+  echo -e "${color}==================================================================${NC}"
+  echo -e "${color}[$2]${NC} ${WHITE}$(now)${NC}"
+}
+
+print_step() {
+  echo -e "${GREEN}+${NC} $1"
+}
+
+print_warning() {
+  echo -e "${YELLOW}[WARNING]${NC} $1" >&2
+}
+
+print_error() {
+  echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+print_success() {
+  echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_info() {
+  echo -e "${CYAN}[INFO]${NC} $1"
+}
+
+print_command() {
+  echo -e "${PURPLE}>>>${NC} $1"
+}
+
+print_executing() {
+  echo -e "${YELLOW} EXECUTING:${NC} $1"
+}
+
 usage() {
-  cat <<USAGE
-Usage:
-  ./run.sh build [default|fast|omp]         (default: omp)
-  ./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]
-                [-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED]
-      - Default checkpoint (if not provided): ${MODELBIN_ROOT}/gpt-oss-20b.bin
-      - In getp mode: -i defaults to tests/data/input.txt, -o defaults to tests/data/output.txt
-  ./run.sh decode [-i OUTPUT_FILE]
-  ./run.sh tokenizer export (builds tokenizer.bin)
-  ./run.sh tokenizer test [-t TOKENIZER_BIN] [-i PROMPT] (builds and runs the C++ tokenizer test)
-  ./run.sh tokenizer verify [--bin BIN_PATH] [--tok TOK_PATH] [--prompt PROMPT] [--quiet]
-USAGE
+  echo -e "${YELLOW}🚀 QUICK START:${NC}"
+  echo -e "  ${GREEN}./run.sh build${NC}                    # Build the project (default: omp flavor)"
+  echo -e "  ${GREEN}./run.sh run${NC}                      # Run with default settings (getp mode, 1 GPU)"
+  echo -e "  ${GREEN}./run.sh all${NC}                      # Build and run in one command"
+  echo -e "  ${GREEN}./run.sh -h${NC}                       # Show this help message"
+  echo ""
+  echo -e "${YELLOW}🔨 BUILD COMMANDS:${NC}"
+  echo -e "  ${GREEN}./run.sh build [default|fast|omp]${NC}         (default: omp)"
+  echo ""
+  echo -e "  ${CYAN}Build Flavors:${NC}"
+  echo -e "    ${WHITE}default${NC}  - Uses 'make run'"
+  echo -e "    ${WHITE}fast${NC}     - Uses 'make runfast'"
+  echo -e "    ${WHITE}omp${NC}      - Uses 'make runomp' (recommended)"
+  echo ""
+  echo -e "${RED}‍♂️ RUN COMMANDS:${NC}"
+  echo -e "  ${GREEN}./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS]${NC}"
+  echo ""
+  echo -e "  ${CYAN}Key Features:${NC}"
+  echo -e "    • Default checkpoint: ${WHITE}${MODELBIN_ROOT}/gpt-oss-20b.bin${NC}"
+  echo -e "    • Default mode: ${WHITE}getp${NC} (uses 20b model)"
+  echo -e "    • GPU allocation: Automatically uses ${WHITE}'srun --gres=gpu:N_GPUS'${NC}"
+  echo -e "    • Logging: Save output to ${WHITE}log.txt${NC} with -l flag"
+  echo ""
+  echo -e "  ${CYAN}Mode-specific defaults for getp:${NC}"
+  echo -e "    • Input defaults to: ${WHITE}tests/data/input.txt${NC}"
+  echo -e "    • Output defaults to: ${WHITE}tests/data/output.txt${NC}"
+  echo ""
+  echo -e "  ${CYAN}Parameters:${NC}"
+  echo -e "    ${WHITE}-c, --checkpoint PATH${NC}  Specify model checkpoint"
+  echo -e "    ${WHITE}-m MODE${NC}                Set run mode (default: getp)"
+  echo -e "    ${WHITE}-i INPUT${NC}               Input file path"
+  echo -e "    ${WHITE}-o OUTPUT${NC}              Output file path"
+  echo -e "    ${WHITE}-z TOKENIZER${NC}           Tokenizer path"
+  echo -e "    ${WHITE}-y SYS${NC}                 System prompt"
+  echo -e "    ${WHITE}-t TEMP${NC}                Temperature (default: 0.0)"
+  echo -e "    ${WHITE}-p TOP_P${NC}               Top-p sampling (default: 0.9)"
+  echo -e "    ${WHITE}-n STEPS${NC}               Number of steps (default: 1024)"
+  echo -e "    ${WHITE}-s SEED${NC}                Random seed"
+  echo -e "    ${WHITE}-l${NC}                     Log output to log.txt"
+  echo -e "    ${WHITE}-g N_GPUS${NC}              Number of GPUs to request (default: 1)"
+  echo ""
+  echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
+  echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS]${NC}"
+  echo ""
+  echo -e "  ${CYAN}Features:${NC}"
+  echo -e "    • Combines: ${WHITE}./run.sh build && ./run.sh run${NC}"
+  echo -e "    • ${WHITE}-c${NC} flag runs 'make clean' before building"
+  echo -e "    • All other flags are passed to the run command"
+  echo ""
+  echo -e "${BLUE} DECODE COMMANDS:${NC}"
+  echo -e "  ${GREEN}./run.sh decode [-i OUTPUT_FILE] [-l]${NC}"
+  echo ""
+  echo -e "  ${CYAN}Features:${NC}"
+  echo -e "    • Default input: ${WHITE}tests/gt/output.txt${NC} (GT file)"
+  echo -e "    • ${WHITE}-l${NC} flag saves decoded output to ${WHITE}gt_decoded.txt${NC}"
+  echo ""
+  echo -e "${CYAN} TOKENIZER COMMANDS:${NC}"
+  echo -e "  ${GREEN}./run.sh tokenizer export${NC}                               # Builds tokenizer.bin"
+  echo -e "  ${GREEN}./run.sh tokenizer test [-t TOKENIZER_BIN] [-i PROMPT]${NC}  # Builds and runs C++ tokenizer test"
+  echo -e "  ${GREEN}./run.sh tokenizer verify [--bin BIN_PATH] [--tok TOK_PATH] [--prompt PROMPT] [--quiet]${NC}"
+  echo ""
+  echo -e "${WHITE}📁 FILE STRUCTURE:${NC}"
+  echo -e "  ${CYAN}tests/${NC}"
+  echo -e "  ├── ${CYAN}data/${NC}"
+  echo -e "  │   ├── ${WHITE}input.txt${NC}          # Default input for getp mode"
+  echo -e "  │   └── ${WHITE}output.txt${NC}         # Default output for getp mode"
+  echo -e "  └── ${CYAN}gt/${NC}"
+  echo -e "      └── ${WHITE}output.txt${NC}         # Default GT file for decode"
+  echo -e "  ${CYAN}build/${NC}                     # Build artifacts"
+  echo -e "  ${WHITE}log.txt${NC}                    # Output log (when using -l flag)"
+  echo ""
+  echo -e "${GREEN} EXAMPLE USAGE:${NC}"
+  echo -e "  ${CYAN}# Basic getp mode with 1 GPU${NC}"
+  echo -e "  ${GREEN}./run.sh run${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Getp mode with 2 GPUs and logging${NC}"
+  echo -e "  ${GREEN}./run.sh run -g 2 -l${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Custom checkpoint with 4 GPUs${NC}"
+  echo -e "  ${GREEN}./run.sh run -c /path/to/model.bin -g 4${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Build and run with clean${NC}"
+  echo -e "  ${GREEN}./run.sh all -c -g 2${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Decode GT file and save output${NC}"
+  echo -e "  ${GREEN}./run.sh decode -l${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Test tokenizer with custom prompt${NC}"
+  echo -e "  ${GREEN}./run.sh tokenizer test -i \"Hello, world!\"${NC}"
+  echo ""
+  echo -e "${YELLOW}⚙️ ENVIRONMENT VARIABLES:${NC}"
+  echo -e "  ${WHITE}MODELBIN_ROOT${NC}     - Path to model binaries (default: ${CYAN}${MODELBIN_ROOT}${NC})"
+  echo -e "  ${WHITE}OMP_NUM_THREADS${NC}   - OpenMP thread count (default: ${CYAN}96${NC})"
+  echo ""
+  echo -e "${BLUE}🔧 DEPENDENCIES:${NC}"
+  echo -e "  ${WHITE}make${NC}      - For building the project"
+  echo -e "  ${WHITE}srun${NC}      - For GPU allocation (SLURM)"
+  echo -e "  ${WHITE}python3${NC}   - For tokenizer verification tests"
 }
 
 now() { date +"%Y-%m-%d %H:%M:%S"; }
@@ -49,13 +210,31 @@ find_checkpoint() {
 
 cmd_build() {
   local flavor="${1:-omp}"
-  echo "[BUILD] $(now)"
+  print_header "${YELLOW}" "BUILD"
   print_kv "flavor" "${flavor}"
   case "${flavor}" in
-    default) echo "+ make run"; make run ;;
-    fast)    echo "+ make runfast"; make runfast ;;
-    omp)     echo "+ make runomp"; make runomp ;;
-    *) echo "Unknown build flavor: ${flavor}. Use: default|fast|omp" >&2; exit 1 ;;
+    default)
+      print_step "make run"
+      print_executing "make run"
+      make run
+      print_success "Build completed successfully"
+      ;;
+    fast)
+      print_step "make runfast"
+      print_executing "make runfast"
+      make runfast
+      print_success "Build completed successfully"
+      ;;
+    omp)
+      print_step "make runomp"
+      print_executing "make runomp"
+      make runomp
+      print_success "Build completed successfully"
+      ;;
+    *)
+      print_error "Unknown build flavor: ${flavor}. Use: default|fast|omp"
+      exit 1
+      ;;
   esac
 }
 
@@ -70,6 +249,8 @@ cmd_run() {
   local top_p=""
   local steps=""
   local seed=""
+  local log_output=""
+  local n_gpus="1"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -83,6 +264,8 @@ cmd_run() {
       -p) top_p="$2"; shift 2 ;;
       -n) steps="$2"; shift 2 ;;
       -s) seed="$2"; shift 2 ;;
+      -l) log_output="1"; shift 1 ;;
+      -g) n_gpus="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -90,23 +273,27 @@ cmd_run() {
 
   ckpt="$(find_checkpoint "${ckpt}")"
   if [[ -z "${ckpt}" ]]; then
-    echo "Checkpoint not found. Set MODELBIN_ROOT or pass --checkpoint." >&2
+    print_error "Checkpoint not found. Set MODELBIN_ROOT or pass --checkpoint."
     exit 1
   fi
 
+  # Default mode is getp if not specified
+  [[ -z "${mode}" ]] && mode="getp"
+
   # Mode-specific defaults for getp
-  if [[ "${mode:-}" == "getp" ]]; then
+  if [[ "${mode}" == "getp" ]]; then
     [[ -z "${inp}" ]] && inp="tests/data/input.txt"
     [[ -z "${out}" ]] && out="tests/data/output.txt"
   fi
 
-  echo "[RUN] $(now)"
+  print_header "${RED}" "RUN"
   print_kv "cwd"           "$(pwd)"
   print_kv "MODELBIN_ROOT" "${MODELBIN_ROOT:-<unset>}"
   print_kv "checkpoint"    "${ckpt}"
-  print_kv "mode"          "${mode:-generate}" "$([[ -z "${mode:-}" ]] && echo "(run.cpp default)" || echo "")"
+  print_kv "mode"          "${mode}" "$([[ "${mode}" == "getp" ]] && echo "(default)" || echo "(provided)")"
+  print_kv "gpus(-g)"      "${n_gpus}" "$([[ "${n_gpus}" == "1" ]] && echo "(default)" || echo "(requested)")"
 
-  if [[ "${mode:-}" == "getp" ]]; then
+  if [[ "${mode}" == "getp" ]]; then
     print_kv "input(-i)"  "${inp}"  "$([[ "${inp}" == "tests/data/input.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
     print_kv "output(-o)" "${out}"  "$([[ "${out}" == "tests/data/output.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
   else
@@ -119,10 +306,11 @@ cmd_run() {
   print_kv "top_p(-p)"     "${top_p:-0.9}"  "$([[ -z "${top_p:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "steps(-n)"     "${steps:-1024}" "$([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "seed(-s)"      "${seed:-time(NULL)}" "$([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "logging(-l)"   "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to log.txt)" || echo "(disabled)")"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
   if [[ ! -x build/run ]]; then
-    echo "[hint] build/run not found or not executable. Build it via: ./run.sh build" >&2
+    print_warning "build/run not found or not executable. Build it via: ./run.sh build"
   fi
 
   # Build command line (only pass provided flags; plus getp defaults)
@@ -137,25 +325,80 @@ cmd_run() {
   [[ -n "${steps}" ]] && args+=(-n "${steps}")
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
 
-  echo "+ build/run \"${ckpt}\" ${args[*]:-}"
-  build/run "${ckpt}" "${args[@]:-}"
+  # Always use srun with GPU allocation
+  local srun_cmd="srun --gres=gpu:${n_gpus}"
+  print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
+
+  if [[ -n "${log_output}" ]]; then
+    print_info "logging output to log.txt"
+    print_executing "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
+    ${srun_cmd} build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
+  else
+    print_executing "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
+    ${srun_cmd} build/run "${ckpt}" "${args[@]:-}"
+  fi
+}
+
+cmd_all() {
+  local clean_flag=""
+  local run_args=()
+
+  # Parse arguments - separate clean flag from run arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c) clean_flag="1"; shift 1 ;;
+      *) run_args+=("$1"); shift 1 ;;
+    esac
+  done
+
+  print_header "${PURPLE}" "ALL"
+  print_kv "clean" "${clean_flag:+enabled}" "$([[ -n "${clean_flag}" ]] && echo "(-c flag)" || echo "(disabled)")"
+
+  # Run make clean if -c flag is provided
+  if [[ -n "${clean_flag}" ]]; then
+    print_step "make clean"
+    print_executing "make clean"
+    make clean
+    print_success "Clean completed"
+  fi
+
+  # Build
+  print_info "building..."
+  cmd_build "omp"
+
+  # Run
+  print_info "running..."
+  cmd_run "${run_args[@]}"
 }
 
 cmd_decode() {
-  local infile="tests/data/output.txt"
+  local infile="tests/gt/output.txt"
+  local log_output=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -i) infile="$2"; shift 2 ;;
-      -h|--help) echo "Usage: ./run.sh decode [-i OUTPUT_FILE]"; exit 0 ;;
+      -l) log_output="1"; shift 1 ;;
+      -h|--help) echo "Usage: ./run.sh decode [-i OUTPUT_FILE] [-l]"; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
   done
-  echo "[DECODE] $(now)"
-  print_kv "input(-i)" "${infile}" "$([[ "${infile}" == "tests/data/output.txt" ]] && echo "(run.sh default)" || echo "(provided)")"
-  echo "+ make decode"
+  print_header "${BLUE}" "DECODE"
+  print_kv "input(-i)" "${infile}" "$([[ "${infile}" == "tests/gt/output.txt" ]] && echo "(run.sh default GT)" || echo "(provided)")"
+  print_kv "logging(-l)" "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to gt_decoded.txt)" || echo "(disabled)")"
+  print_step "make decode"
+  print_executing "make decode"
   make decode
-  echo "+ build/decode -1 -i \"${infile}\""
-  build/decode -1 -i "${infile}"
+  print_command "build/decode -1 -i \"${infile}\""
+
+  if [[ -n "${log_output}" ]]; then
+    print_info "saving decoded output to gt_decoded.txt"
+    print_executing "build/decode -1 -i \"${infile}\" > gt_decoded.txt"
+    build/decode -1 -i "${infile}" > gt_decoded.txt 2>&1
+    print_success "decoded output saved to gt_decoded.txt"
+  else
+    print_executing "build/decode -1 -i \"${infile}\""
+    build/decode -1 -i "${infile}"
+  fi
 }
 
 cmd_tokenizer() {
@@ -163,9 +406,11 @@ cmd_tokenizer() {
   shift || true
   case "${action}" in
     export)
-      echo "[TOKENIZER export] $(now)"
-      echo "+ make tokenizer-bin"
+      print_header "${CYAN}" "TOKENIZER export"
+      print_step "make tokenizer-bin"
+      print_executing "make tokenizer-bin"
       make tokenizer-bin
+      print_success "Tokenizer export completed"
       ;;
     test)
       local tokbin="build/tokenizer.bin"
@@ -178,12 +423,14 @@ cmd_tokenizer() {
           *) echo "Unknown argument: $1" >&2; exit 1 ;;
         esac
       done
-      echo "[TOKENIZER test] $(now)"
+      print_header "${CYAN}" "TOKENIZER test"
       print_kv "tokbin" "${tokbin}" "$([[ "${tokbin}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")"
       print_kv "prompt" "${prompt}" "$([[ "${prompt}" == "Hello world" ]] && echo "(default)" || echo "(provided)")"
-      echo "+ make tokenizer-test"
+      print_step "make tokenizer-test"
+      print_executing "make tokenizer-test"
       make tokenizer-test
-      echo "+ build/test_tokenizer -t \"${tokbin}\" -i \"${prompt}\""
+      print_command "build/test_tokenizer -t \"${tokbin}\" -i \"${prompt}\""
+      print_executing "build/test_tokenizer -t \"${tokbin}\" -i \"${prompt}\""
       build/test_tokenizer -t "${tokbin}" -i "${prompt}"
       ;;
     verify)
@@ -201,12 +448,13 @@ cmd_tokenizer() {
           *) echo "Unknown argument: $1" >&2; exit 1 ;;
         esac
       done
-      echo "[TOKENIZER verify] $(now)"
+      print_header "${CYAN}" "TOKENIZER verify"
       print_kv "bin"    "${bin}" "$([[ "${bin}" == "build/test_tokenizer" ]] && echo "(default)" || echo "(provided)")"
       print_kv "tok"    "${tok}" "$([[ "${tok}" == "build/tokenizer.bin" ]] && echo "(default)" || echo "(provided)")"
       print_kv "prompt" "${prompt}" "$([[ "${prompt}" == "tests/data/input.txt" ]] && echo "(default)" || echo "(provided)")"
       print_kv "flags"  "${verbose:-<none>}"
-      echo "+ python3 tests/test_tokenizer.py --bin \"${bin}\" --tok \"${tok}\" ${verbose} --prompt \"${prompt}\""
+      print_command "python3 tests/test_tokenizer.py --bin \"${bin}\" --tok \"${tok}\" ${verbose} --prompt \"${prompt}\""
+      print_executing "python3 tests/test_tokenizer.py --bin \"${bin}\" --tok \"${tok}\" ${verbose} --prompt \"${prompt}\""
       python3 tests/test_tokenizer.py --bin "${bin}" --tok "${tok}" ${verbose} --prompt "${prompt}"
       ;;
     *)
@@ -215,12 +463,15 @@ cmd_tokenizer() {
 }
 
 main() {
+  print_fancy_header
+
   local sub="${1:-}"
   if [[ -z "${sub}" ]]; then usage; exit 1; fi
   shift || true
   case "${sub}" in
     build)     cmd_build "${1:-omp}" ;;
     run)       cmd_run "$@" ;;
+    all)       cmd_all "$@" ;;
     decode)    cmd_decode "$@" ;;
     tokenizer) cmd_tokenizer "$@" ;;
     -h|--help|help) usage ;;

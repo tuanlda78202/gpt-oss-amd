@@ -27,12 +27,12 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-    printf("\n=== HYBRID WARM-UP COMPLETE ===\n");
+    printf("\n--- HYBRID WARM-UP COMPLETE ---\n");
     printf("GPU Memory Status:\n");
     printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("================================\n");
+    printf("-------------------------------\n");
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
@@ -43,12 +43,12 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-    printf("\n=== HYBRID FINISH COMPLETE ===\n");
+    printf("\n--- HYBRID FINISH COMPLETE ---\n");
     printf("GPU Memory Status:\n");
     printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("================================\n");
+    printf("-------------------------------\n");
 }
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
