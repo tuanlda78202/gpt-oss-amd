@@ -3,13 +3,13 @@
 #include <algorithm>
 #include <cstdio>
 
-// ====== SIMPLE AND CORRECT TOP-K KERNEL ======
 __global__ void topk_kernel(float* router_score, float* topk_values, int* topk_indices,
                             int num_experts, int experts_per_token) {
     // Use shared memory for the scores and indices
     __shared__ float shared_scores[1024];
     __shared__ int shared_indices[1024];
     int tid = threadIdx.x;
+
     // Load data into shared memory
     if (tid < num_experts) {
         shared_scores[tid] = router_score[tid];
@@ -19,6 +19,7 @@ __global__ void topk_kernel(float* router_score, float* topk_values, int* topk_i
         shared_indices[tid] = -1;
     }
     __syncthreads();
+
     // Only thread 0 performs the sorting to avoid race conditions
     if (tid == 0) {
         // Simple selection sort for top-k (efficient for small k)
@@ -46,7 +47,6 @@ __global__ void topk_kernel(float* router_score, float* topk_values, int* topk_i
         }
     }
     __syncthreads();
-    // Write results (all threads can participate in writing)
     if (tid < experts_per_token) {
         topk_values[tid] = shared_scores[tid];
         topk_indices[tid] = shared_indices[tid];
@@ -70,7 +70,6 @@ void topk_gpu(float* topk_values, int* topk_indices, float* router_score, int nu
         return;
     }
 
-    // Launch kernel directly on device data
     dim3 blockDim(1024);
     dim3 gridDim(1);
     hipLaunchKernelGGL(topk_kernel, gridDim, blockDim, 0, 0, router_score, topk_values,

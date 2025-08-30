@@ -27,12 +27,6 @@ __global__ void rmsnorm_hybrid_kernel(float* o, float* x, __half* weight_half, i
 
     ss_float = total_sum;
     for (int i = lx; i < size; i += blockDim.x) {
-        // Convert FP16 weight to FP32 with exact precision
-        // __half weight_val = weight_half[i];
-        // float weight_fp32 = __half2float(weight_val);
-        // Ensure exact computation order for reproducibility
-        // float scaled_x = ss_float * x[i];
-        // o[i] = weight_fp32 * scaled_x;
         o[i] = __half2float(weight_half[i]) * ss_float * x[i];
     }
 }

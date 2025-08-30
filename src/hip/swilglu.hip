@@ -1,6 +1,5 @@
 #include "BLAS.hip"
 
-// '_s_' = single precision (float)
 __global__ void swiglu_gpu_kernel(float* hb, float* hb2, int hidden_dim, float alpha,
                                        float swiglu_limit) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -27,8 +26,6 @@ __global__ void swiglu_gpu_kernel(float* hb, float* hb2, int hidden_dim, float a
     hb[i] = val;
 }
 
-// '_s_' = single precision
-// input: hb, hb2 allocated on device
 void swiglu_gpu(float* hb, float* hb2, int hidden_dim, float alpha, float swiglu_limit) {
     if (hidden_dim == 0 || hb == nullptr || hb2 == nullptr) {
         printf("THABLAS SwiGLU ERROR: INVALID ARGUMENT\n");
@@ -43,18 +40,4 @@ void swiglu_gpu(float* hb, float* hb2, int hidden_dim, float alpha, float swiglu
 
     CHECK_HIP(hipGetLastError());
     CHECK_HIP(hipDeviceSynchronize());
-}
-
-void swiglu_hip_device(float* gate, float* up, float* gate_up, int intermediate_dim, float alpha,
-                       float swiglu_limit) {
-    // Copy gate to gate_up first
-    CHECK_HIP(hipMemcpy(gate_up, gate, intermediate_dim * sizeof(float), hipMemcpyDeviceToDevice));
-
-    // Apply swiglu operation
-    dim3 blockDim(64);
-    dim3 gridDim((intermediate_dim + blockDim.x - 1) / blockDim.x);
-    hipLaunchKernelGGL(swiglu_gpu_kernel, gridDim, blockDim, 0, 0, gate_up, up,
-                       intermediate_dim, alpha, swiglu_limit);
-
-    CHECK_HIP(hipGetLastError());
 }

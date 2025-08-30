@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <omp.h>
 
-__global__ void s_softmax_v2_kernel(float* x, int size) {
+__global__ void softmax_kernel(float* x, int size) {
     int lx = threadIdx.x;
     int bDim = blockDim.x;
 
@@ -39,39 +39,10 @@ __global__ void s_softmax_v2_kernel(float* x, int size) {
     }
 }
 
-// _s_ = single persion (float)
-// input: output, x allocated on device
-// input: size = 32000
-void s_softmax_v2(float* x, int size) {
-    if (size == 0 || x == nullptr) {
-        fprintf(stderr, "SOFTMAX ERROR: INVALID ARGUMENT\n");
-        return;
-    }
-
-    dim3 blockDim(256);
-    dim3 gridDim(1);
-
-    hipLaunchKernelGGL(s_softmax_v2_kernel, gridDim, blockDim, 0, 0, x, size);
-
-    CHECK_HIP(hipGetLastError());
-    CHECK_HIP(hipDeviceSynchronize());
-}
-
-void softmax_hip(float* x, int size) {
-    float* x_d;
-    CHECK_HIP(hipMalloc(&x_d, size * sizeof(float)));
-    CHECK_HIP(hipMemcpy(x_d, x, size * sizeof(float), hipMemcpyHostToDevice));
-
-    s_softmax_v2(x_d, size);
-
-    CHECK_HIP(hipMemcpy(x, x_d, size * sizeof(float), hipMemcpyDeviceToHost));
-    CHECK_HIP(hipFree(x_d));
-}
-
 void softmax_gpu(float* x, int size) {
     dim3 blockDim(256);
     dim3 gridDim(1);
-    hipLaunchKernelGGL(s_softmax_v2_kernel, gridDim, blockDim, 0, 0, x, size);
+    hipLaunchKernelGGL(softmax_kernel, gridDim, blockDim, 0, 0, x, size);
 
     CHECK_HIP(hipGetLastError());
 }

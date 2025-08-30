@@ -55,7 +55,7 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         __half* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-        matmul_gpu(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
+        matvec_gpu(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
                    (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
         // ! Separate q, k, v on GPU
@@ -91,7 +91,7 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         __half* b_o = w->b_o + 1ll * l * hidden_dim;
 
-        matmul_gpu(s->tb2, s->tb, w_o, b_o, head_dim * p->n_attn_heads, hidden_dim);
+        matvec_gpu(s->tb2, s->tb, w_o, b_o, head_dim * p->n_attn_heads, hidden_dim);
 
         // ! Residual connection
         vec_add_vec_gpu(x, s->tb2, 1.0f, hidden_dim);
@@ -103,7 +103,7 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         __half* b_router = w->b_router + 1ll * l * n_experts;
 
-        matmul_gpu(s->router_score, s->t, w_router, b_router, hidden_dim, n_experts);
+        matvec_gpu(s->router_score, s->t, w_router, b_router, hidden_dim, n_experts);
 
         topk_gpu(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
         softmax_gpu(s->topk_v, p->experts_per_token);
@@ -133,16 +133,16 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
             __half* w_mlp1 = w->w_mlp1 + w_mlp1_offset;
             __half* b_mlp1 = w->b_mlp1 + b_mlp1_offset;
 
-            matmul_gpu(s->mlp1_out, s->t, w_mlp1, b_mlp1, hidden_dim, 2 * p->intermediate_dim);
+            matvec_gpu(s->mlp1_out, s->t, w_mlp1, b_mlp1, hidden_dim, 2 * p->intermediate_dim);
 
-            // Split mlp1_out into gate and up
+            // ! Split mlp1_out into gate and up
             split_gate_up_gpu(s->mlp1_out, s->gate, s->up, p->intermediate_dim);
 
-            // SwiGLU non-linearity
+            // ! SwiGLU non-linearity
             const float alpha = 1.702f;
             swiglu_gpu(s->gate, s->up, p->intermediate_dim, alpha, p->swiglu_limit);
 
-            // Copy result back to gate_up buffer
+            // ! Copy result back to gate_up buffer
             CHECK_HIP(hipMemcpy(s->gate_up, s->gate, p->intermediate_dim * sizeof(float),
                                 hipMemcpyDeviceToDevice));
 
@@ -153,9 +153,9 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
             __half* w_mlp2 = w->w_mlp2 + w_mlp2_offset;
             __half* b_mlp2 = w->b_mlp2 + b_mlp2_offset;
 
-            matmul_gpu(s->tb2, s->gate_up, w_mlp2, b_mlp2, hidden_dim, p->intermediate_dim);
+            matvec_gpu(s->tb2, s->gate_up, w_mlp2, b_mlp2, hidden_dim, p->intermediate_dim);
 
-            // Aggregate expert
+            // ! Aggregate expert
             vec_add_vec_gpu(s->e_agg, s->tb2, expert_w, hidden_dim);
         }
 
@@ -167,7 +167,7 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     rmsnorm_gpu(x, x, w->rms_out_w, hidden_dim);
 
     // Linear: classifier into logits
-    matmul_gpu(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
+    matvec_gpu(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
 
     CHECK_HIP(hipDeviceSynchronize());
 
