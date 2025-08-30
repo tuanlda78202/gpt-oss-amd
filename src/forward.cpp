@@ -7,6 +7,7 @@
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
 #include "hip/softmax.hip"
+#include "hip/split_qkv.hip"
 #include "hip/swilglu.hip"
 #include "hip/topk.hip"
 #include <cassert>
@@ -58,13 +59,8 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         matvec_gpu(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
                    (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
-        // ! Separate q, k, v on GPU
-        CHECK_HIP(hipMemcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float),
-                            hipMemcpyDeviceToDevice));
-        CHECK_HIP(hipMemcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
-                            head_dim * p->n_kv_heads * sizeof(float), hipMemcpyDeviceToDevice));
-        CHECK_HIP(hipMemcpy(s->v, s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
-                            head_dim * p->n_kv_heads * sizeof(float), hipMemcpyDeviceToDevice));
+        // ! Split QKV
+        split_qkv_gpu(s->qkv, s->q, s->k, s->v, head_dim, p->n_attn_heads, p->n_kv_heads);
 
         // ! RoPE
         float ntk_beta = 32.0f;

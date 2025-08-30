@@ -1,3 +1,5 @@
+#include "BLAS.hip"
+
 __global__ void convert_embedding_kernel(__half* content_row_half, float* x, int hidden_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < hidden_dim) {
