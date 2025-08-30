@@ -41,7 +41,7 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
 
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! RMSNorm
-        rmsnorm_hip_hybrid_device(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
+        rmsnorm_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
         // ! KV cache management
         int loff = l * p->seq_len * kv_dim;
@@ -55,8 +55,8 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         __half* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-        matmul_hip_hybrid_device(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
-                                 (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        matmul_gpu(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
+                   (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
         // ! Separate q, k, v on GPU
         CHECK_HIP(hipMemcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float),
@@ -70,47 +70,43 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         float ntk_beta = 32.0f;
         float ntk_alpha = 1.0f;
 
-        compute_cos_sin_hip_device(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                                   p->initial_context_length, ntk_beta, ntk_alpha, cos_vals,
-                                   sin_vals);
-
-        apply_rotary_emb_hip_device(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
-        apply_rotary_emb_hip_device(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
+        compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                          p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
+        rope_gpu(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
+        rope_gpu(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
 
         // ! MHA
-        compute_attention_scores_hip_device(s->q, s->key_cache + loff, s->att, s->mask, pos,
-                                            p->seq_len, head_dim, kv_dim, kv_mul, p->sliding_window,
-                                            l, p->n_attn_heads);
+        compute_attn_gpu(s->q, s->key_cache + loff, s->att, s->mask, pos, p->seq_len, head_dim,
+                         kv_dim, kv_mul, p->sliding_window, l, p->n_attn_heads);
 
-        add_attention_sink_hip_device(s->att, w->attn_sinks + l * p->n_attn_heads, pos, p->seq_len,
-                                      p->n_attn_heads, l);
+        add_attn_sink_gpu(s->att, w->attn_sinks + l * p->n_attn_heads, pos, p->seq_len,
+                          p->n_attn_heads, l);
 
-        softmax_attention_hip_device(s->att, pos, p->seq_len, p->n_attn_heads);
+        softmax_attn_gpu(s->att, pos, p->seq_len, p->n_attn_heads);
 
-        weighted_value_accumulation_hip_device(s->att, s->value_cache + loff, s->tb, pos,
-                                               p->seq_len, head_dim, kv_dim, kv_mul,
-                                               p->n_attn_heads);
+        w_value_acc_gpu(s->att, s->value_cache + loff, s->tb, pos, p->seq_len, head_dim, kv_dim,
+                        kv_mul, p->n_attn_heads);
 
         // ! Output projection
         __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         __half* b_o = w->b_o + 1ll * l * hidden_dim;
 
-        matmul_hip_hybrid_device(s->tb2, s->tb, w_o, b_o, head_dim * p->n_attn_heads, hidden_dim);
+        matmul_gpu(s->tb2, s->tb, w_o, b_o, head_dim * p->n_attn_heads, hidden_dim);
 
         // ! Residual connection
-        vecaddvec_hip_device(x, s->tb2, 1.0f, hidden_dim);
+        vec_add_vec_gpu(x, s->tb2, 1.0f, hidden_dim);
 
         // ! RMSNorm
-        rmsnorm_hip_hybrid_device(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
+        rmsnorm_gpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
 
         // ! MoE Router
         __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         __half* b_router = w->b_router + 1ll * l * n_experts;
 
-        matmul_hip_hybrid_device(s->router_score, s->t, w_router, b_router, hidden_dim, n_experts);
+        matmul_gpu(s->router_score, s->t, w_router, b_router, hidden_dim, n_experts);
 
-        topk_hip_device(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
-        softmax_hip_device(s->topk_v, p->experts_per_token);
+        topk_gpu(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
+        softmax_gpu(s->topk_v, p->experts_per_token);
 
         // ! Expert processing
         CHECK_HIP(hipMemset(s->e_agg, 0, hidden_dim * sizeof(float)));
@@ -137,15 +133,14 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
             __half* w_mlp1 = w->w_mlp1 + w_mlp1_offset;
             __half* b_mlp1 = w->b_mlp1 + b_mlp1_offset;
 
-            matmul_hip_hybrid_device(s->mlp1_out, s->t, w_mlp1, b_mlp1, hidden_dim,
-                                     2 * p->intermediate_dim);
+            matmul_gpu(s->mlp1_out, s->t, w_mlp1, b_mlp1, hidden_dim, 2 * p->intermediate_dim);
 
             // Split mlp1_out into gate and up
-            split_gate_up_hip_device(s->mlp1_out, s->gate, s->up, p->intermediate_dim);
+            split_gate_up_gpu(s->mlp1_out, s->gate, s->up, p->intermediate_dim);
 
             // SwiGLU non-linearity
             const float alpha = 1.702f;
-            thaDNN_s_swiglu(s->gate, s->up, p->intermediate_dim, alpha, p->swiglu_limit);
+            swiglu_gpu(s->gate, s->up, p->intermediate_dim, alpha, p->swiglu_limit);
 
             // Copy result back to gate_up buffer
             CHECK_HIP(hipMemcpy(s->gate_up, s->gate, p->intermediate_dim * sizeof(float),
@@ -158,22 +153,21 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
             __half* w_mlp2 = w->w_mlp2 + w_mlp2_offset;
             __half* b_mlp2 = w->b_mlp2 + b_mlp2_offset;
 
-            matmul_hip_hybrid_device(s->tb2, s->gate_up, w_mlp2, b_mlp2, hidden_dim,
-                                     p->intermediate_dim);
+            matmul_gpu(s->tb2, s->gate_up, w_mlp2, b_mlp2, hidden_dim, p->intermediate_dim);
 
             // Aggregate expert
-            vecaddvec_hip_device(s->e_agg, s->tb2, expert_w, hidden_dim);
+            vec_add_vec_gpu(s->e_agg, s->tb2, expert_w, hidden_dim);
         }
 
         // Residual connection
-        vecaddvec_hip_device(x, s->e_agg, 1.0f, hidden_dim);
+        vec_add_vec_gpu(x, s->e_agg, 1.0f, hidden_dim);
     }
 
     // Final operations
-    rmsnorm_hip_hybrid_device(x, x, w->rms_out_w, hidden_dim);
+    rmsnorm_gpu(x, x, w->rms_out_w, hidden_dim);
 
     // Linear: classifier into logits
-    matmul_hip_hybrid_device(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
+    matmul_gpu(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
 
     CHECK_HIP(hipDeviceSynchronize());
 

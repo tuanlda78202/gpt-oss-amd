@@ -264,7 +264,7 @@ void weighted_value_accumulation_hip(float* att_scores, float* v_cache, float* t
 }
 
 // ! HYRBID
-void compute_attention_scores_hip_device(float* q, float* k_cache, float* att_scores, float* mask,
+void compute_attn_gpu(float* q, float* k_cache, float* att_scores, float* mask,
                                          int pos, int seq_len, int head_dim, int kv_dim, int kv_mul,
                                          int sliding_window, int layer_idx, int n_attn_heads) {
     CHECK_HIP(hipMemset(att_scores, 0, n_attn_heads * seq_len * sizeof(float)));
@@ -287,7 +287,7 @@ __global__ void convert_attn_sinks_kernel(__half* attn_sinks_half, float* attn_s
     }
 }
 
-void add_attention_sink_hip_device(float* att_scores, __half* attn_sinks_half, int pos, int seq_len,
+void add_attn_sink_gpu(float* att_scores, __half* attn_sinks_half, int pos, int seq_len,
                                    int n_attn_heads, int layer_idx) {
     // Convert FP16 attention sinks to FP32 on-the-fly
     if (n_attn_heads <= 0 || pos < 0 || seq_len <= 0) {
@@ -315,7 +315,7 @@ void add_attention_sink_hip_device(float* att_scores, __half* attn_sinks_half, i
     CHECK_HIP(hipGetLastError());
 }
 
-void softmax_attention_hip_device(float* att_scores, int pos, int seq_len, int n_attn_heads) {
+void softmax_attn_gpu(float* att_scores, int pos, int seq_len, int n_attn_heads) {
     for (int h = 0; h < n_attn_heads; h++) {
         float* att_head_d = att_scores + h * seq_len;
         dim3 blockDim(1024);
@@ -326,7 +326,7 @@ void softmax_attention_hip_device(float* att_scores, int pos, int seq_len, int n
     CHECK_HIP(hipGetLastError());
 }
 
-void weighted_value_accumulation_hip_device(float* att_scores, float* v_cache, float* tb, int pos,
+void w_value_acc_gpu(float* att_scores, float* v_cache, float* tb, int pos,
                                             int seq_len, int head_dim, int kv_dim, int kv_mul,
                                             int n_attn_heads) {
     dim3 block_dim_accum(1024);

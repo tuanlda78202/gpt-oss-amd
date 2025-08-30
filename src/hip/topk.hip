@@ -53,7 +53,7 @@ __global__ void topk_kernel(float* router_score, float* topk_values, int* topk_i
     }
 }
 
-void topk_hip_device(float* topk_values, int* topk_indices, float* router_score, int num_experts,
+void topk_gpu(float* topk_values, int* topk_indices, float* router_score, int num_experts,
                      int experts_per_token) {
     if (num_experts <= 0 || experts_per_token <= 0 || experts_per_token > num_experts) {
         fprintf(stderr, "TOPK DEVICE Invalid parameters: num_experts=%d, experts_per_token=%d\n",

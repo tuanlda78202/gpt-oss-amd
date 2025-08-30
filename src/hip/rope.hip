@@ -86,7 +86,7 @@ __global__ void apply_rotary_emb_kernel(float* x, float* cos, float* sin, int n_
     }
 }
 
-void compute_cos_sin_hip_device(int pos, float base, int head_dim, float scaling_factor,
+void compute_cosin_gpu(int pos, float base, int head_dim, float scaling_factor,
                                 float initial_context_length, float ntk_beta, float ntk_alpha,
                                 float* cos_out, float* sin_out) {
     dim3 blockDim(1); // Single thread for this computation
@@ -98,7 +98,7 @@ void compute_cos_sin_hip_device(int pos, float base, int head_dim, float scaling
     CHECK_HIP(hipGetLastError());
 }
 
-void apply_rotary_emb_hip_device(float* x, float* cos, float* sin, int n_heads, int head_dim) {
+void rope_gpu(float* x, float* cos, float* sin, int n_heads, int head_dim) {
     dim3 blockDim(256);
     dim3 gridDim((n_heads * (head_dim / 2) + blockDim.x - 1) / blockDim.x);
     hipLaunchKernelGGL(apply_rotary_emb_kernel, gridDim, blockDim, 0, 0, x, cos, sin, n_heads,

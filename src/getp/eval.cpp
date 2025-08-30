@@ -260,7 +260,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     start = time_in_ms();
     finish(transformer, tokenizer);
     end = time_in_ms();
-    printf("\n⌛️ Finish (s): %f\n", (double)(end - start) / 1000);
+    printf("⌛️ Finish (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
     if (verification_result != 0) {

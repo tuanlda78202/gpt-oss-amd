@@ -52,7 +52,7 @@ __global__ void matvec_hybrid_tiled(const __half* A_half, const float* B, float*
     }
 }
 
-void matmul_hip_hybrid_device(float* xout, float* x, __half* w, __half* bias, int n, int d) {
+void matmul_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
     // Initialize output to zero for exact accumulation
     CHECK_HIP(hipMemset(xout, 0, d * sizeof(float)));
 

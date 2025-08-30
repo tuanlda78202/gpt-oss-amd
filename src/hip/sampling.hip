@@ -100,7 +100,7 @@ void sample_multinomial_hip_device(float* logits, int vocab_size, float temperat
     }
 
     // Apply softmax
-    softmax_hip_device(logits, vocab_size);
+    softmax_gpu(logits, vocab_size);
 
     // Sample
     dim3 block(256);

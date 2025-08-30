@@ -37,7 +37,7 @@ __global__ void rmsnorm_hybrid_kernel(float* o, float* x, __half* weight_half, i
     }
 }
 
-void rmsnorm_hip_hybrid_device(float* o, float* x, __half* weight, int size) {
+void rmsnorm_gpu(float* o, float* x, __half* weight, int size) {
     dim3 blockDim(1024);
     dim3 gridDim(1);
     hipLaunchKernelGGL(rmsnorm_hybrid_kernel, gridDim, blockDim, 0, 0, o, x, weight, size);

@@ -49,7 +49,7 @@ void vecaddvec_hip_hybrid_device(float* a, __half* b, float weight, int size) {
     CHECK_HIP(hipDeviceSynchronize());
 }
 
-void vecaddvec_hip_device(float* a, float* b, float weight, int size) {
+void vec_add_vec_gpu(float* a, float* b, float weight, int size) {
     dim3 blockDim(64);
     dim3 gridDim((size + 64 - 1) / 64);
     hipLaunchKernelGGL(vecaddvec_kernel, gridDim, blockDim, 0, 0, a, b, weight, size);
@@ -66,7 +66,7 @@ __global__ void split_gate_up_kernel(float* mlp1_out, float* gate, float* up,
     }
 }
 
-void split_gate_up_hip_device(float* mlp1_out, float* gate, float* up, int intermediate_dim) {
+void split_gate_up_gpu(float* mlp1_out, float* gate, float* up, int intermediate_dim) {
     dim3 blockDim(256);
     dim3 gridDim((intermediate_dim + 255) / 256);
     hipLaunchKernelGGL(split_gate_up_kernel, gridDim, blockDim, 0, 0, mlp1_out, gate, up,
