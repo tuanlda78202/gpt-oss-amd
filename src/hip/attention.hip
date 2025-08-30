@@ -1,4 +1,4 @@
-#include "../BLAS.hip"
+#include "BLAS.hip"
 #include <cmath>
 
 // ====== SOFTMAX KERNEL (copied from softmax.hip) ======

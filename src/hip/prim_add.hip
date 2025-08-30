@@ -1,4 +1,4 @@
-#include "../BLAS.hip"
+#include "BLAS.hip"
 
 __global__ void vecaddvec_kernel(float* a, float* b, float weight, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

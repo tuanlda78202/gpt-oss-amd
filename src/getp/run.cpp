@@ -4,7 +4,7 @@
 #include "../forward.cpp"
 #include "../model.cpp"
 #include "../sampler.cpp"
-#include "getp_eval.cpp"
+#include "eval.cpp"
 
 #include <cstdio>
 #include <cstdlib>

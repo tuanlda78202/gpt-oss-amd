@@ -1,4 +1,4 @@
-#include "../BLAS.hip"
+#include "BLAS.hip"
 
 #define TILE_SIZE 16
 #define SCALE 4

@@ -1,4 +1,4 @@
-#include "../BLAS.hip"
+#include "BLAS.hip"
 #include <cmath>
 #include <cstdio>
 

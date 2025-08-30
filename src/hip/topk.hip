@@ -1,5 +1,5 @@
 #include "../../include/hip_helper.hpp"
-#include "../BLAS.hip"
+#include "BLAS.hip"
 #include <algorithm>
 #include <cstdio>
 

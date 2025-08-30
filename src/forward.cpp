@@ -1,5 +1,5 @@
 #include "../include/model.hpp"
-#include "BLAS.hip"
+#include "hip/BLAS.hip"
 #include "hip/attention.hip"
 #include "hip/matvec.hip"
 #include "hip/prim_add.hip"

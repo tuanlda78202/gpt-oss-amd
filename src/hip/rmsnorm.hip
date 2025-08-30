@@ -1,4 +1,4 @@
-#include "../BLAS.hip"
+#include "BLAS.hip"
 
 __global__ void rmsnorm_hybrid_kernel(float* o, float* x, __half* weight_half, int size) {
     int lx = threadIdx.x;

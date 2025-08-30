@@ -1,4 +1,4 @@
-#include "../BLAS.hip"
+#include "BLAS.hip"
 
 // '_s_' = single precision (float)
 __global__ void thaDNN_s_swiglu_kernel(float* hb, float* hb2, int hidden_dim, float alpha,

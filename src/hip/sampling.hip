@@ -1,5 +1,4 @@
-// Create a new file: src/hip/sampling.hip
-#include "../BLAS.hip"
+#include "BLAS.hip"
 #include <hip/hip_runtime.h>
 
 // GPU Argmax kernel
