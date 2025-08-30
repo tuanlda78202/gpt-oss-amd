@@ -16,16 +16,6 @@
         }                                                                                          \
     } while (0)
 
-// #define CHECK_RCCL(call)                                                       \
-//   do {                                                                         \
-//     rcclResult_t status_ = call;                                               \
-//     if (status_ != ncclSuccess && status_ != ncclInProgress) {                 \
-//       fprintf(stderr, "NCCL error (%s:%d): %s\n", __FILE__, __LINE__,          \
-//               ncclGetErrorString(status_));                                    \
-//       exit(EXIT_FAILURE);                                                      \
-//     }                                                                          \
-//   } while (0)
-
 typedef struct {
     float value;
     int index;
@@ -172,34 +162,6 @@ typedef struct {
     float* mask;
 } OssRunState;
 
-typedef struct {
-    // current wave of activations
-    __half* x;            // activation at current time stamp (hidden_dim, )
-    __half* t;            // same, but inside a residual branch (hidden_dim, )
-    __half* tb;           // (head_dim * n_attn_heads, )
-    __half* tb2;          // (hidden_dim, )
-    __half* router_score; // router score (n_experts, )
-    __half* topk_v;       // topk expert weights (experts_per_token, )
-    int* topk_i;          // topk expert indices (experts_per_token, )
-    __half* mlp1_out;
-    __half* gate;
-    __half* up;
-    __half* gate_up;
-    __half* e_agg;
-    __half* qkv;    // an additional buffer just for convenience (head_dim *
-                    // (n_attn_heads + 2 * n_kv_heads), )
-    __half* q;      // query (n_attn_heads * head_dim,)
-    __half* k;      // key (n_kv_heads * head_dim,)
-    __half* v;      // value (n_kv_heads * head_dim,)
-    __half* att;    // buffer for scores/attention values (n_heads, seq_len)
-    __half* logits; // output logits
-
-    // ! kv cache (largest memory consumer)
-    __half* key_cache;   // (layer, seq_len, kv_dim)
-    __half* value_cache; // (layer, seq_len, kv_dim)
-    __half* mask;
-} OssRunStateHalf;
-
 // ! Main Transformer struct
 typedef struct {
     OssConfig config;
@@ -209,15 +171,6 @@ typedef struct {
     float* data;       // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
 } OssTransformer;
-
-typedef struct {
-    OssConfig config;
-    OssTransformerWeightsHalf weights;
-    OssRunStateHalf state; // buffers for the "wave" of activations in the forward pass
-    int fd;                // file descriptor for memory mapping
-    float* data;           // memory mapped data pointer
-    ssize_t file_size;     // size of the checkpoint file in bytes
-} OssTransformerHalf;
 
 // ! Hybrid Precision Transformer
 typedef struct {

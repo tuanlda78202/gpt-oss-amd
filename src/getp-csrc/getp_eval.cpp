@@ -199,7 +199,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
     printf("Requests matching: %d\n", total_lines - total_mismatches);
 
     if (total_mismatches == 0) {
-        printf("🎉 ✅ ALL TESTS PASSED! Generated output matches ground truth perfectly.\n");
+        printf("🎉 ✅ ALL TESTS PASSED!\n");
         return 0;
     } else {
         printf("❌ TESTS FAILED! %d requests have mismatches.\n", total_mismatches);

@@ -1,7 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-// #include <hipblas.h>
 #include <omp.h>
 
 #define CHECK_HIP(cmd)                                                                             \
@@ -77,26 +76,4 @@ __device__ float block_reduce_max(float val) {
         val = warp_reduce_max(val);
 
     return val;
-}
-
-struct thablasHandle_t {
-    int current_gpu_id;
-    hipStream_t calc_stream;
-    hipStream_t copy_stream;
-};
-
-int thablasCreate(thablasHandle_t* handle) {
-    int current_gpu_id;
-    CHECK_HIP(hipGetDevice(&current_gpu_id));
-    handle->current_gpu_id = current_gpu_id;
-
-    CHECK_HIP(hipStreamCreate(&handle->calc_stream));
-    CHECK_HIP(hipStreamCreate(&handle->copy_stream));
-
-    return 0;
-}
-
-int thablasDestroy(thablasHandle_t handle) {
-    //
-    return 0;
 }

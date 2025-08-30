@@ -2,7 +2,7 @@
 
 void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
-    const size_t chunk_size = 512 * 1024 * 1024; // 512MB chunks
+    const size_t chunk_size = 512 * 1024 * 1024;
 
     bool show_progress = total_size > 1024 * 1024;
 
@@ -260,7 +260,6 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     CHECK_HIP(hipDeviceSynchronize());
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-
     printf("✅ Hybrid precision model loaded: %.1f GB allocated\n",
            used_mem / (1024.0 * 1024.0 * 1024.0));
 }
@@ -307,7 +306,6 @@ void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.value_cache));
     CHECK_HIP(hipFree(t_d->state.mask));
 
-    // Verify memory is freed
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     printf("GPU memory freed: %.1f GB free / %.1f GB total\n",

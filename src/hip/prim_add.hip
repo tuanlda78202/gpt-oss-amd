@@ -7,13 +7,6 @@ __global__ void vecaddvec_kernel(float* a, float* b, float weight, int size) {
 }
 
 void vecaddvec(float* a, float* b, float weight, int size) {
-    // if (a == nullptr || b == nullptr || size == 0)
-    // {
-    //     printf("THABLAS VEC ADD VEC ERROR: INVALID ARGUMENT\n"); fflush(stdout);
-    //     return THABLAS_STATUS_ALLOC_FAILED;
-    // }
-
-    // CHECK_HIP(hipSetDevice(handle.current_gpu_id));
     dim3 blockDim(64);
     dim3 gridDim((size + 64 - 1) / 64);
     hipLaunchKernelGGL(vecaddvec_kernel, gridDim, blockDim, 0, 0, a, b, weight, size);
@@ -41,10 +34,8 @@ void vecaddvec_hip(float* a, float* b, float weight, int size) {
 __global__ void vecaddvec_hybrid_kernel(float* a, __half* b_half, float weight, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
-        // Convert FP16 bias to FP32 with exact precision
         __half bias_val = b_half[i];
         float b_fp32 = __half2float(bias_val);
-        // Ensure exact computation order for reproducibility
         float weighted_bias = b_fp32 * weight;
         a[i] += weighted_bias;
     }
@@ -58,7 +49,6 @@ void vecaddvec_hip_hybrid_device(float* a, __half* b, float weight, int size) {
     CHECK_HIP(hipDeviceSynchronize());
 }
 
-// ! Device-only vector addition for FP32+FP32 operations (residual connections)
 void vecaddvec_hip_device(float* a, float* b, float weight, int size) {
     dim3 blockDim(64);
     dim3 gridDim((size + 64 - 1) / 64);
@@ -67,13 +57,12 @@ void vecaddvec_hip_device(float* a, float* b, float weight, int size) {
     CHECK_HIP(hipDeviceSynchronize());
 }
 
-// ! Efficient GPU kernel for splitting interleaved gate/up projections
 __global__ void split_gate_up_kernel(float* mlp1_out, float* gate, float* up,
                                      int intermediate_dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < intermediate_dim) {
-        gate[i] = mlp1_out[2 * i];   // even indices -> gate
-        up[i] = mlp1_out[2 * i + 1]; // odd indices -> up
+        gate[i] = mlp1_out[2 * i];
+        up[i] = mlp1_out[2 * i + 1];
     }
 }
 

@@ -1,5 +1,4 @@
 #include "../include/sampler.hpp"
-#include "forward_cpu.cpp"
 #include "hip/sampling.hip"
 #include <cmath>
 #include <cstdio>
@@ -99,18 +98,6 @@ void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, f
 
 void free_sampler_oss(OssSampler* sampler) { free(sampler->probindex); }
 
-unsigned int random_u32_oss(unsigned long long* state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-
-float random_f32_oss(unsigned long long* state) { // random float32 in [0,1)
-    return (random_u32_oss(state) >> 8) / 16777216.0f;
-}
-
 int sample_oss(OssSampler* sampler, float* logits) {
     // sample the token given the logits and some hyperparameters
     int next;
@@ -118,49 +105,24 @@ int sample_oss(OssSampler* sampler, float* logits) {
         // greedy argmax sampling: take the token with the highest probability
         next = sample_argmax_oss(logits, sampler->vocab_size);
     } else {
-        // apply the temperature to the logits
-        for (int q = 0; q < sampler->vocab_size; q++) {
-            logits[q] /= sampler->temperature;
-        }
-
-        // apply softmax to the logits to get the probabilities for next token
-        softmax_cpu(logits, sampler->vocab_size);
-
-        // flip a (float) coin (this is our source of entropy for sampling)
-        float coin = random_f32_oss(&sampler->rng_state);
-
-        // we sample from this distribution to get the next token
-        if (sampler->topp <= 0 || sampler->topp >= 1) {
-            // simply sample from the predicted probability distribution
-            next = sample_mult_oss(logits, sampler->vocab_size, coin);
-        } else {
-            // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp_oss(logits, sampler->vocab_size, sampler->topp, sampler->probindex,
-                                   coin);
-        }
     }
     return next;
 }
 
 int sample_oss_gpu(OssSampler* sampler, float* logits_d) {
-    // GPU-based sampling - no CPU transfers of logits
     static int* result_d = nullptr;
     if (result_d == nullptr) {
         CHECK_HIP(hipMalloc(&result_d, sizeof(int)));
     }
 
     if (sampler->temperature == 0.0f) {
-        // GPU argmax sampling
         sample_argmax_hip_device(logits_d, sampler->vocab_size, result_d);
     } else {
-        // GPU multinomial sampling with temperature and softmax
         sample_multinomial_hip_device(logits_d, sampler->vocab_size, sampler->temperature,
                                       sampler->rng_state, result_d);
-        // Update RNG state
         sampler->rng_state = (sampler->rng_state * 1103515245 + 12345) & 0x7fffffff;
     }
 
-    // Only transfer the result (1 int) back to CPU
     int next;
     CHECK_HIP(hipMemcpy(&next, result_d, sizeof(int), hipMemcpyDeviceToHost));
     return next;

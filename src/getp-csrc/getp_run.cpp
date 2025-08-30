@@ -97,8 +97,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
         // advance the state machine
         pos++;
         if (pos < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt
-            // token
+            // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos];
         } else {
             // otherwise sample the next token from the logits
