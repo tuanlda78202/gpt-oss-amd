@@ -17,18 +17,13 @@
 OssTransformerHybrid* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
-    // Do not inference here
-    // You should handle the warm-up process
-    // TODO:
-    // - Memory allocation
-    // - Load model
-    // - ...
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
     t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
 
     copy_transformer_to_device_hybrid(transformer_oss, t_d);
 
+    // ! GPU stats
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
@@ -41,16 +36,10 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
-    // Do not inference here
-    // You should handle the finish process
-    // TODO:
-    // - Memory deallocation
-    // - Unload model
-    // - ...
-
     free_transformer_on_device_hybrid(t_d);
     free(t_d);
 
+    // ! GPU stats
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
@@ -84,7 +73,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int num_prompt_tokens = 0;
     int* prompt_tokens =
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
+    encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
            t_d->config.initial_context_length);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
@@ -97,9 +86,9 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int pos = 0;                  // position in the sequence
 
     // print the very first token should be removed
-    // const char* first_piece = decode_piece(tokenizer, 200006, token);
-    // safe_printf(first_piece);
-    // fflush(stdout);
+    const char* first_piece = decode_piece(tokenizer, 200006, token);
+    safe_printf(first_piece);
+    fflush(stdout);
 
     while (pos < steps) {
         // forward the transformer to get logits for the next token

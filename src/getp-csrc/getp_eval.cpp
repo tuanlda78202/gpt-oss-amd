@@ -231,17 +231,17 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     fflush(stdout);
     warm_up(transformer, tokenizer);
     end = time_in_ms();
-    printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
+    printf("⌛️ Warm up (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
     // ! Inference
     start = time_in_ms();
-    printf("------------------------------\n⚡️ Running inference...\n");
+    printf("------------------------------\n⚡️ Running inference...\n\n");
     fflush(stdout);
     long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
     end = time_in_ms();
     // Your goal is to achieve best throughput(=reduce elapsed time)!
-    fprintf(stdout, "\nelapsed time(s): %f, achieved throughput TPS (tok/s): %f\n",
+    fprintf(stdout, "\n️⌛️ Inference (s): %f, achieved throughput TPS (tok/s): %f\n",
             (double)(end - start) / 1000, (num_gen_tokens) / (double)(end - start) * 1000);
     fflush(stdout);
 
@@ -258,7 +258,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     start = time_in_ms();
     finish(transformer, tokenizer);
     end = time_in_ms();
-    printf("\nFinish elapsed time(s): %f\n", (double)(end - start) / 1000);
+    printf("\n⌛️ Finish (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
     if (verification_result != 0) {
