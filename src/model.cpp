@@ -246,7 +246,21 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     CHECK_HIP(hipMemset(t_d->state.logits, 0, vocab_size * sizeof(float)));
     CHECK_HIP(hipMemset(t_d->state.key_cache, 0, key_cache_size));
     CHECK_HIP(hipMemset(t_d->state.value_cache, 0, value_cache_size));
-    CHECK_HIP(hipMemset(t_d->state.mask, 0, seq_len * seq_len * sizeof(float)));
+    if (conf->sliding_window > 0) {
+        float* mask_host = (float*)calloc(seq_len * seq_len, sizeof(float));
+        for (int i = 0; i < seq_len; i++) {
+            for (int j = 0; j < seq_len; j++) {
+                if (i - j >= conf->sliding_window) {
+                    mask_host[i * seq_len + j] = -INFINITY;
+                }
+            }
+        }
+        CHECK_HIP(hipMemcpy(t_d->state.mask, mask_host, seq_len * seq_len * sizeof(float),
+                            hipMemcpyHostToDevice));
+        free(mask_host);
+    } else {
+        CHECK_HIP(hipMemset(t_d->state.mask, 0, seq_len * seq_len * sizeof(float)));
+    }
 
     CHECK_HIP(hipDeviceSynchronize());
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
