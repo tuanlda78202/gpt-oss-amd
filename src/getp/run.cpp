@@ -74,6 +74,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int* prompt_tokens =
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
+    encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
            t_d->config.initial_context_length);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");

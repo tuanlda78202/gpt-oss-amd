@@ -19,7 +19,7 @@ This repository implements an inference serving system for **gpt-oss** models (2
 
 ### goals
 
-- ✅ **Correctness first** — keep simple checks/metrics to verify output validity.
+- ✅ **Correctness** — keep simple checks/metrics to verify output validity.
 - 🚀 **Throughput** — maximize tokens/sec via CPU threading + HIP GPU kernels.
 - 📚 **Scope** — single node, multi-GPU execution for 20B and 120B models.
 
@@ -221,6 +221,7 @@ srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
 
 ```bash
 uv sync
+source .venv/bin/activate
 pre-commit install
 
 chmod +x run.sh

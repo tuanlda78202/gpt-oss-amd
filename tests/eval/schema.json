@@ -1,0 +1,18 @@
+{
+	"type": "object",
+	"properties": {
+		"id": {
+			"type": "string",
+			"description": "SHA-256 hash (hex string) of the prompt text"
+		},
+		"prompt": {
+			"type": "string",
+			"description": "The input question, instruction, or context"
+		},
+		"completion": {
+			"type": "string",
+			"description": "The reference answer or continuation"
+		}
+	},
+	"required": ["id", "prompt", "completion"]
+}

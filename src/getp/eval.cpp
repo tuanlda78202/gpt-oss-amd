@@ -86,7 +86,7 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
                     writeFile << ' ';
                 writeFile << output_tokens[j];
             }
-            writeFile << "\n";
+            writeFile << '\n';
         }
         writeFile.close();
     } else {
