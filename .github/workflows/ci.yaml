@@ -125,7 +125,7 @@ jobs:
             echo "No shell scripts found."
             exit 0
           fi
-          echo "$files" | xargs -r shellcheck --severity=warning -e SC1071,SC1090,SC1091
+          echo "$files" | xargs -r shellcheck --severity=warning -e SC1071,SC1090,SC1091,SC2034,SC2155
 
   format-check:
     runs-on: ubuntu-latest

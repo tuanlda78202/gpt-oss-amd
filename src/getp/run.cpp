@@ -4,7 +4,7 @@
 #include "../forward.cpp"
 #include "../model.cpp"
 #include "../sampler.cpp"
-#include "getp_eval.cpp"
+#include "eval.cpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -14,41 +14,41 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-OssTransformerHalf* t_d;
+OssTransformerHybrid* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
-    // Do not inference here
-    // You should handle the warm-up process
-    // TODO:
-    // - Memory allocation
-    // - Load model
-    // - ...
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
-    t_d = (OssTransformerHalf*)malloc(sizeof(OssTransformerHalf));
+    t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
 
-    copy_transformer_to_device_half(transformer_oss, t_d);
+    copy_transformer_to_device_hybrid(transformer_oss, t_d);
 
+    // ! GPU stats
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-    printf("\n=== WARM-UP COMPLETE ===\n");
+    printf("\n--- HYBRID WARM-UP COMPLETE ---\n");
     printf("GPU Memory Status:\n");
     printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("========================\n");
+    printf("-------------------------------\n");
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
-    // Do not inference here
-    // You should handle the finish process
-    // TODO:
-    // - Memory deallocation
-    // - Unload model
-    // - ...
-
+    free_transformer_on_device_hybrid(t_d);
     free(t_d);
+
+    // ! GPU stats
+    size_t free_mem, total_mem;
+    CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
+    size_t used_mem = total_mem - free_mem;
+    printf("\n--- HYBRID FINISH COMPLETE ---\n");
+    printf("GPU Memory Status:\n");
+    printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("-------------------------------\n");
 }
 
 long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
@@ -63,9 +63,6 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
 
     // Inference here
     OssSampler* sampler_oss = (OssSampler*)sampler;
-
-    OssTransformer* t_d =
-        (OssTransformer*)transformer; // ! TODO: replace this with allocation on device
 
     const char* empty_prompt = "";
     if (input_seq == NULL) {
@@ -88,25 +85,23 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;                  // position in the sequence
 
-    // print the very first token
-    // should be removed
+    // print the very first token should be removed
     const char* first_piece = decode_piece(tokenizer, 200006, token);
     safe_printf(first_piece);
     fflush(stdout);
 
     while (pos < steps) {
         // forward the transformer to get logits for the next token
-        float* logits = forward_cpu(t_d, token, pos);
+        float* logits = forward_hybrid(t_d, token, pos);
 
         // advance the state machine
         pos++;
         if (pos < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt
-            // token
+            // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos];
         } else {
             // otherwise sample the next token from the logits
-            next = sample_oss(sampler_oss, logits);
+            next = sample_oss_gpu(sampler_oss, logits);
             // save the output token, it will be printed to file
             output_tokens[pos - num_prompt_tokens] = next;
         }

@@ -1071,8 +1071,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     free(prompt_tokens);
 }
 
-#include "getp-csrc/getp_eval.cpp"
-#include "getp-csrc/getp_run.cpp"
+#include "getp/eval.cpp"
+#include "getp/run.cpp"
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing

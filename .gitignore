@@ -78,6 +78,7 @@ build/
 # Stuff
 uv.lock
 .vscode/
-output.txt
 note.txt
 legacy.hip/
+time_log.py
+data/

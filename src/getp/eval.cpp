@@ -104,7 +104,8 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
                     Requests* requests);
 
 int verify_output(const char* generated_filename, const char* ground_truth_filename) {
-    printf("------------------------------\n🔍 Verifying output...\n");
+    printf("==================================================================\n🔍 Verifying "
+           "output...\n");
     fflush(stdout);
 
     std::ifstream generated_file(generated_filename);
@@ -199,7 +200,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
     printf("Requests matching: %d\n", total_lines - total_mismatches);
 
     if (total_mismatches == 0) {
-        printf("🎉 ✅ ALL TESTS PASSED! Generated output matches ground truth perfectly.\n");
+        printf("🎉 ✅ ALL TESTS PASSED!\n");
         return 0;
     } else {
         printf("❌ TESTS FAILED! %d requests have mismatches.\n", total_mismatches);
@@ -227,21 +228,22 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
 
     // ! Warm up
     start = time_in_ms();
-    printf("------------------------------\n🔥 Warming up...");
+    printf("==================================================================\n🔥 Warming up...");
     fflush(stdout);
     warm_up(transformer, tokenizer);
     end = time_in_ms();
-    printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
+    printf("⌛️ Warm up (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
     // ! Inference
     start = time_in_ms();
-    printf("------------------------------\n⚡️ Running inference...\n");
+    printf("==================================================================\n⚡️ Running "
+           "inference...\n\n");
     fflush(stdout);
     long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
     end = time_in_ms();
     // Your goal is to achieve best throughput(=reduce elapsed time)!
-    fprintf(stdout, "\nelapsed time(s): %f, achieved throughput TPS (tok/s): %f\n",
+    fprintf(stdout, "\n️⌛️ Inference (s): %f, achieved throughput TPS (tok/s): %f\n",
             (double)(end - start) / 1000, (num_gen_tokens) / (double)(end - start) * 1000);
     fflush(stdout);
 
@@ -258,7 +260,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     start = time_in_ms();
     finish(transformer, tokenizer);
     end = time_in_ms();
-    printf("\nFinish elapsed time(s): %f\n", (double)(end - start) / 1000);
+    printf("⌛️ Finish (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
     if (verification_result != 0) {
