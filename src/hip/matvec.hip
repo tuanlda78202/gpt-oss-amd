@@ -1,221 +1,133 @@
 #include "BLAS.hip"
-#include <hip/hip_runtime.h>
-#include <stdint.h>
 
-#ifndef WARPS_PER_BLOCK          // try 8 for large M, 4 for mid, 2 for tiny
-#define WARPS_PER_BLOCK 8
-#endif
+#define VEC 4
 
-#ifndef TILE_K                   // must be even; 512 is great for large K
-#define TILE_K 512
-#endif
+template <const int BM, const int BK>
+__global__ void matvec_logits(const __half* __restrict__ A_half, const float* __restrict__ B,
+                              float* __restrict__ C, const __half* __restrict__ bias, int M,
+                              int K) {
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK];
 
-#ifndef LDS_PAD                  // to mitigate bank conflicts
-#define LDS_PAD 32
-#endif
+    int row = blockIdx.y * BM + threadIdx.y;
+    float acc = 0.0f;
 
-#ifndef UNROLL_PAIR
-#define UNROLL_PAIR 4
-#endif
+    const int k_vec = threadIdx.x * VEC;
+    const int b_vec_idx = threadIdx.y * VEC;
 
-#ifndef USE_LOADER_WARP          // warp 0 prefetches next x tile while others compute
-#define USE_LOADER_WARP 1
-#endif
+    for (int t = 0; t < CEIL_DIV(K, BK); ++t) {
+        int k_base = t * BK;
 
-#ifndef USE_NONTEMPORAL_A        // use non-temporal loads for streaming A (AMD/Clang)
-#define USE_NONTEMPORAL_A 0
-#endif
+        // --- Load A[row][k] ---
+        float4 a_vec = make_float4(0, 0, 0, 0);
+        int a_offset = row * K + k_base + k_vec;
 
-#define THREADS_PER_BLOCK (WARPS_PER_BLOCK * warpSize)
+        if (row < M && (k_base + k_vec + 3) < K) {
+            half2 h0 = *reinterpret_cast<const half2*>(&A_half[a_offset + 0]);
+            half2 h1 = *reinterpret_cast<const half2*>(&A_half[a_offset + 2]);
+            float2 f0 = __half22float2(h0);
+            float2 f1 = __half22float2(h1);
+            a_vec = make_float4(f0.x, f0.y, f1.x, f1.y);
+        }
 
-#if USE_NONTEMPORAL_A
-  #if defined(__has_builtin)
-    #if __has_builtin(__builtin_nontemporal_load)
-      #define NTA_LOAD(TPTR) __builtin_nontemporal_load(TPTR)
-    #else
-      #define NTA_LOAD(TPTR) (*(TPTR))
-    #endif
-  #else
-    #define NTA_LOAD(TPTR) (*(TPTR))
-  #endif
-#else
-  #define NTA_LOAD(TPTR) (*(TPTR))
-#endif
-
-// __device__ __forceinline__ float warp_reduce_sum(float v) {
-    // for (int off = warpSize >> 1; off > 0; off >>= 1) {
-        // v += __shfl_down(v, off, warpSize);
-    // }
-    // return v;
-// }
-
-extern "C"
-__launch_bounds__(THREADS_PER_BLOCK, 2)
-__global__ void matvec_hybrid_warp(
-    const __half* __restrict__ A_half,
-    const float*  __restrict__ x,
-    float*        __restrict__ y,
-    const __half* __restrict__ bias,
-    int M, int K)
-{
-    // Double-buffered LDS tiles of x
-    __shared__ float sX[2][TILE_K + LDS_PAD];
-
-    const int lane = threadIdx.x;    // 0..63 (AMD warpSize = 64)
-    const int warp = threadIdx.y;    // 0..WARPS_PER_BLOCK-1
-    const int warp_rows_stride = gridDim.y * blockDim.y;
-
-    // Persistent loop: each warp processes multiple rows (row += total warps in the grid)
-    for (int row = blockIdx.y * blockDim.y + warp; row < M; row += warp_rows_stride) {
-
-        float acc = 0.0f;
-
-        // --- Preload first tile of x into buffer 0 ---
-        int buf = 0;
-        int k0  = 0;
-
-        // Loader warp prefetches x tile 0
-        if (USE_LOADER_WARP && warp == 0) {
-            const float* xptr = x; // k0 == 0
-            const bool aligned16 = (((uintptr_t)xptr) & 0xF) == 0;
-            int tile = min(TILE_K, K);
-
-            if (aligned16) {
-                // vectorized float4 loads
-                int i4 = lane; // each lane handles indices in steps of warpSize
-                for (int off = i4 * 4; off < tile; off += warpSize * 4) {
-                    float4 v = *reinterpret_cast<const float4*>(xptr + off);
-                    // store to LDS
-                    if (off + 0 < tile) sX[buf][off + 0] = v.x;
-                    if (off + 1 < tile) sX[buf][off + 1] = v.y;
-                    if (off + 2 < tile) sX[buf][off + 2] = v.z;
-                    if (off + 3 < tile) sX[buf][off + 3] = v.w;
-                }
-            } else {
-                // scalar fallback
-                for (int i = lane; i < tile; i += warpSize) {
-                    sX[buf][i] = xptr[i];
-                }
-            }
-        } else if (!USE_LOADER_WARP) {
-            // No dedicated loader: all warps help stage x
-            int tile = min(TILE_K, K);
-            for (int i = lane; i < tile; i += warpSize) {
-                sX[buf][i] = x[i];
+#pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            int k = k_vec + i;
+            if ((k < BK) && (k_base + k < K)) {
+                As[threadIdx.y][k] = reinterpret_cast<float*>(&a_vec)[i];
             }
         }
+
+        // --- Load B[k] ---
+        float4 b_vec = make_float4(0, 0, 0, 0);
+        int b_offset = k_base + b_vec_idx;
+
+        if ((b_offset + 3) < K) {
+            b_vec = *reinterpret_cast<const float4*>(&B[b_offset]);
+        }
+
+#pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            int k = b_vec_idx + i;
+            if ((k < BK) && (k_base + k < K)) {
+                Bs[k] = reinterpret_cast<float*>(&b_vec)[i];
+            }
+        }
+
         __syncthreads();
 
-        // --- Main tile loop with double-buffered prefetch ---
-        while (k0 < K) {
-            const int tile = min(TILE_K, K - k0);
-
-            // Next tile prefetch by loader warp while others compute
-            const int next_k0  = k0 + tile;
-            const int next_buf = buf ^ 1;
-
-            if (USE_LOADER_WARP && warp == 0 && next_k0 < K) {
-                const float* xptr = x + next_k0;
-                const bool aligned16 = (((uintptr_t)xptr) & 0xF) == 0;
-
-                if (aligned16) {
-                    for (int off = lane * 4; off < min(TILE_K, K - next_k0); off += warpSize * 4) {
-                        float4 v = *reinterpret_cast<const float4*>(xptr + off);
-                        if (off + 0 < TILE_K && next_k0 + off + 0 < K) sX[next_buf][off + 0] = v.x;
-                        if (off + 1 < TILE_K && next_k0 + off + 1 < K) sX[next_buf][off + 1] = v.y;
-                        if (off + 2 < TILE_K && next_k0 + off + 2 < K) sX[next_buf][off + 2] = v.z;
-                        if (off + 3 < TILE_K && next_k0 + off + 3 < K) sX[next_buf][off + 3] = v.w;
-                    }
-                } else {
-                    for (int i = lane; i < min(TILE_K, K - next_k0); i += warpSize) {
-                        sX[next_buf][i] = xptr[i];
-                    }
-                }
-            }
-
-            // ----- Compute on current tile (buf) -----
-            const __half* a_row = A_half + (size_t)row * K + k0;
-
-            // Align to 4B for half2 vectorized loads
-            int start = 0;
-            if (((uintptr_t)a_row & 0x2) && tile > 0) {
-                if (lane == 0) {
-                    float a0 = __half2float(a_row[0]);
-                    acc = fmaf(a0, sX[buf][0], acc);
-                }
-                start = 1;
-            }
-
-            const int pairs = (tile - start) >> 1;
-            const __half2* __restrict__ a2 = reinterpret_cast<const __half2*>(a_row + start);
-
-            #pragma unroll UNROLL_PAIR
-            for (int p = lane; p < pairs; p += warpSize) {
-                // optional non-temporal (streaming) load for A
-                __half2 h2 = NTA_LOAD(a2 + p);
-                float2 af  = __half22float2(h2);
-                const int j = (p << 1) + start;
-                acc = fmaf(af.x, sX[buf][j],     acc);
-                acc = fmaf(af.y, sX[buf][j + 1], acc);
-            }
-
-            if (((tile - start) & 1) != 0) {
-                const int j = start + (pairs << 1);
-                // share the scalar tail
-                if (lane == 0) {
-                    float a = __half2float(a_row[j]);
-                    acc = fmaf(a, sX[buf][j], acc);
-                }
-            }
-
-            // --- Barrier: ensure all consumers finished before swapping buffers
-            __syncthreads();
-
-            // If not using loader warp, cooperatively stage the next tile now
-            if (!USE_LOADER_WARP) {
-                if (next_k0 < K) {
-                    int ntile = min(TILE_K, K - next_k0);
-                    for (int i = lane; i < ntile; i += warpSize) {
-                        sX[next_buf][i] = x[next_k0 + i];
-                    }
-                }
-            }
-
-            // Ensure the loader finished writing next_buf before we use it next iter
-            __syncthreads();
-
-            // Advance
-            k0  = next_k0;
-            buf = next_buf;
+        // Compute dot product
+        for (int i = 0; i < BK; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i];
         }
 
-        // Reduce within warp and write out
-        acc = warp_reduce_sum(acc);
-        if (lane == 0) {
-            const float b = bias ? __half2float(bias[row]) : 0.0f;
-            y[row] = acc + b;
-        }
-        __syncthreads(); // keep waves roughly in lockstep across rows (helps on some SKUs)
+        __syncthreads();
+    }
+
+    if (row < M) {
+        float b = bias ? __half2float(bias[row]) : 0.0f;
+        C[row] = acc + b;
     }
 }
 
-// ---- Host launcher (unchanged signature) ----
-static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
+// Each warp computes one row; block has RB warps (RB rows) → 64*RB threads.
+// Good defaults: RB = 8 (512 threads/block) or RB = 4 (256).
+template <int RB /* rows per block */>
+__global__ void matvec_warp_splitk_vec4(const __half* __restrict__ A_half,
+                                        const float* __restrict__ B, float* __restrict__ C,
+                                        const __half* __restrict__ bias, int M, int K) {
+    const int lane = threadIdx.x; // 0..63
+    const int warp = threadIdx.y; // 0..RB-1
+    const int row = blockIdx.y * RB + warp;
+    if (row >= M)
+        return;
 
-extern "C" void matvec_gpu(float* __restrict__ y,
-                           const float* __restrict__ x,
-                           const __half* __restrict__ A_half,
-                           const __half* __restrict__ bias,
-                           int K,  // columns of A (len of x)
-                           int M)  // rows of A (len of y)
-{
-    int wpb = (M >= 2048 ? WARPS_PER_BLOCK :
-              (M >=  512 ? max(4, WARPS_PER_BLOCK/2) : max(2, WARPS_PER_BLOCK/4)));
+    const int a_base = row * K;
+    float acc = 0.0f;
 
-    dim3 block_dim(warpSize, wpb, 1);                 // (64, wpb)
-    dim3 grid_dim(1, ceil_div(M, wpb), 1);
+    // Process main part in chunks of 4
+    const int K4 = K >> 2; // floor(K/4)
+    for (int k4 = lane; k4 < K4; k4 += warpSize) {
+        const int k = (k4 << 2);
 
-    hipLaunchKernelGGL(matvec_hybrid_warp, grid_dim, block_dim, 0, 0,
-                       A_half, x, y, bias, M, K);
+        // Load B[k..k+3] as float4
+        float4 bv = *reinterpret_cast<const float4*>(&B[k]);
+
+        // Load A[row,k..k+3] as (half2 + half2)
+        half2 a0 = *reinterpret_cast<const half2*>(&A_half[a_base + k + 0]);
+        half2 a1 = *reinterpret_cast<const half2*>(&A_half[a_base + k + 2]);
+
+        float2 af0 = __half22float2(a0);
+        float2 af1 = __half22float2(a1);
+
+        // FMA
+        acc = fmaf(af0.x, bv.x, acc);
+        acc = fmaf(af0.y, bv.y, acc);
+        acc = fmaf(af1.x, bv.z, acc);
+        acc = fmaf(af1.y, bv.w, acc);
+    }
+
+    // Tail (K not multiple of 4)
+    for (int kt = (K4 << 2) + lane; kt < K; kt += warpSize) {
+        acc = fmaf(__half2float(A_half[a_base + kt]), B[kt], acc);
+    }
+
+    // Warp reduce
+    acc = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        float badd = bias ? __half2float(bias[row]) : 0.0f;
+        C[row] = acc + badd;
+    }
+}
+
+void matvec_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
+    CHECK_HIP(hipMemset(xout, 0, d * sizeof(float)));
+
+    constexpr int RB = 4; // 256 threads/block; try 8 if regs allow
+    dim3 block(64, RB, 1);
+    dim3 grid(1, CEIL_DIV(d, RB), 1);
+    matvec_warp_splitk_vec4<RB><<<grid, block>>>(w, x, xout, bias, d, n);
+
     CHECK_HIP(hipGetLastError());
 }
