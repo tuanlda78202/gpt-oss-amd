@@ -70,8 +70,6 @@ __global__ void matvec_logits(const __half* __restrict__ A_half, const float* __
     }
 }
 
-// Each warp computes one row; block has RB warps (RB rows) → 64*RB threads.
-// Good defaults: RB = 8 (512 threads/block) or RB = 4 (256).
 template <int RB /* rows per block */>
 __global__ void matvec_warp_splitk_vec4(const __half* __restrict__ A_half,
                                         const float* __restrict__ B, float* __restrict__ C,

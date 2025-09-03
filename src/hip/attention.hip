@@ -202,19 +202,17 @@ void w_value_acc_gpu(float* att_scores, float* v_cache, float* tb, int pos,
 }
 
 // ============================================================
-//                FLASH ATTENTION (DECODE) — OPT v2
+//                FLASH ATTENTION
 //  * Numerically-stable online softmax (masked-step safe)
 //  * Preload & pre-scale Q into shared memory (1× load)
 //  * Variable block size (64..256) to match head_dim
 //  * Optional FP16 KV-cache path (set USE_FP16_KV 1)
-//  * NEW: Multi-CTA chunking across time with associative merge
-//         (more CU occupancy on decode; big win for long contexts)
+//  * Multi-CTA chunking across time with associative merge
 // ============================================================
 #ifndef USE_FP16_KV
 #define USE_FP16_KV 0
 #endif
 
-// --- forward declarations ---
 __global__ void flash_attn_decode_kernel(const float* __restrict__ q,
                                          const void*  __restrict__ k_cache,
                                          const void*  __restrict__ v_cache,

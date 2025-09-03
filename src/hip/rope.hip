@@ -7,7 +7,6 @@ __device__ __forceinline__ float clamp01(float x) {
     return fminf(1.0f, fmaxf(0.0f, x));
 }
 
-// ====== FAST PARALLEL COS/SIN ======
 __global__ void compute_cos_sin_kernel_fast(
     int pos, float base, int head_dim, float scaling_factor,
     float initial_context_length, float ntk_beta, float ntk_alpha,
@@ -21,7 +20,6 @@ __global__ void compute_cos_sin_kernel_fast(
     const float two_over_hd = 2.0f / (float)head_dim;
     const float inv_freq_base = -two_over_hd * (float)i; // exponent for base^(...)
 
-    // Using powf(base, exp) is fine here (d_half is small). If you compile with -ffast-math, it's faster.
     float inv_freq = powf(base, inv_freq_base);
 
     float concentration = 1.0f;
@@ -36,6 +34,7 @@ __global__ void compute_cos_sin_kernel_fast(
 
         // ramp in [0,1] across i
         float ramp = clamp01(((float)i - low) / (high - low));
+
         // interpolation vs extrapolation mix
         float interpolation = 1.0f / (scaling_factor * powf(base, (2.0f * (float)i) / (float)head_dim));
         float extrapolation = 1.0f / powf(base, (2.0f * (float)i) / (float)head_dim);
@@ -53,7 +52,6 @@ __global__ void compute_cos_sin_kernel_fast(
     sin_out[i] = s * concentration;
 }
 
-// ====== APPLY ROTARY ======
 __global__ void apply_rotary_emb_kernel_fast(
     float* __restrict__ x,
     const float* __restrict__ cosv,
@@ -85,7 +83,6 @@ __global__ void apply_rotary_emb_kernel_fast(
     }
 }
 
-// ---------------- Host wrappers (drop-in) ----------------
 void compute_cosin_gpu(int pos, float base, int head_dim, float scaling_factor,
                        float initial_context_length, float ntk_beta, float ntk_alpha,
                        float* cos_out, float* sin_out)
