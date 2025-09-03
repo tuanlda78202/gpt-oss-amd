@@ -71,17 +71,21 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         rope_gpu(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
         rope_gpu(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
 
-        // ! MHA
-        compute_attn_gpu(s->q, s->key_cache + loff, s->att, s->mask, pos, p->seq_len, head_dim,
-                         kv_dim, kv_mul, p->sliding_window, l, p->n_attn_heads);
+        // ! MHA (legacy -> FA)
+        // compute_attn_gpu(s->q, s->key_cache + loff, s->att, s->mask, pos, p->seq_len, head_dim,
+        // kv_dim, kv_mul, p->sliding_window, l, p->n_attn_heads);
 
-        add_attn_sink_gpu(s->att, w->attn_sinks + l * p->n_attn_heads, pos, p->seq_len,
-                          p->n_attn_heads, l);
+        // add_attn_sink_gpu(s->att, w->attn_sinks + l * p->n_attn_heads, pos, p->seq_len,
+        // p->n_attn_heads, l);
 
-        softmax_attn_gpu(s->att, pos, p->seq_len, p->n_attn_heads);
+        // softmax_attn_gpu(s->att, pos, p->seq_len, p->n_attn_heads);
 
-        w_value_acc_gpu(s->att, s->value_cache + loff, s->tb, pos, p->seq_len, head_dim, kv_dim,
-                        kv_mul, p->n_attn_heads);
+        // w_value_acc_gpu(s->att, s->value_cache + loff, s->tb, pos, p->seq_len, head_dim, kv_dim,
+        // kv_mul, p->n_attn_heads);
+
+        flash_attn_decode_gpu(s->q, s->key_cache + loff, s->value_cache + loff, s->mask,
+                              w->attn_sinks + l * p->n_attn_heads, s->tb, pos, p->seq_len, head_dim,
+                              kv_dim, kv_mul, p->sliding_window, l, p->n_attn_heads);
 
         // ! Output projection
         __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
