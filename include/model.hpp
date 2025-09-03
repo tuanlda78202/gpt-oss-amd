@@ -16,6 +16,8 @@
         }                                                                                          \
     } while (0)
 
+struct PPManager;
+
 typedef struct {
     float value;
     int index;
@@ -180,6 +182,7 @@ typedef struct {
     int fd;                            // file descriptor for memory mapping
     float* data;                       // memory mapped data pointer
     ssize_t file_size;                 // size of the checkpoint file in bytes
+    PPManager* pp;                     // PP manager
 } OssTransformerHybrid;
 
 void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
