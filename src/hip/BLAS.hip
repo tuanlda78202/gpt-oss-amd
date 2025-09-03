@@ -21,6 +21,10 @@
 #define GEMM_BLOCK_DIM_Y 4
 #define VDS_BLOCK_DIM 32
 
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+
 // #define MATRIX_CORE 1
 
 __device__ float warp_reduce_sum(float val) {
@@ -53,7 +57,7 @@ __device__ float block_reduce_sum(float val) {
 __device__ float warp_reduce_max(float val) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        val = std::max(val, __shfl_xor(val, offset));
+        val = MAX(val, __shfl_xor(val, offset));
 
     return val;
 }

@@ -81,5 +81,5 @@ uv.lock
 note.txt
 legacy.hip/
 time_log.py
-data/input.txt
-data/output.txt
+tests/data/input.txt
+tests/data/output.txt

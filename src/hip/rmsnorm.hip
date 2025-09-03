@@ -3,14 +3,12 @@
 __global__ void rmsnorm_hybrid_kernel(float* o, float* x, __half* weight_half, int size) {
     int lx = threadIdx.x;
     float tmp;
-    // Use double precision for sum accumulation to avoid rounding errors
-    double ss = 0.0;
+    float ss = 0.0f;
     __shared__ float total_sum;
 
-    // Compute sum of squares with double precision
     for (int i = lx; i < size; i += blockDim.x) {
         tmp = x[i];
-        ss += (double)tmp * (double)tmp;
+        ss += (float)tmp * (float)tmp;
     }
 
     // Reduce with high precision
