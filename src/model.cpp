@@ -19,7 +19,7 @@ static std::vector<std::pair<int, int>> partition_layers(int n_layers, int parts
 
 static bool enable_p2p(int src_dev, int dst_dev) {
     int can = 0;
-    hipDeviceCanAccessPeer(&can, dst_dev, src_dev);
+    CHECK_HIP(hipDeviceCanAccessPeer(&can, dst_dev, src_dev));
     if (can)
         hipDeviceEnablePeerAccess(src_dev, 0);
     return can != 0;
@@ -277,7 +277,7 @@ static void copy_transformer_to_device_hybrid_pp(OssTransformer* t_fp32, OssTran
 void copy_transformer_to_device_hybrid(OssTransformer* t_host, OssTransformerHybrid* t_root) {
     // Decide PP degree
     int numDevs = 1;
-    hipGetDeviceCount(&numDevs);
+    CHECK_HIP(hipGetDeviceCount(&numDevs));
     printf("\nNumber of devices: %d\n", numDevs);
     int pp = numDevs;
     if (const char* e = std::getenv("GETP_PP")) {
@@ -399,7 +399,7 @@ void free_transformer_on_device_hybrid(OssTransformerHybrid* t_root) {
         std::free(s.shard);
     }
     if (mgr->host_bounce)
-        hipHostFree(mgr->host_bounce);
+        CHECK_HIP(hipHostFree(mgr->host_bounce));
     delete mgr;
     t_root->pp = nullptr;
     std::memset(t_root, 0, sizeof(*t_root));
