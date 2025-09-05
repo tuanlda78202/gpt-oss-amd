@@ -17,6 +17,7 @@
 #include <cstring>
 #include <omp.h>
 
+// TODO: merge interface batch=1
 float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     OssConfig* p = &transformer->config;
     OssTransformerWeightsHalf* w = &transformer->weights;
@@ -100,7 +101,6 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         // ! Expert processing
         CHECK_HIP(hipMemset(s->e_agg, 0, hidden_dim * sizeof(float)));
 
-        // TODO (explain): Copy topk_indices to host once per layer
         int topk_indices_host[16];
         float topk_weights_host[16];
         int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
@@ -190,6 +190,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
     CHECK_HIP(hipMalloc(&sin_vals, cos_sin_size));
 
     // ! Embedding - batched
+    // TODO: full GPU
     int* d_tokens = nullptr;
     CHECK_HIP(hipMalloc(&d_tokens, batch_size * sizeof(int)));
     CHECK_HIP(hipMemcpy(d_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
@@ -221,7 +222,10 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
         compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
                           p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
-        rope_batch_gpu(s->q, cos_vals, sin_vals, batch_size, p->n_attn_heads, head_dim);
+        // TODO: 1 RoPE only
+        rope_q_batch_gpu(s->q, cos_vals, sin_vals, batch_size, p->n_attn_heads, head_dim);
+        rope_k_batch_gpu(s->key_cache, cos_vals, sin_vals, batch_size, p->n_kv_heads, head_dim,
+                         p->seq_len, kv_dim, l, pos);
 
         // ! GQA - batched
         flash_attn_decode_gpu_batch(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks,
@@ -248,7 +252,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         matvec_batch_gpu(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim,
                          n_experts);
 
-        // TODO: Need batched topk and MoE processing - for now loop over batch
+        // TODO: Batched topk and MoE processing on GPUs
         for (int b = 0; b < batch_size; b++) {
             int batch_offset_experts = b * n_experts;
             int batch_offset_topk = b * p->experts_per_token;
@@ -263,7 +267,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
             // ! Expert processing for this batch element
             CHECK_HIP(hipMemset(s->e_agg + batch_offset_hidden, 0, hidden_dim * sizeof(float)));
 
-            // TODO: Copy topk_indices to host once per layer per batch element
+            // TODO: full on GPU
             int topk_indices_host[16];
             float topk_weights_host[16];
             int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
@@ -273,6 +277,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
             CHECK_HIP(hipMemcpy(topk_weights_host, s->topk_v + batch_offset_topk,
                                 safe_experts_per_token * sizeof(float), hipMemcpyDeviceToHost));
 
+            // TODO: fused 1 kernel GPU
             for (int idx = 0; idx < safe_experts_per_token; idx++) {
                 int e = topk_indices_host[idx];
                 float expert_w = topk_weights_host[idx];

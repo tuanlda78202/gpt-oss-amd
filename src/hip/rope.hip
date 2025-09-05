@@ -143,7 +143,7 @@ void rope_gpu(float* x, float* cosv, float* sinv, int n_heads, int head_dim)
     CHECK_HIP(hipGetLastError());
 }
 
-void rope_batch_gpu(float* x_batch, float* cosv, float* sinv, int batch_size, int n_heads, int head_dim)
+void rope_q_batch_gpu(float* x_batch, float* cosv, float* sinv, int batch_size, int n_heads, int head_dim)
 {
     const int half = head_dim >> 1;
     const int total_per_batch = n_heads * half;
@@ -152,5 +152,43 @@ void rope_batch_gpu(float* x_batch, float* cosv, float* sinv, int batch_size, in
 
     hipLaunchKernelGGL(apply_rotary_emb_batch_kernel, dim3(grid_x, batch_size), dim3(block), 0, 0,
                        x_batch, cosv, sinv, batch_size, n_heads, head_dim);
+    CHECK_HIP(hipGetLastError());
+}
+
+__global__ void apply_rotary_to_kcache_at_pos_batch_kernel(float* k_cache, const float* cosv,
+                                                           const float* sinv, int batch_size,
+                                                           int n_kv_heads, int head_dim,
+                                                           int seq_len, int kv_dim, int layer_idx,
+                                                           int pos) {
+    int h = blockIdx.x; // kv head
+    int b = blockIdx.y; // batch item
+    int tid = threadIdx.x;
+    int half = head_dim >> 1;
+
+    if (h >= n_kv_heads || b >= batch_size)
+        return;
+
+    long long base = 1ll * layer_idx * batch_size * seq_len * kv_dim + 1ll * b * seq_len * kv_dim +
+                     1ll * pos * kv_dim + 1ll * h * head_dim;
+
+    float* x = k_cache + base;
+
+    for (int i = tid; i < half; i += blockDim.x) {
+        float x1 = x[i];
+        float x2 = x[half + i];
+        float c = cosv[i];
+        float s = sinv[i];
+        x[i] = fmaf(-x2, s, x1 * c);
+        x[half + i] = fmaf(x1, s, x2 * c);
+    }
+}
+
+inline void rope_k_batch_gpu(float* k_cache, float* cosv, float* sinv, int batch_size,
+                                         int n_kv_heads, int head_dim, int seq_len, int kv_dim,
+                                         int layer_idx, int pos) {
+    dim3 grid(n_kv_heads, batch_size);
+    dim3 block(256);
+    hipLaunchKernelGGL(apply_rotary_to_kcache_at_pos_batch_kernel, grid, block, 0, 0, k_cache, cosv,
+                       sinv, batch_size, n_kv_heads, head_dim, seq_len, kv_dim, layer_idx, pos);
     CHECK_HIP(hipGetLastError());
 }

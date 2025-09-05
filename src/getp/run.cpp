@@ -22,7 +22,8 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
 
     t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
 
-    transformer_oss->config.batch_size = 2;
+    // TODO: set first 16 rq not working correctly
+    transformer_oss->config.batch_size = 4;
 
     copy_transformer_to_device_hybrid(transformer_oss, t_d);
 
@@ -248,8 +249,9 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
             } else {
                 // Print generated token
                 const char* piece = decode_piece(tokenizer, current_tokens[b], next_token);
-                printf("B%d: %s\n", b, piece);
-                fflush(stdout);
+                // TODO: make log better
+                // printf("B%d: %s\n", b, piece);
+                // fflush(stdout);
             }
 
             current_tokens[b] = next_token;
