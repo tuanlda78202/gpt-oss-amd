@@ -604,3 +604,35 @@ void flash_attn_decode_gpu(const float* q,
     CHECK_HIP(hipFree(partial_l));
     CHECK_HIP(hipGetLastError());
 }
+
+// Simple batched attention - loops over batch internally for now
+void flash_attn_decode_gpu_batch(
+    const float* q_batch,      // (B, n_heads * head_dim)
+    const float* k_cache,      // (L, B, T, kv_dim) - full cache
+    const float* v_cache,      // (L, B, T, kv_dim)
+    const float* mask,         // (T, T) - shared across batch
+    const __half* attn_sinks,  // (L, n_heads) - shared across batch
+    float* tb_batch,           // (B, n_heads * head_dim) - output
+    int batch_size,
+    int pos, int seq_len, int head_dim, int kv_dim, int kv_mul,
+    int sliding_window, int layer_idx, int n_attn_heads)
+{
+    // For now, process each batch element separately using existing single-batch function
+    for (int b = 0; b < batch_size; b++) {
+        // Calculate offsets for this batch element
+        const float* q_b = q_batch + b * (n_attn_heads * head_dim);
+        float* tb_b = tb_batch + b * (n_attn_heads * head_dim);
+
+        // KV cache offset: layer * (B * T * kv_dim) + b * (T * kv_dim)
+        const float* k_cache_b = k_cache + layer_idx * (batch_size * seq_len * kv_dim) +
+                                 b * (seq_len * kv_dim);
+        const float* v_cache_b = v_cache + layer_idx * (batch_size * seq_len * kv_dim) +
+                                 b * (seq_len * kv_dim);
+
+        // Call single-batch attention
+        flash_attn_decode_gpu(q_b, k_cache_b, v_cache_b, mask,
+                             attn_sinks + layer_idx * n_attn_heads, tb_b,
+                             pos, seq_len, head_dim, kv_dim, kv_mul,
+                             sliding_window, layer_idx, n_attn_heads);
+    }
+}

@@ -33,6 +33,55 @@ __global__ void split_qkv_kernel(
     }
 }
 
+__global__ void split_qkv_batch_kernel(
+    const float* qkv_batch,         // (B, (q_heads + 2*kv_heads) * head_dim)
+    float* q_batch,                 // (B, q_heads * head_dim)
+    float* key_cache,               // (L, B, T, kv_dim) - write current K to cache
+    float* value_cache,             // (L, B, T, kv_dim) - write current V to cache
+    int batch_size,
+    int head_dim,
+    int n_attn_heads,
+    int n_kv_heads,
+    int layer,
+    int pos,
+    int seq_len
+) {
+    int b = blockIdx.y;                            // batch index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; // feature index within QKV
+
+    if (b >= batch_size) return;
+
+    int q_size = head_dim * n_attn_heads;
+    int k_size = head_dim * n_kv_heads;
+    int v_size = head_dim * n_kv_heads;
+    int total_size = q_size + k_size + v_size;
+    int kv_dim = head_dim * n_kv_heads;
+
+    if (idx < total_size) {
+        int qkv_offset = b * total_size;
+
+        if (idx < q_size) {
+            // Copy Q part to q_batch
+            int q_offset = b * q_size;
+            q_batch[q_offset + idx] = qkv_batch[qkv_offset + idx];
+        } else if (idx < q_size + k_size) {
+            // Copy K part to key_cache
+            int k_idx = idx - q_size;
+            int cache_offset = layer * (batch_size * seq_len * kv_dim) +
+                              b * (seq_len * kv_dim) +
+                              pos * kv_dim + k_idx;
+            key_cache[cache_offset] = qkv_batch[qkv_offset + idx];
+        } else {
+            // Copy V part to value_cache
+            int v_idx = idx - q_size - k_size;
+            int cache_offset = layer * (batch_size * seq_len * kv_dim) +
+                              b * (seq_len * kv_dim) +
+                              pos * kv_dim + v_idx;
+            value_cache[cache_offset] = qkv_batch[qkv_offset + idx];
+        }
+    }
+}
+
 void split_qkv_gpu(
     const float* qkv,
     float* q,
@@ -55,6 +104,38 @@ void split_qkv_gpu(
                        dim3(block_size),
                        0, 0,
                        qkv, q, k, v, head_dim, n_attn_heads, n_kv_heads);
+
+    CHECK_HIP(hipGetLastError());
+}
+
+void split_qkv_batch_gpu(
+    const float* qkv_batch,
+    float* q_batch,
+    float* key_cache,
+    float* value_cache,
+    int batch_size,
+    int head_dim,
+    int n_attn_heads,
+    int n_kv_heads,
+    int layer,
+    int pos,
+    int seq_len
+) {
+    int q_size = head_dim * n_attn_heads;
+    int k_size = head_dim * n_kv_heads;
+    int v_size = head_dim * n_kv_heads;
+    int total_size = q_size + k_size + v_size;
+
+    int block_size = 256;
+    int grid_size = (total_size + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(split_qkv_batch_kernel,
+                       dim3(grid_size, batch_size),
+                       dim3(block_size),
+                       0, 0,
+                       qkv_batch, q_batch, key_cache, value_cache,
+                       batch_size, head_dim, n_attn_heads, n_kv_heads,
+                       layer, pos, seq_len);
 
     CHECK_HIP(hipGetLastError());
 }

@@ -98,6 +98,39 @@ void compute_cosin_gpu(int pos, float base, int head_dim, float scaling_factor,
     CHECK_HIP(hipGetLastError());
 }
 
+__global__ void apply_rotary_emb_batch_kernel(
+    float* __restrict__ x_batch,  // (B, n_heads, head_dim)
+    const float* __restrict__ cosv,
+    const float* __restrict__ sinv,
+    int batch_size, int n_heads, int head_dim)
+{
+    const int half = head_dim >> 1;
+    const int total_per_batch = n_heads * half;
+
+    int b = blockIdx.y;  // batch index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;  // index within batch
+
+    if (b >= batch_size || idx >= total_per_batch) return;
+
+    int h = idx / half;  // head index
+    int i = idx % half;  // position within head
+
+    int x_offset = b * (n_heads * head_dim);  // offset for this batch
+
+    float x1 = x_batch[x_offset + h * head_dim + i];
+    float x2 = x_batch[x_offset + h * head_dim + half + i];
+
+    float c = cosv[i];
+    float s = sinv[i];
+
+    // (x1, x2) <- rot((x1, x2), theta)
+    float o1 = fmaf(-x2, s, x1 * c);  // x1*c - x2*s
+    float o2 = fmaf( x1, s, x2 * c);  // x2*c + x1*s
+
+    x_batch[x_offset + h * head_dim + i]         = o1;
+    x_batch[x_offset + h * head_dim + half + i]  = o2;
+}
+
 void rope_gpu(float* x, float* cosv, float* sinv, int n_heads, int head_dim)
 {
     const int half = head_dim >> 1;
@@ -107,5 +140,17 @@ void rope_gpu(float* x, float* cosv, float* sinv, int n_heads, int head_dim)
 
     hipLaunchKernelGGL(apply_rotary_emb_kernel_fast, dim3(grid), dim3(block), 0, 0,
                        x, cosv, sinv, n_heads, head_dim);
+    CHECK_HIP(hipGetLastError());
+}
+
+void rope_batch_gpu(float* x_batch, float* cosv, float* sinv, int batch_size, int n_heads, int head_dim)
+{
+    const int half = head_dim >> 1;
+    const int total_per_batch = n_heads * half;
+    const int block = 256;
+    const int grid_x = (total_per_batch + block - 1) / block;
+
+    hipLaunchKernelGGL(apply_rotary_emb_batch_kernel, dim3(grid_x, batch_size), dim3(block), 0, 0,
+                       x_batch, cosv, sinv, batch_size, n_heads, head_dim);
     CHECK_HIP(hipGetLastError());
 }

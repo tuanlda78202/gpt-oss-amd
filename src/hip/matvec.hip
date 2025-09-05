@@ -119,6 +119,62 @@ __global__ void matvec_warp_splitk_vec4(const __half* __restrict__ A_half,
     }
 }
 
+template <int RB>
+__global__ void matvec_batch_kernel(const __half* __restrict__ A_half,
+                                    const float* __restrict__ B_batch, float* __restrict__ C_batch,
+                                    const __half* __restrict__ bias, int batch_size, int M, int K) {
+    const int lane = threadIdx.x; // 0..63
+    const int warp = threadIdx.y; // 0..RB-1
+    const int row = blockIdx.y * RB + warp;
+    const int batch_idx = blockIdx.z;
+
+    if (row >= M || batch_idx >= batch_size)
+        return;
+
+    const int b_base = batch_idx * K; // input offset for this batch
+    const int c_base = batch_idx * M; // output offset for this batch
+    const float* B = B_batch + b_base;
+    float* C = C_batch + c_base;
+
+    const int a_base = row * K;
+    float acc = 0.0f;
+
+    // Process main part in chunks of 4
+    const int K4 = K >> 2;
+    for (int k4 = lane; k4 < K4; k4 += warpSize) {
+        const int k = (k4 << 2);
+
+        // Load B[k..k+3] as float4
+        float4 bv = *reinterpret_cast<const float4*>(&B[k]);
+
+        // Load A[row,k..k+3] as (half2 + half2)
+        half2 a0 = *reinterpret_cast<const half2*>(&A_half[a_base + k + 0]);
+        half2 a1 = *reinterpret_cast<const half2*>(&A_half[a_base + k + 2]);
+
+        float2 af0 = __half22float2(a0);
+        float2 af1 = __half22float2(a1);
+
+        // FMA
+        acc = fmaf(af0.x, bv.x, acc);
+        acc = fmaf(af0.y, bv.y, acc);
+        acc = fmaf(af1.x, bv.z, acc);
+        acc = fmaf(af1.y, bv.w, acc);
+    }
+
+    // Tail (K not multiple of 4)
+    for (int kt = (K4 << 2) + lane; kt < K; kt += warpSize) {
+        acc = fmaf(__half2float(A_half[a_base + kt]), B[kt], acc);
+    }
+
+    // Warp reduce
+    acc = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        float badd = bias ? __half2float(bias[row]) : 0.0f;
+        C[row] = acc + badd;
+    }
+}
+
 void matvec_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
     CHECK_HIP(hipMemset(xout, 0, d * sizeof(float)));
 
@@ -126,6 +182,17 @@ void matvec_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
     dim3 block(64, RB, 1);
     dim3 grid(1, CEIL_DIV(d, RB), 1);
     matvec_warp_splitk_vec4<RB><<<grid, block>>>(w, x, xout, bias, d, n);
+
+    CHECK_HIP(hipGetLastError());
+}
+
+void matvec_batch_gpu(float* xout, float* x_batch, __half* w, __half* bias, int batch_size, int n, int d) {
+    CHECK_HIP(hipMemset(xout, 0, batch_size * d * sizeof(float)));
+
+    constexpr int RB = 4;
+    dim3 block(64, RB, 1);
+    dim3 grid(1, CEIL_DIV(d, RB), batch_size);
+    matvec_batch_kernel<RB><<<grid, block>>>(w, x_batch, xout, bias, batch_size, d, n);
 
     CHECK_HIP(hipGetLastError());
 }
