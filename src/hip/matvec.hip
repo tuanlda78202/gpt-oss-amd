@@ -1,13 +1,22 @@
 #include "BLAS.hip"
 
-#define VEC 4
+// 64-wide wave reduce
+__device__ __forceinline__ float warp_reduce_sum_64(float v) {
+#pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        v += __shfl_down(v, off);
+    return v;
+}
 
-// Each warp computes one row; block has RB warps (RB rows) → 64*RB threads.
-// Good defaults: RB = 8 (512 threads/block) or RB = 4 (256).
+// Unroll factor: try 2 or 4. Higher unroll -> more VGPR pressure.
+#ifndef K_UNROLL
+#define K_UNROLL 4
+#endif
+
 template <int RB /* rows per block */>
-__global__ void matvec_warp_splitk_vec4(const __half* __restrict__ A_half,
-                                        const float* __restrict__ B, float* __restrict__ C,
-                                        const __half* __restrict__ bias, int M, int K) {
+__global__ void matvec_warp_splitk_vec4_u(const __half* __restrict__ A_half,
+                                          const float* __restrict__ B, float* __restrict__ C,
+                                          const __half* __restrict__ bias, int M, int K) {
     const int lane = threadIdx.x; // 0..63
     const int warp = threadIdx.y; // 0..RB-1
     const int row = blockIdx.y * RB + warp;
@@ -17,49 +26,84 @@ __global__ void matvec_warp_splitk_vec4(const __half* __restrict__ A_half,
     const int a_base = row * K;
     float acc = 0.0f;
 
-    // Process main part in chunks of 4
+    // Work in units of 4 for vectorization
     const int K4 = K >> 2; // floor(K/4)
-    for (int k4 = lane; k4 < K4; k4 += warpSize) {
-        const int k = (k4 << 2);
 
-        // Load B[k..k+3] as float4
-        float4 bv = *reinterpret_cast<const float4*>(&B[k]);
+    // Each lane walks k4 in steps of warpSize
+    // We process K_UNROLL float4s per loop to increase ILP.
+    int k4 = lane;
 
-        // Load A[row,k..k+3] as (half2 + half2)
-        half2 a0 = *reinterpret_cast<const half2*>(&A_half[a_base + k + 0]);
-        half2 a1 = *reinterpret_cast<const half2*>(&A_half[a_base + k + 2]);
+    // Prefetch registers
+    float4 bv[K_UNROLL];
+    half2 a0[K_UNROLL], a1[K_UNROLL];
+    float2 af0[K_UNROLL], af1[K_UNROLL];
 
-        float2 af0 = __half22float2(a0);
-        float2 af1 = __half22float2(a1);
-
-        // FMA
-        acc = fmaf(af0.x, bv.x, acc);
-        acc = fmaf(af0.y, bv.y, acc);
-        acc = fmaf(af1.x, bv.z, acc);
-        acc = fmaf(af1.y, bv.w, acc);
+// Preload first batch
+#pragma unroll
+    for (int u = 0; u < K_UNROLL; ++u) {
+        int k4u = k4 + u * WARP_SIZE;
+        if (k4u < K4) {
+            const int k = (k4u << 2);
+            bv[u] = *reinterpret_cast<const float4*>(&B[k]);
+            a0[u] = *reinterpret_cast<const half2*>(&A_half[a_base + k + 0]);
+            a1[u] = *reinterpret_cast<const half2*>(&A_half[a_base + k + 2]);
+            af0[u] = __half22float2(a0[u]);
+            af1[u] = __half22float2(a1[u]);
+        }
     }
 
-    // Tail (K not multiple of 4)
-    for (int kt = (K4 << 2) + lane; kt < K; kt += warpSize) {
+    for (;;) {
+// Compute FMAs on the prefetched batch
+#pragma unroll
+        for (int u = 0; u < K_UNROLL; ++u) {
+            int k4u = k4 + u * WARP_SIZE;
+            if (k4u < K4) {
+                acc = fmaf(af0[u].x, bv[u].x, acc);
+                acc = fmaf(af0[u].y, bv[u].y, acc);
+                acc = fmaf(af1[u].x, bv[u].z, acc);
+                acc = fmaf(af1[u].y, bv[u].w, acc);
+            }
+        }
+
+        // Advance
+        k4 += K_UNROLL * WARP_SIZE;
+        if (k4 >= K4)
+            break;
+
+// Prefetch next batch while previous FMAs are in flight
+#pragma unroll
+        for (int u = 0; u < K_UNROLL; ++u) {
+            int k4u = k4 + u * WARP_SIZE;
+            if (k4u < K4) {
+                const int k = (k4u << 2);
+                bv[u] = *reinterpret_cast<const float4*>(&B[k]);
+                a0[u] = *reinterpret_cast<const half2*>(&A_half[a_base + k + 0]);
+                a1[u] = *reinterpret_cast<const half2*>(&A_half[a_base + k + 2]);
+                af0[u] = __half22float2(a0[u]);
+                af1[u] = __half22float2(a1[u]);
+            }
+        }
+    }
+
+    // Tail for K % 4
+    for (int kt = (K4 << 2) + lane; kt < K; kt += WARP_SIZE) {
+        // (If you want: consider nontemporal load for A here after profiling)
         acc = fmaf(__half2float(A_half[a_base + kt]), B[kt], acc);
     }
 
     // Warp reduce
-    acc = warp_reduce_sum(acc);
+    acc = warp_reduce_sum_64(acc);
 
     if (lane == 0) {
-        float badd = bias ? __half2float(bias[row]) : 0.0f;
-        C[row] = acc + badd;
+        C[row] = acc + (bias ? __half2float(bias[row]) : 0.0f);
     }
 }
 
-void matvec_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
-    CHECK_HIP(hipMemset(xout, 0, d * sizeof(float)));
-
-    constexpr int RB = 4; // 256 threads/block; try 8 if regs allow
-    dim3 block(64, RB, 1);
-    dim3 grid(1, CEIL_DIV(d, RB), 1);
-    matvec_warp_splitk_vec4<RB><<<grid, block>>>(w, x, xout, bias, d, n);
-
+void matvec_gpu(float* xout, float* x, const __half* w, const __half* bias, int n, int d) {
+    // Zeroing isn't needed here (no atomics).
+    constexpr int RB = 4; // try 4, also test 8 if VGPRs allow 2+ waves/CU
+    dim3 block(WARP_SIZE, RB, 1);
+    dim3 grid(1, (d + RB - 1) / RB, 1);
+    hipLaunchKernelGGL((matvec_warp_splitk_vec4_u<RB>), grid, block, 0, 0, w, x, xout, bias, d, n);
     CHECK_HIP(hipGetLastError());
 }
