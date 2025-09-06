@@ -1,6 +1,7 @@
 #pragma once
 #include "model.hpp"
 
+// TODO: rmv unused
 float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos);
 float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int pos,
                             int batch_size);

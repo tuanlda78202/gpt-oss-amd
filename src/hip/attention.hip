@@ -605,35 +605,450 @@ void flash_attn_decode_gpu(const float* q,
     CHECK_HIP(hipGetLastError());
 }
 
-// Simple batched attention - loops over batch internally for now
+// ============================================================
+// Batched CHUNK kernel: grid = (n_attn_heads, n_chunks, batch_size)
+// Each CTA handles one (head, chunk, batch) triple and writes
+// partial (O_c, m_c, l_c) at indices [b, h, c, ...]
+// ============================================================
+__launch_bounds__(256, 2)
+__global__ void flash_attn_decode_chunk_kernel_batched(
+    const float* __restrict__ q_batch,      // (B, H*D)
+    const void*  __restrict__ k_cache_base, // (L, B, T, kv_dim) laid out per your strides
+    const void*  __restrict__ v_cache_base, // same layout as K
+    const float* __restrict__ mask,         // (T, T), shared across batch
+    int pos, int seq_len, int head_dim, int kv_dim,
+    int kv_mul, int sliding_window, int layer_idx,
+    int n_attn_heads,
+    int chunk_size, int n_chunks,
+    // batch routing/strides
+    const int* __restrict__ batch_indices,  // (B) -> global-batch id
+    long long B_stride,                     // elements per (B * T * kv_dim) “layer stride”
+    // outputs
+    float* __restrict__ partial_O, // (B, H, C, D)
+    float* __restrict__ partial_m, // (B, H, C)
+    float* __restrict__ partial_l  // (B, H, C)
+) {
+    const int h   = blockIdx.x;  // head
+    const int c   = blockIdx.y;  // chunk
+    const int b   = blockIdx.z;  // batch
+    const int tid = threadIdx.x;
+
+    if (h >= n_attn_heads || c >= n_chunks) return;
+
+    const int g = h / kv_mul; // GQA group index
+
+    // Chunk time range
+    const int t0 = c * chunk_size;
+    int t1 = t0 + chunk_size; if (t1 > (pos + 1)) t1 = pos + 1;
+    if (t0 >= t1) {
+        if (tid == 0) {
+            partial_m[((long long)b*n_attn_heads + h)*n_chunks + c] = -3.402823466e+38f;
+            partial_l[((long long)b*n_attn_heads + h)*n_chunks + c] = 0.0f;
+        }
+        return;
+    }
+
+    // Per-batch pointers for Q and partial outputs
+    const float* q_b = q_batch + (long long)b * (n_attn_heads * head_dim);
+    float* O_c = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + c ) * (long long)head_dim;
+
+    extern __shared__ float q_sh[]; // D floats
+    const float* q_head = q_b + (long long)h * head_dim;
+
+    // Preload & pre-scale Q once
+    const float inv_sqrt_d = rsqrtf((float)head_dim);
+    for (int i = tid; i < head_dim; i += blockDim.x) q_sh[i] = q_head[i] * inv_sqrt_d;
+    __syncthreads();
+
+    // Initialize O_c
+    for (int i = tid; i < head_dim; i += blockDim.x) O_c[i] = 0.0f;
+
+    __shared__ float m_shared; // running max
+    __shared__ float l_shared; // running sum exp
+    __shared__ float scale_old_shared, scale_new_shared, s_shared;
+    __shared__ int masked_step;
+
+    if (tid == 0) { m_shared = -3.402823466e+38f; l_shared = 0.0f; }
+    __syncthreads();
+
+    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0);
+
+    // Compute KV base for this (layer, gb)
+    const int gb = batch_indices[b];
+    const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;  // ✅ elements
+    const long long batch_stride = 1ll * seq_len * kv_dim;             // ✅ elements
+
+    const size_t elem_bytes =
+    #if USE_FP16_KV
+        sizeof(__half);
+    #else
+        sizeof(float);
+    #endif
+
+    const char* k_base = (const char*)k_cache_base + elem_bytes * (
+        (long long)layer_idx * layer_stride + (long long)gb * batch_stride );
+    const char* v_base = (const char*)v_cache_base + elem_bytes * (
+        (long long)layer_idx * layer_stride + (long long)gb * batch_stride );
+
+    for (int t = t0; t < t1; ++t) {
+#if USE_FP16_KV
+        const __half* __restrict__ k_head_h = (const __half*)( (const __half*)k_base + (long long)t * kv_dim + (long long)g * head_dim );
+#else
+        const float*  __restrict__ k_head_f = (const float*)( (const float*)k_base + (long long)t * kv_dim + (long long)g * head_dim );
+#endif
+        float partial = 0.0f;
+#if USE_FP16_KV
+        int i = tid * 2;
+        for (; i + 1 < head_dim; i += blockDim.x * 2) {
+            __half2 kh2 = *reinterpret_cast<const __half2*>(&k_head_h[i]);
+            float2 kf = __half22float2(kh2);
+            partial += q_sh[i] * kf.x + q_sh[i + 1] * kf.y;
+        }
+        for (; i < head_dim; i += blockDim.x) partial += q_sh[i] * __half2float(k_head_h[i]);
+#else
+        for (int i = tid; i < head_dim; i += blockDim.x) partial += q_sh[i] * k_head_f[i];
+#endif
+        partial = block_reduce_sum(partial);
+
+        if (tid == 0) {
+            float s = partial;
+            if (use_mask) s += mask[(long long)pos * seq_len + t];
+            s_shared = s; masked_step = !isfinite(s);
+        }
+        __syncthreads();
+        if (masked_step) continue;
+
+        if (tid == 0) {
+            const float s = s_shared;
+            const float m_prev = m_shared;
+            const float l_prev = l_shared;
+            const float m_new  = fmaxf(m_prev, s);
+            const float alpha  = __expf(m_prev - m_new);
+            const float p      = __expf(s - m_new);
+            const float l_new  = alpha * l_prev + p;
+            scale_old_shared = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
+            scale_new_shared = (l_new > 0.0f) ? p / l_new : 0.0f;
+            m_shared = m_new; l_shared = l_new;
+        }
+        __syncthreads();
+
+#if USE_FP16_KV
+        const __half* __restrict__ v_head_h = (const __half*)( (const __half*)v_base + (long long)t * kv_dim + (long long)g * head_dim );
+#else
+        const float*  __restrict__ v_head_f = (const float*)( (const float*)v_base + (long long)t * kv_dim + (long long)g * head_dim );
+#endif
+        const float scale_old = scale_old_shared;
+        const float scale_new = scale_new_shared;
+
+#if USE_FP16_KV
+        int j = tid * 2;
+        for (; j + 1 < head_dim; j += blockDim.x * 2) {
+            __half2 vh2 = *reinterpret_cast<const __half2*>(&v_head_h[j]);
+            float2 vf = __half22float2(vh2);
+            float o0 = O_c[j]; float o1 = O_c[j + 1];
+            o0 = scale_old * o0 + scale_new * vf.x;
+            o1 = scale_old * o1 + scale_new * vf.y;
+            O_c[j] = o0; O_c[j + 1] = o1;
+        }
+        for (; j < head_dim; j += blockDim.x) {
+            float o = O_c[j];
+            o = scale_old * o + scale_new * __half2float(v_head_h[j]);
+            O_c[j] = o;
+        }
+#else
+        for (int j = tid; j < head_dim; j += blockDim.x) {
+            float o = O_c[j];
+            o = scale_old * o + scale_new * v_head_f[j];
+            O_c[j] = o;
+        }
+#endif
+    }
+
+    if (tid == 0) {
+        partial_m[((long long)b*n_attn_heads + h)*n_chunks + c] = m_shared;
+        partial_l[((long long)b*n_attn_heads + h)*n_chunks + c] = l_shared;
+    }
+}
+
+// ============================================================
+// Batched REDUCE kernel: grid = (n_attn_heads, batch_size)
+// Reduces over chunks for each (b, h), writes to tb_batch[b, h, :]
+// Also applies attention sink per (b, h)
+// ============================================================
+__launch_bounds__(256, 2)
+__global__ void flash_attn_reduce_chunks_kernel_batched(
+    const float* __restrict__ partial_O,     // (B, H, C, D)
+    const float* __restrict__ partial_m,     // (B, H, C)
+    const float* __restrict__ partial_l,     // (B, H, C)
+    const __half* __restrict__ attn_sinks_half, // (L, H) — we index by head only here
+    float* __restrict__ tb_batch,            // (B, H*D)
+    int head_dim, int n_chunks, int n_attn_heads
+) {
+    const int h   = blockIdx.x;
+    const int b   = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (h >= n_attn_heads) return;
+
+    float m = partial_m[((long long)b*n_attn_heads + h)*n_chunks + 0];
+    float l = partial_l[((long long)b*n_attn_heads + h)*n_chunks + 0];
+
+    float* O_acc = tb_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
+
+    // Copy O0
+    const float* O0 = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + 0 ) * (long long)head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) O_acc[i] = O0[i];
+    __syncthreads();
+
+    // Merge remaining chunks
+    for (int c = 1; c < n_chunks; ++c) {
+        const float mc = partial_m[((long long)b*n_attn_heads + h)*n_chunks + c];
+        const float lc = partial_l[((long long)b*n_attn_heads + h)*n_chunks + c];
+        if (!(isfinite(mc) && lc > 0.0f)) continue;
+
+        const float* Oc = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + c ) * (long long)head_dim;
+
+        const float m_new = fmaxf(m, mc);
+        const float a = __expf(m  - m_new) * l;
+        const float b2= __expf(mc - m_new) * lc;
+        const float denom = a + b2;
+        const float wA = (denom > 0.0f) ? a  / denom : 0.0f;
+        const float wB = (denom > 0.0f) ? b2 / denom : 0.0f;
+
+        for (int i = tid; i < head_dim; i += blockDim.x) {
+            float o = wA * O_acc[i] + wB * Oc[i];
+            O_acc[i] = o;
+        }
+        __syncthreads();
+        m = m_new; l = denom;
+    }
+
+    // Apply attention sink (denominator only). attn_sinks_half is per-head.
+    if (attn_sinks_half != nullptr) {
+        float sink_s = __half2float(attn_sinks_half[h]);
+        if (isfinite(sink_s)) {
+            const float m_prev = m; const float l_prev = l;
+            const float m_new  = fmaxf(m_prev, sink_s);
+            const float a = __expf(m_prev - m_new) * l_prev;
+            const float b3= __expf(sink_s - m_new);
+            const float denom = a + b3;
+            const float renorm = (denom > 0.0f) ? (a / denom) : 1.0f;
+            for (int i = tid; i < head_dim; i += blockDim.x) O_acc[i] *= renorm;
+        }
+    }
+}
+__launch_bounds__(256, 2)
+__global__ void flash_attn_decode_kernel_batched(
+    const float* __restrict__ q_batch,      // (B, H*D)
+    const void*  __restrict__ k_cache_base, // (L, B, T, kv_dim)
+    const void*  __restrict__ v_cache_base, // (L, B, T, kv_dim)
+    const float* __restrict__ mask,         // (T, T)
+    const __half* __restrict__ attn_sinks_half, // (H)
+    float* __restrict__ tb_batch,           // (B, H*D)
+    int pos, int seq_len, int head_dim, int kv_dim,
+    int kv_mul, int sliding_window, int layer_idx, int n_attn_heads,
+    const int* __restrict__ batch_indices, long long B_stride
+) {
+    const int h   = blockIdx.x;
+    const int b   = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (h >= n_attn_heads) return;
+
+    const int g = h / kv_mul;
+
+    const float* q_b  = q_batch   + (long long)b * (n_attn_heads * head_dim);
+    float*       tb_b = tb_batch  + (long long)b * (n_attn_heads * head_dim);
+    const float* q_head = q_b + (long long)h * head_dim;
+    float* tb_head = tb_b + (long long)h * head_dim;
+
+    extern __shared__ float q_sh[];
+    const float inv_sqrt_d = rsqrtf((float)head_dim);
+    for (int i = tid; i < head_dim; i += blockDim.x) q_sh[i] = q_head[i] * inv_sqrt_d;
+    __syncthreads();
+
+    for (int i = tid; i < head_dim; i += blockDim.x) tb_head[i] = 0.0f;
+
+    __shared__ float m_shared, l_shared, scale_old_shared, scale_new_shared, s_shared;
+    __shared__ int masked_step;
+    if (tid == 0) { m_shared = -3.402823466e+38f; l_shared = 0.0f; }
+    __syncthreads();
+
+    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0);
+
+    const int gb = batch_indices[b];
+    const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;  // ✅ elements
+    const long long batch_stride = 1ll * seq_len * kv_dim;             // ✅ elements
+
+    const size_t elem_bytes =
+    #if USE_FP16_KV
+        sizeof(__half);
+    #else
+        sizeof(float);
+    #endif
+
+    const char* k_base = (const char*)k_cache_base + elem_bytes * (
+        (long long)layer_idx * layer_stride + (long long)gb * batch_stride );
+    const char* v_base = (const char*)v_cache_base + elem_bytes * (
+        (long long)layer_idx * layer_stride + (long long)gb * batch_stride );
+
+
+    for (int t = 0; t <= pos; ++t) {
+#if USE_FP16_KV
+        const __half* __restrict__ k_head_h = (const __half*)( (const __half*)k_base + (long long)t * kv_dim + (long long)g * head_dim );
+#else
+        const float*  __restrict__ k_head_f = (const float*)( (const float*)k_base + (long long)t * kv_dim + (long long)g * head_dim );
+#endif
+        float partial = 0.0f;
+#if USE_FP16_KV
+        int i = tid * 2;
+        for (; i + 1 < head_dim; i += blockDim.x * 2) {
+            __half2 kh2 = *reinterpret_cast<const __half2*>(&k_head_h[i]);
+            float2 kf = __half22float2(kh2);
+            partial += q_sh[i] * kf.x + q_sh[i + 1] * kf.y;
+        }
+        for (; i < head_dim; i += blockDim.x) partial += q_sh[i] * __half2float(k_head_h[i]);
+#else
+        for (int i = tid; i < head_dim; i += blockDim.x) partial += q_sh[i] * k_head_f[i];
+#endif
+        partial = block_reduce_sum(partial);
+
+        if (tid == 0) {
+            float s = partial; if (use_mask) s += mask[(long long)pos * seq_len + t];
+            s_shared = s; masked_step = !isfinite(s);
+        }
+        __syncthreads();
+        if (masked_step) continue;
+
+        if (tid == 0) {
+            const float s = s_shared;
+            const float m_prev = m_shared;
+            const float l_prev = l_shared;
+            const float m_new  = fmaxf(m_prev, s);
+            const float alpha  = __expf(m_prev - m_new);
+            const float p      = __expf(s - m_new);
+            const float l_new  = alpha * l_prev + p;
+            scale_old_shared = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
+            scale_new_shared = (l_new > 0.0f) ? p / l_new : 0.0f;
+            m_shared = m_new; l_shared = l_new;
+        }
+        __syncthreads();
+
+#if USE_FP16_KV
+        const __half* __restrict__ v_head_h = (const __half*)( (const __half*)v_base + (long long)t * kv_dim + (long long)g * head_dim );
+#else
+        const float*  __restrict__ v_head_f = (const float*)( (const float*)v_base + (long long)t * kv_dim + (long long)g * head_dim );
+#endif
+        const float scale_old = scale_old_shared;
+        const float scale_new = scale_new_shared;
+
+#if USE_FP16_KV
+        int j = tid * 2;
+        for (; j + 1 < head_dim; j += blockDim.x * 2) {
+            __half2 vh2 = *reinterpret_cast<const __half2*>(&v_head_h[j]);
+            float2 vf = __half22float2(vh2);
+            float o0 = tb_head[j]; float o1 = tb_head[j + 1];
+            o0 = scale_old * o0 + scale_new * vf.x;
+            o1 = scale_old * o1 + scale_new * vf.y;
+            tb_head[j] = o0; tb_head[j + 1] = o1;
+        }
+        for (; j < head_dim; j += blockDim.x) {
+            float o = tb_head[j];
+            o = scale_old * o + scale_new * __half2float(v_head_h[j]);
+            tb_head[j] = o;
+        }
+#else
+        for (int j = tid; j < head_dim; j += blockDim.x) {
+            float o = tb_head[j];
+            o = scale_old * o + scale_new * v_head_f[j];
+            tb_head[j] = o;
+        }
+#endif
+    }
+
+    // sink
+    if (attn_sinks_half != nullptr) {
+        float sink_s = __half2float(attn_sinks_half[h]);
+        if (isfinite(sink_s)) {
+            const float m_prev = m_shared; const float l_prev = l_shared;
+            float m_new = fmaxf(m_prev, sink_s);
+            float a = __expf(m_prev - m_new) * l_prev;
+            float b3= __expf(sink_s - m_new);
+            float denom = a + b3; float renorm = (denom > 0.0f) ? (a / denom) : 1.0f;
+            for (int i = tid; i < head_dim; i += blockDim.x) tb_head[i] *= renorm;
+        }
+    }
+}
+
 void flash_attn_decode_gpu_batch(
-    const float* q_batch,      // (B, n_heads * head_dim)
-    const float* k_cache,      // (L, B, T, kv_dim) - full cache
-    const float* v_cache,      // (L, B, T, kv_dim)
-    const float* mask,         // (T, T) - shared across batch
-    const __half* attn_sinks,  // (L, n_heads) - shared across batch
-    float* tb_batch,           // (B, n_heads * head_dim) - output
+    const float* q_batch,      // (B, H*D)
+    const float* k_cache,      // base pointer (L, B, T, kv_dim) by your stride math
+    const float* v_cache,
+    const float* mask,         // (T, T)
+    const __half* attn_sinks,  // (L, H) — we use attn_sinks + layer_idx*H
+    float* tb_batch,           // (B, H*D)
     int batch_size,
     int pos, int seq_len, int head_dim, int kv_dim, int kv_mul,
     int sliding_window, int layer_idx, int n_attn_heads,
-    const int* batch_indices,
-    int B_stride)
-{
-    for (int b = 0; b < batch_size; b++) {
-        const float* q_b = q_batch + b * (n_attn_heads * head_dim);
-        float* tb_b = tb_batch + b * (n_attn_heads * head_dim);
+    const int* batch_indices,  // (B) maps logical b -> global batch slot in cache
+    int B_stride               // elements in (B * T * kv_dim) per layer
+){
+    if (batch_size <= 0 || n_attn_heads <= 0 || head_dim <= 0) return;
 
-        // KV cache offset: layer * (B * T * kv_dim) + b * (T * kv_dim)
-        const int gb = batch_indices[b];
-        const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
-        const long long batch_stride = 1ll * seq_len  * kv_dim;
-        const float* k_cache_b = k_cache + 1ll * layer_idx * layer_stride + 1ll * gb * batch_stride;
-        const float* v_cache_b = v_cache + 1ll * layer_idx * layer_stride + 1ll * gb * batch_stride;
+    const int L = pos + 1;
+    int chunk_size = choose_chunk_size(L, n_attn_heads);
+    int n_chunks   = (L + chunk_size - 1) / chunk_size;
 
-        // Call single-batch attention
-        flash_attn_decode_gpu(q_b, k_cache_b, v_cache_b, mask,
-                             attn_sinks + layer_idx * n_attn_heads, tb_b,
-                             pos, seq_len, head_dim, kv_dim, kv_mul,
-                             sliding_window, layer_idx, n_attn_heads);
+    // threads per block (64..256) matching head_dim
+    int tpb = fa_next_pow2(head_dim);
+    if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
+    size_t shmem = (size_t)head_dim * sizeof(float);
+
+    const __half* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
+
+    if (n_chunks <= 1) {
+        // Single-CTA per (head, batch)
+        dim3 grid(n_attn_heads, batch_size), block(tpb);
+        hipLaunchKernelGGL(flash_attn_decode_kernel_batched, grid, block, shmem, 0,
+                           q_batch,
+                           (const void*)k_cache, (const void*)v_cache,
+                           mask, attn_sinks_head, tb_batch,
+                           pos, seq_len, head_dim, kv_dim, kv_mul,
+                           sliding_window, layer_idx, n_attn_heads,
+                           batch_indices, (long long)B_stride);
+        CHECK_HIP(hipGetLastError());
+        return;
     }
+
+    // Allocate partials for (B, H, C, D) and (B, H, C)
+    float* partial_O; float* partial_m; float* partial_l;
+    CHECK_HIP(hipMalloc(&partial_O, (long long)batch_size * n_attn_heads * n_chunks * head_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&partial_m, (long long)batch_size * n_attn_heads * n_chunks * sizeof(float)));
+    CHECK_HIP(hipMalloc(&partial_l, (long long)batch_size * n_attn_heads * n_chunks * sizeof(float)));
+
+    // Kernel 1: chunks (heads × chunks × batch)
+    {
+        dim3 grid1(n_attn_heads, n_chunks, batch_size), block1(tpb);
+        hipLaunchKernelGGL(flash_attn_decode_chunk_kernel_batched, grid1, block1, shmem, 0,
+                           q_batch,
+                           (const void*)k_cache, (const void*)v_cache,
+                           mask,
+                           pos, seq_len, head_dim, kv_dim, kv_mul,
+                           sliding_window, layer_idx, n_attn_heads,
+                           chunk_size, n_chunks,
+                           batch_indices, (long long)B_stride,
+                           partial_O, partial_m, partial_l);
+    }
+
+    // Kernel 2: reduce (heads × batch)
+    {
+        dim3 grid2(n_attn_heads, batch_size), block2(tpb);
+        hipLaunchKernelGGL(flash_attn_reduce_chunks_kernel_batched, grid2, block2, 0, 0,
+                           partial_O, partial_m, partial_l,
+                           attn_sinks_head, tb_batch,
+                           head_dim, n_chunks, n_attn_heads);
+    }
+
+    CHECK_HIP(hipFree(partial_O));
+    CHECK_HIP(hipFree(partial_m));
+    CHECK_HIP(hipFree(partial_l));
+    CHECK_HIP(hipGetLastError());
 }
