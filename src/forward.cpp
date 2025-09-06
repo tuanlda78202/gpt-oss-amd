@@ -168,8 +168,8 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     return s->logits;
 }
 
-float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int pos,
-                            int batch_size) {
+float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int pos, int batch_size,
+                            const int* batch_indices_h, int B_stride) {
     OssConfig* p = &transformer->config;
     OssTransformerWeightsHalf* w = &transformer->weights;
     OssRunState* s = &transformer->state;
@@ -188,6 +188,12 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
     CHECK_HIP(hipMalloc(&cos_vals, cos_sin_size));
     CHECK_HIP(hipMalloc(&sin_vals, cos_sin_size));
+
+    // TODO: don't copy back and forth every time
+    int* d_batch_indices = nullptr;
+    CHECK_HIP(hipMalloc(&d_batch_indices, batch_size * sizeof(int)));
+    CHECK_HIP(hipMemcpy(d_batch_indices, batch_indices_h, batch_size * sizeof(int),
+                        hipMemcpyHostToDevice));
 
     // ! Embedding - batched
     // TODO: full GPU
@@ -214,7 +220,8 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
         // ! Split QKV and write to KV cache - batched
         split_qkv_batch_gpu(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim,
-                            p->n_attn_heads, p->n_kv_heads, l, pos, p->seq_len);
+                            p->n_attn_heads, p->n_kv_heads, l, pos, p->seq_len, d_batch_indices,
+                            B_stride);
 
         // ! RoPE - batched
         float ntk_beta = 32.0f;
@@ -225,12 +232,13 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         // TODO: 1 RoPE only
         rope_q_batch_gpu(s->q, cos_vals, sin_vals, batch_size, p->n_attn_heads, head_dim);
         rope_k_batch_gpu(s->key_cache, cos_vals, sin_vals, batch_size, p->n_kv_heads, head_dim,
-                         p->seq_len, kv_dim, l, pos);
+                         p->seq_len, kv_dim, l, pos, d_batch_indices, B_stride);
 
         // ! GQA - batched
         flash_attn_decode_gpu_batch(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks,
                                     s->tb, batch_size, pos, p->seq_len, head_dim, kv_dim, kv_mul,
-                                    p->sliding_window, l, p->n_attn_heads);
+                                    p->sliding_window, l, p->n_attn_heads, d_batch_indices,
+                                    B_stride);
 
         // ! Output projection - batched
         __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
@@ -339,6 +347,8 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
     if (sin_vals) {
         CHECK_HIP(hipFree(sin_vals));
     }
+
+    CHECK_HIP(hipFree(d_batch_indices));
 
     return s->logits;
 }

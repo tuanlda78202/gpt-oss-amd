@@ -22,8 +22,8 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
 
     t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
 
-    // TODO: set first 16 rq not working correctly
-    transformer_oss->config.batch_size = 4;
+    // TODO: auto with run script
+    transformer_oss->config.batch_size = 2;
 
     copy_transformer_to_device_hybrid(transformer_oss, t_d);
 
@@ -212,7 +212,8 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
             break;
 
         // Forward pass for the batch
-        float* batch_logits = forward_hybrid_batch(t_d, batch_tokens, target_pos, valid_batch_size);
+        float* batch_logits = forward_hybrid_batch(t_d, batch_tokens, target_pos, valid_batch_size,
+                                                   batch_indices, t_d->config.batch_size);
 
         // Process results for each sequence in the batch
         for (int i = 0; i < valid_batch_size; i++) {

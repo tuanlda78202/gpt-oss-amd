@@ -615,19 +615,20 @@ void flash_attn_decode_gpu_batch(
     float* tb_batch,           // (B, n_heads * head_dim) - output
     int batch_size,
     int pos, int seq_len, int head_dim, int kv_dim, int kv_mul,
-    int sliding_window, int layer_idx, int n_attn_heads)
+    int sliding_window, int layer_idx, int n_attn_heads,
+    const int* batch_indices,
+    int B_stride)
 {
-    // For now, process each batch element separately using existing single-batch function
     for (int b = 0; b < batch_size; b++) {
-        // Calculate offsets for this batch element
         const float* q_b = q_batch + b * (n_attn_heads * head_dim);
         float* tb_b = tb_batch + b * (n_attn_heads * head_dim);
 
         // KV cache offset: layer * (B * T * kv_dim) + b * (T * kv_dim)
-        const float* k_cache_b = k_cache + layer_idx * (batch_size * seq_len * kv_dim) +
-                                 b * (seq_len * kv_dim);
-        const float* v_cache_b = v_cache + layer_idx * (batch_size * seq_len * kv_dim) +
-                                 b * (seq_len * kv_dim);
+        const int gb = batch_indices[b];
+        const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
+        const long long batch_stride = 1ll * seq_len  * kv_dim;
+        const float* k_cache_b = k_cache + 1ll * layer_idx * layer_stride + 1ll * gb * batch_stride;
+        const float* v_cache_b = v_cache + 1ll * layer_idx * layer_stride + 1ll * gb * batch_stride;
 
         // Call single-batch attention
         flash_attn_decode_gpu(q_b, k_cache_b, v_cache_b, mask,
