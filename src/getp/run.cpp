@@ -142,8 +142,8 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
     long long total_tokens_out = 0;
 
     // Encode all prompts in the batch
-    int* prompt_tokens[batch_size];
-    int num_prompt_tokens[batch_size];
+    int** prompt_tokens = (int**)malloc(batch_size * sizeof(int*));
+    int* num_prompt_tokens = (int*)malloc(batch_size * sizeof(int));
     int max_prompt_len = 0;
 
     for (int b = 0; b < batch_size; b++) {
@@ -160,9 +160,9 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
     }
 
     // Batch processing variables
-    int current_tokens[batch_size]; // Current token for each sequence
-    int pos[batch_size];            // Position for each sequence
-    bool finished[batch_size];      // Whether each sequence is finished
+    int* current_tokens = (int*)malloc(batch_size * sizeof(int)); // Current token for each sequence
+    int* pos = (int*)malloc(batch_size * sizeof(int));            // Position for each sequence
+    bool* finished = (bool*)malloc(batch_size * sizeof(bool)); // Whether each sequence is finished
     int active_sequences = batch_size;
 
     // Initialize batch state
@@ -174,7 +174,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
 
     // Print first tokens
     for (int b = 0; b < batch_size; b++) {
-        printf("Batch %d: ", b);
+        printf("#%d: ", b + 1);
         const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
         safe_printf(first_piece);
         printf(" | ");
@@ -185,9 +185,9 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
     // Main generation loop
     while (active_sequences > 0) {
         bool process_batch = false;
-        int batch_tokens[batch_size];
-        int batch_positions[batch_size];
-        int batch_indices[batch_size];
+        int* batch_tokens = (int*)malloc(batch_size * sizeof(int));
+        int* batch_positions = (int*)malloc(batch_size * sizeof(int));
+        int* batch_indices = (int*)malloc(batch_size * sizeof(int));
         int valid_batch_size = 0;
 
         // Collect sequences that need processing at the same position
@@ -206,8 +206,12 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
             }
         }
 
-        if (!process_batch || valid_batch_size == 0)
+        if (!process_batch || valid_batch_size == 0) {
+            free(batch_tokens);
+            free(batch_positions);
+            free(batch_indices);
             break;
+        }
 
         // Forward pass for the batch
         float* batch_logits = forward_hybrid_batch(t_d, batch_tokens, target_pos, valid_batch_size,
@@ -254,14 +258,22 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
 
             current_tokens[b] = next_token;
         }
+
+        free(batch_tokens);
+        free(batch_positions);
+        free(batch_indices);
     }
 
     // Cleanup
     for (int b = 0; b < batch_size; b++) {
         free(prompt_tokens[b]);
     }
+    free(prompt_tokens);
+    free(num_prompt_tokens);
+    free(current_tokens);
+    free(pos);
+    free(finished);
 
-    printf("Batched generation complete. Total tokens generated: %lld\n", total_tokens_out);
     return total_tokens_out;
 }
 
@@ -288,9 +300,8 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
                                          ? (requests->num_reqs - start_idx)
                                          : batch_size;
 
-            // Prepare batch
-            const char* input_seqs[batch_size];
-            int* output_tokens_batch[batch_size];
+            const char** input_seqs = (const char**)malloc(batch_size * sizeof(const char*));
+            int** output_tokens_batch = (int**)malloc(batch_size * sizeof(int*));
 
             for (int i = 0; i < current_batch_size; i++) {
                 int req_idx = start_idx + i;
@@ -308,6 +319,9 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
             num_token_out += batched_getp_generate(transformer, tokenizer, sampler, input_seqs,
                                                    output_tokens_batch, current_batch_size,
                                                    requests->max_seq_len);
+
+            free(input_seqs);
+            free(output_tokens_batch);
         }
     }
 
