@@ -1,4 +1,3 @@
-// TODO: Modify this file to optimize end-to-end throughput
 #define GETP_SKIP_TYPEDEFS
 #include "../../include/tokenizer.hpp"
 #include "../forward.cpp"
@@ -17,13 +16,12 @@
 
 OssTransformerHybrid* t_d;
 
-void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
     t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
 
-    // TODO: auto with run script
-    transformer_oss->config.batch_size = 2;
+    transformer_oss->config.batch_size = batch_size;
 
     copy_transformer_to_device_hybrid(transformer_oss, t_d);
 
@@ -246,7 +244,6 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
                     int output_idx = pos[b] - num_prompt_tokens[b] + 1;
                     output_tokens_batch[b][output_idx] = -1; // End marker
                 }
-                printf("\nBatch %d finished after %d tokens\n", b, pos[b]);
             } else {
                 // Print generated token
                 const char* piece = decode_piece(tokenizer, current_tokens[b], next_token);
@@ -264,7 +261,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
         free(prompt_tokens[b]);
     }
 
-    printf("\nBatched generation complete. Total tokens generated: %lld\n", total_tokens_out);
+    printf("Batched generation complete. Total tokens generated: %lld\n", total_tokens_out);
     return total_tokens_out;
 }
 

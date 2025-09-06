@@ -98,7 +98,7 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
 }
 
 // ! -----------------------------Eval Functions---------------------------------------
-void warm_up(Transformer* transformer, Tokenizer* tokenizer);
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size);
 void finish(Transformer* transformer, Tokenizer* tokenizer);
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sample,
                     Requests* requests);
@@ -209,7 +209,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
 }
 
 void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* input_filename,
-          char* output_filename, int steps) {
+          char* output_filename, int steps, int batch_size) {
     // ! I/O
     Requests requests;
     int num_reqs;
@@ -230,7 +230,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     start = time_in_ms();
     printf("==================================================================\n🔥 Warming up...");
     fflush(stdout);
-    warm_up(transformer, tokenizer);
+    warm_up(transformer, tokenizer, batch_size);
     end = time_in_ms();
     printf("⌛️ Warm up (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
@@ -238,7 +238,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     // ! Inference
     start = time_in_ms();
     printf("==================================================================\n⚡️ Running "
-           "inference...\n\n");
+           "inference...\n");
     fflush(stdout);
     long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
     end = time_in_ms();
@@ -258,13 +258,18 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
 
     // ! Finish
     start = time_in_ms();
+    printf("==================================================================\n");
+    fflush(stdout);
     finish(transformer, tokenizer);
     end = time_in_ms();
     printf("⌛️ Finish (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);
 
-    if (verification_result != 0) {
-        printf("\n⚠️  Verification failed!\n");
+    // ! Verification
+    if (verification_result == 0) {
+        printf("✅ Verification: PASSED\n");
+    } else {
+        printf("❌ Verification: FAILED\n");
     }
 
     // free_requests(&requests);
