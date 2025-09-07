@@ -163,6 +163,11 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     CHECK_HIP(hipMalloc(&t_d->state.value_cache, value_cache_size));
     CHECK_HIP(hipMalloc(&t_d->state.mask, (size_t)seq_len * seq_len * sizeof(float)));
 
+    CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.d_tokens, (size_t)batch_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
+
     printf("Converting and transferring weights...\n");
 
     // ! Stream conversion and transfer for weights (FP32 -> FP16)
@@ -317,6 +322,10 @@ void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.key_cache));
     CHECK_HIP(hipFree(t_d->state.value_cache));
     CHECK_HIP(hipFree(t_d->state.mask));
+    CHECK_HIP(hipFree(t_d->state.d_batch_indices));
+    CHECK_HIP(hipFree(t_d->state.d_tokens));
+    CHECK_HIP(hipFree(t_d->state.cos_vals));
+    CHECK_HIP(hipFree(t_d->state.sin_vals));
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));

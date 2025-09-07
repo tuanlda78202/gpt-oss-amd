@@ -182,28 +182,15 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
     int intermediate_dim = p->intermediate_dim;
     int n_experts = p->n_experts;
 
-    float* cos_vals = nullptr;
-    float* sin_vals = nullptr;
     size_t cos_sin_size = (head_dim / 2) * sizeof(float);
 
-    CHECK_HIP(hipMalloc(&cos_vals, cos_sin_size));
-    CHECK_HIP(hipMalloc(&sin_vals, cos_sin_size));
-
-    // TODO: don't copy back and forth every time
-    int* d_batch_indices = nullptr;
-    CHECK_HIP(hipMalloc(&d_batch_indices, batch_size * sizeof(int)));
-    CHECK_HIP(hipMemcpy(d_batch_indices, batch_indices_h, batch_size * sizeof(int),
+    // ! Copy batch indices to persistent GPU buffer (only when data changes)
+    CHECK_HIP(hipMemcpy(s->d_batch_indices, batch_indices_h, batch_size * sizeof(int),
                         hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(s->d_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
 
     // ! Embedding - batched
-    // TODO: full GPU
-    int* d_tokens = nullptr;
-    CHECK_HIP(hipMalloc(&d_tokens, batch_size * sizeof(int)));
-    CHECK_HIP(hipMemcpy(d_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
-
-    embed_batch_gpu(x, w->token_embedding_table, d_tokens, batch_size, hidden_dim);
-
-    CHECK_HIP(hipFree(d_tokens));
+    embed_batch_gpu(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
 
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! RMSNorm - batched
@@ -218,9 +205,9 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         matvec_batch_gpu(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
                          (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
-        // ! Split QKV and write to KV cache - batched
+        // ! Split QKV and write to KV cache
         split_qkv_batch_gpu(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim,
-                            p->n_attn_heads, p->n_kv_heads, l, pos, p->seq_len, d_batch_indices,
+                            p->n_attn_heads, p->n_kv_heads, l, pos, p->seq_len, s->d_batch_indices,
                             B_stride);
 
         // ! RoPE - batched
@@ -228,16 +215,16 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         float ntk_alpha = 1.0f;
 
         compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                          p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
+                          p->initial_context_length, ntk_beta, ntk_alpha, s->cos_vals, s->sin_vals);
         // TODO: 1 RoPE only
-        rope_q_batch_gpu(s->q, cos_vals, sin_vals, batch_size, p->n_attn_heads, head_dim);
-        rope_k_batch_gpu(s->key_cache, cos_vals, sin_vals, batch_size, p->n_kv_heads, head_dim,
-                         p->seq_len, kv_dim, l, pos, d_batch_indices, B_stride);
+        rope_q_batch_gpu(s->q, s->cos_vals, s->sin_vals, batch_size, p->n_attn_heads, head_dim);
+        rope_k_batch_gpu(s->key_cache, s->cos_vals, s->sin_vals, batch_size, p->n_kv_heads,
+                         head_dim, p->seq_len, kv_dim, l, pos, s->d_batch_indices, B_stride);
 
-        // ! GQA - batched
+        // ! GQA - batched (using persistent GPU buffer)
         flash_attn_decode_gpu_batch(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks,
                                     s->tb, batch_size, pos, p->seq_len, head_dim, kv_dim, kv_mul,
-                                    p->sliding_window, l, p->n_attn_heads, d_batch_indices,
+                                    p->sliding_window, l, p->n_attn_heads, s->d_batch_indices,
                                     B_stride);
 
         // ! Output projection - batched
@@ -266,6 +253,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
         softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
 
+        // ! Expert processing
         for (int b = 0; b < batch_size; b++) {
             int batch_offset_experts = b * n_experts;
             int batch_offset_topk = b * p->experts_per_token;
@@ -337,15 +325,6 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
     // Linear: classifier into logits - batched
     matvec_batch_gpu(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
-
-    if (cos_vals) {
-        CHECK_HIP(hipFree(cos_vals));
-    }
-    if (sin_vals) {
-        CHECK_HIP(hipFree(sin_vals));
-    }
-
-    CHECK_HIP(hipFree(d_batch_indices));
 
     return s->logits;
 }

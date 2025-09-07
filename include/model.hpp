@@ -161,6 +161,11 @@ typedef struct {
     float* key_cache;   // (layer, B, seq_len, kv_dim)
     float* value_cache; // (layer, B, seq_len, kv_dim)
     float* mask;        // (seq_len, seq_len) - shared across batch
+
+    int* d_batch_indices; // (max_batch_size) - persistent GPU batch indices
+    int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
+    float* cos_vals;      // (head_dim/2) - persistent RoPE cos coefficients
+    float* sin_vals;      // (head_dim/2) - persistent RoPE sin coefficients
 } OssRunState;
 
 // ! Main Transformer struct
