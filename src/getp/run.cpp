@@ -134,6 +134,32 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     return pos - num_prompt_tokens + 1;
 }
 
+void clear_lines(int num_lines) {
+    for (int i = 0; i < num_lines; i++) {
+        printf("\033[A\033[K");
+    }
+    fflush(stdout);
+}
+
+void print_batch_progress(int batch_size, int* tokens_generated, int* max_tokens, bool* finished) {
+    for (int i = 0; i < batch_size; i++) {
+        if (finished[i]) {
+            printf("Seq #%-2d ●●●●●●●●●●●●●●●● ✓ Done\n", i + 1);
+        } else {
+            int progress = (max_tokens[i] > 0) ? (tokens_generated[i] * 16 / max_tokens[i]) : 0;
+            if (progress > 16)
+                progress = 16;
+
+            printf("Seq #%-2d ", i + 1);
+            for (int j = 0; j < 16; j++) {
+                printf(j < progress ? "●" : "○");
+            }
+            printf(" (%d/%d)\n", tokens_generated[i], max_tokens[i]);
+        }
+    }
+    fflush(stdout);
+}
+
 // Batched inference for multiple requests
 long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                                 const char** input_seqs, int** output_tokens_batch, int batch_size,
@@ -183,6 +209,18 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
     fflush(stdout);
 
     // Main generation loop
+    int* tokens_generated = (int*)calloc(batch_size, sizeof(int));
+    int* max_generation_tokens = (int*)malloc(batch_size * sizeof(int));
+
+    // Calculate max tokens for each sequence
+    for (int b = 0; b < batch_size; b++) {
+        max_generation_tokens[b] = steps - num_prompt_tokens[b];
+        if (max_generation_tokens[b] < 0)
+            max_generation_tokens[b] = 0;
+    }
+
+    print_batch_progress(batch_size, tokens_generated, max_generation_tokens, finished);
+
     while (active_sequences > 0) {
         bool process_batch = false;
         int* batch_tokens = (int*)malloc(batch_size * sizeof(int));
@@ -238,6 +276,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
                     output_tokens_batch[b][output_idx] = next_token;
                 }
                 total_tokens_out++;
+                tokens_generated[b]++;
             }
 
             // Check for termination
@@ -248,16 +287,13 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
                     int output_idx = pos[b] - num_prompt_tokens[b] + 1;
                     output_tokens_batch[b][output_idx] = -1; // End marker
                 }
-            } else {
-                // Print generated token
-                const char* piece = decode_piece(tokenizer, current_tokens[b], next_token);
-                // TODO: make log better
-                // printf("B%d: %s\n", b, piece);
-                // fflush(stdout);
             }
 
             current_tokens[b] = next_token;
         }
+
+        clear_lines(batch_size);
+        print_batch_progress(batch_size, tokens_generated, max_generation_tokens, finished);
 
         free(batch_tokens);
         free(batch_positions);
@@ -273,6 +309,8 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
     free(current_tokens);
     free(pos);
     free(finished);
+    free(tokens_generated);
+    free(max_generation_tokens);
 
     return total_tokens_out;
 }
@@ -283,7 +321,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     int batch_size = t_d->config.batch_size;
 
     if (batch_size <= 1 || requests->num_reqs == 1) {
-        printf("🛑 Using single-sequence inference\n");
+        printf("⚠️ Using single-sequence inference\n");
         fflush(stdout);
         for (int idx = 0; idx < requests->num_reqs; ++idx) {
             const char* input_seq = get_str_req_ptr(requests, idx);
@@ -292,13 +330,17 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
                                                   output_tokens, requests->max_seq_len);
         }
     } else {
-        printf("🛑 Using batched inference with batch_size = %d\n", batch_size);
+        printf("🚀 Using batched inference with batch_size = %d\n", batch_size);
         fflush(stdout);
 
         for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += batch_size) {
             int current_batch_size = ((requests->num_reqs - start_idx) < batch_size)
                                          ? (requests->num_reqs - start_idx)
                                          : batch_size;
+
+            printf("\n📦 Batch %d/%d (#%d->%d):\n", (start_idx / batch_size) + 1,
+                   (requests->num_reqs + batch_size - 1) / batch_size, start_idx + 1,
+                   start_idx + current_batch_size);
 
             const char** input_seqs = (const char**)malloc(batch_size * sizeof(const char*));
             int** output_tokens_batch = (int**)malloc(batch_size * sizeof(int*));
