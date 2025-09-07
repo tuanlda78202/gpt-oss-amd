@@ -260,17 +260,17 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         matvec_batch_gpu(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim,
                          n_experts);
 
-        // TODO: Batched topk and MoE processing on GPUs
+        // ! TopK and Softmax - batched
+        topk_batch_gpu(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts,
+                       p->experts_per_token);
+
+        softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
+
         for (int b = 0; b < batch_size; b++) {
             int batch_offset_experts = b * n_experts;
             int batch_offset_topk = b * p->experts_per_token;
             int batch_offset_hidden = b * hidden_dim;
             int batch_offset_inter = b * intermediate_dim;
-
-            topk_gpu(s->topk_v + batch_offset_topk, s->topk_i + batch_offset_topk,
-                     s->router_score + batch_offset_experts, n_experts, p->experts_per_token);
-
-            softmax_gpu(s->topk_v + batch_offset_topk, p->experts_per_token);
 
             // ! Expert processing for this batch element
             CHECK_HIP(hipMemset(s->e_agg + batch_offset_hidden, 0, hidden_dim * sizeof(float)));
@@ -300,6 +300,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
                 matvec_gpu(s->mlp1_out + b * (2 * intermediate_dim), s->t + batch_offset_hidden,
                            w_mlp1, b_mlp1, hidden_dim, 2 * p->intermediate_dim);
+
                 // ! Split mlp1_out into gate and up
                 split_gate_up_gpu(s->mlp1_out + b * (2 * intermediate_dim),
                                   s->gate + batch_offset_inter, s->up + batch_offset_inter,
@@ -310,10 +311,6 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
                 swiglu_gpu(s->gate + batch_offset_inter, s->up + batch_offset_inter,
                            p->intermediate_dim, alpha, p->swiglu_limit);
 
-                // ! Copy result back to gate_up buffer
-                CHECK_HIP(hipMemcpy(s->gate_up + batch_offset_inter, s->gate + batch_offset_inter,
-                                    p->intermediate_dim * sizeof(float), hipMemcpyDeviceToDevice));
-
                 // ! Final matmul (down project)
                 long long w_mlp2_offset =
                     1ll * (l * n_experts + e) * hidden_dim * p->intermediate_dim;
@@ -322,7 +319,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
                 __half* w_mlp2 = w->w_mlp2 + w_mlp2_offset;
                 __half* b_mlp2 = w->b_mlp2 + b_mlp2_offset;
 
-                matvec_gpu(s->tb2 + batch_offset_hidden, s->gate_up + batch_offset_inter, w_mlp2,
+                matvec_gpu(s->tb2 + batch_offset_hidden, s->gate + batch_offset_inter, w_mlp2,
                            b_mlp2, hidden_dim, p->intermediate_dim);
 
                 // ! Aggregate expert
