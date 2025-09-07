@@ -254,29 +254,29 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
 
         // ! Expert processing
+        CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
+
+        int* all_topk_indices_host = new int[batch_size * p->experts_per_token];
+        float* all_topk_weights_host = new float[batch_size * p->experts_per_token];
+        int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
+
+        CHECK_HIP(hipMemcpy(all_topk_indices_host, s->topk_i,
+                            batch_size * safe_experts_per_token * sizeof(int),
+                            hipMemcpyDeviceToHost));
+        CHECK_HIP(hipMemcpy(all_topk_weights_host, s->topk_v,
+                            batch_size * safe_experts_per_token * sizeof(float),
+                            hipMemcpyDeviceToHost));
+
         for (int b = 0; b < batch_size; b++) {
-            int batch_offset_experts = b * n_experts;
-            int batch_offset_topk = b * p->experts_per_token;
             int batch_offset_hidden = b * hidden_dim;
             int batch_offset_inter = b * intermediate_dim;
 
-            // ! Expert processing for this batch element
-            CHECK_HIP(hipMemset(s->e_agg + batch_offset_hidden, 0, hidden_dim * sizeof(float)));
-
-            // TODO: full on GPU
-            int topk_indices_host[16];
-            float topk_weights_host[16];
-            int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
-
-            CHECK_HIP(hipMemcpy(topk_indices_host, s->topk_i + batch_offset_topk,
-                                safe_experts_per_token * sizeof(int), hipMemcpyDeviceToHost));
-            CHECK_HIP(hipMemcpy(topk_weights_host, s->topk_v + batch_offset_topk,
-                                safe_experts_per_token * sizeof(float), hipMemcpyDeviceToHost));
-
-            // TODO: fused 1 kernel GPU
             for (int idx = 0; idx < safe_experts_per_token; idx++) {
-                int e = topk_indices_host[idx];
-                float expert_w = topk_weights_host[idx];
+                int e = all_topk_indices_host[b * safe_experts_per_token + idx];
+                float expert_w = all_topk_weights_host[b * safe_experts_per_token + idx];
+
+                if (e < 0 || e >= n_experts)
+                    continue;
 
                 // ! Linear 1 (Gated MLP)
                 long long w_mlp1_offset =
@@ -315,6 +315,9 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
                                 expert_w, hidden_dim);
             }
         }
+
+        delete[] all_topk_indices_host;
+        delete[] all_topk_weights_host;
 
         // Residual connection - batched
         vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
