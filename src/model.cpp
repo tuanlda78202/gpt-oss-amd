@@ -278,12 +278,10 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_host, OssTransformerHyb
     // Decide PP degree
     int numDevs = 1;
     CHECK_HIP(hipGetDeviceCount(&numDevs));
-    printf("\nNumber of devices: %d\n", numDevs);
     int pp = numDevs;
     if (const char* e = std::getenv("GETP_PP")) {
         pp = std::max(1, std::min(numDevs, atoi(e)));
     }
-    printf("\nPP degree: %d\n", pp);
     if (pp <= 1) {
         // original behavior (single GPU) — your existing code path here:
         // NOTE: Keep your old body, or call the shard loader with full range on device 0.

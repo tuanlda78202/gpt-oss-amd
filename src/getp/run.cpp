@@ -14,32 +14,128 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-OssTransformerHybrid* t_d;
+thread_local int TLS_DP_GROUP = 0;
+thread_local OssTransformerHybrid* TLS_TD = nullptr;
+
+#define t_d TLS_TD
+
+static int g_num_devices = 1;
+static int g_pp_stages =
+#ifdef GETP_PP
+    GETP_PP
+#else
+    1
+#endif
+    ;
+static int g_dp_groups = 1;         // how many independent copies (DP world)
+static int g_devices_per_group = 1; // = g_pp_stages
+
+static OssTransformerHybrid** g_models = nullptr;
+
+// Map a request index to a DP group id
+static inline int dp_group_for_req(int req_index) {
+    // simple round-robin across DP groups
+    return (req_index % g_dp_groups);
+}
+
+static int getenv_int(const char* key, int fallback) {
+    const char* v = getenv(key);
+    if (!v)
+        return fallback;
+    char* endp = nullptr;
+    long x = strtol(v, &endp, 10);
+    if (!endp || *endp != '\0' || x <= 0)
+        return fallback;
+    return (int)x;
+}
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
-    t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
+    // Discover GPUs
+    CHECK_HIP(hipGetDeviceCount(&g_num_devices));
+    if (g_num_devices <= 0) {
+        fprintf(stderr, "No HIP devices found.\n");
+        exit(EXIT_FAILURE);
+    }
 
-    copy_transformer_to_device_hybrid(transformer_oss, t_d);
+    // Decide DP layout
+    // If PP is enabled, we treat each PP island as a "device group".
+    // Otherwise, each device is one DP group.
+    if (g_pp_stages <= 1) {
+        g_devices_per_group = 1;
+        g_dp_groups = getenv_int("GETP_DP", g_num_devices); // default: use all GPUs
+        if (g_dp_groups > g_num_devices)
+            g_dp_groups = g_num_devices;
+    } else {
+        if (g_num_devices % g_pp_stages != 0) {
+            fprintf(stderr, "GPU count (%d) is not divisible by GETP_PP (%d).\n", g_num_devices,
+                    g_pp_stages);
+            exit(EXIT_FAILURE);
+        }
+        g_devices_per_group = g_pp_stages;
+        g_dp_groups = getenv_int("GETP_DP", g_num_devices / g_pp_stages);
+        if (g_dp_groups > (g_num_devices / g_pp_stages))
+            g_dp_groups = (g_num_devices / g_pp_stages);
+    }
 
-    // ! GPU stats
-    size_t free_mem, total_mem;
-    CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
-    size_t used_mem = total_mem - free_mem;
-    printf("\n--- HYBRID WARM-UP COMPLETE ---\n");
-    printf("GPU Memory Status:\n");
-    printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("-------------------------------\n");
+    printf("[DP] devices=%d, pp_stages=%d, dp_groups=%d, devices_per_group=%d\n", g_num_devices,
+           g_pp_stages, g_dp_groups, g_devices_per_group);
+    omp_set_num_threads(g_dp_groups);
+
+    // Allocate one model replica per DP group (each replica will select its
+    // first device as "home" for warmup copy; PP code, if used, will fan-out).
+    g_models = (OssTransformerHybrid**)malloc(sizeof(OssTransformerHybrid*) * g_dp_groups);
+    if (!g_models) {
+        fprintf(stderr, "malloc g_models failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Build/transfer one replica per DP group
+    // Note: we pick a representative device for each group to call
+    // copy_transformer_to_device_hybrid. If you have internal PP that spreads within the group,
+    // that code will take over later.
+#pragma omp parallel for schedule(static)
+    for (int g = 0; g < g_dp_groups; ++g) {
+        int home_device = g * g_devices_per_group; // first device in this group
+        CHECK_HIP(hipSetDevice(home_device));
+
+        g_models[g] = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
+        if (!g_models[g]) {
+            fprintf(stderr, "malloc model for group %d failed\n", g);
+            exit(EXIT_FAILURE);
+        }
+        copy_transformer_to_device_hybrid(transformer_oss, g_models[g]);
+
+        size_t free_mem, total_mem;
+        CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
+#pragma omp critical
+        {
+            printf("\n--- HYBRID WARM-UP COMPLETE (group %d on device %d) ---\n", g, home_device);
+            printf("GPU Memory Status: Total %.2f GB, Used %.2f GB, Free %.2f GB\n",
+                   total_mem / (1024.0 * 1024.0 * 1024.0),
+                   (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0),
+                   free_mem / (1024.0 * 1024.0 * 1024.0));
+            printf("-----------------------------------------------\n");
+        }
+    }
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
-    free_transformer_on_device_hybrid(t_d);
-    free(t_d);
+    if (g_models) {
+#pragma omp parallel for schedule(static)
+        for (int g = 0; g < g_dp_groups; ++g) {
+            int home_device = g * g_devices_per_group;
+            CHECK_HIP(hipSetDevice(home_device));
+            if (g_models[g]) {
+                free_transformer_on_device_hybrid(g_models[g]);
+                free(g_models[g]);
+            }
+        }
+        free(g_models);
+        g_models = nullptr;
+    }
 
-    // ! GPU stats
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
@@ -92,7 +188,8 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
 
     while (pos < steps) {
         // forward the transformer to get logits for the next token
-        float* logits = forward_hybrid(t_d, token, pos);
+        extern thread_local int TLS_DP_GROUP;
+        float* logits = forward_hybrid(g_models[TLS_DP_GROUP], token, pos);
 
         // advance the state machine
         pos++;
@@ -134,15 +231,35 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
 
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
-    long long num_token_out = 0;
+    const int N = requests->num_reqs;
+    long long total_tokens = 0;
 
-    for (int idx = 0; idx < requests->num_reqs; ++idx) {
-        const char* input_seq = get_str_req_ptr(requests, idx);
-        int* output_tokens = get_tok_gen_ptr(requests, idx);
-        num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq,
-                                              output_tokens, requests->max_seq_len);
+#pragma omp parallel reduction(+ : total_tokens)
+    {
+        const int tid = omp_get_thread_num();
+        const int group = tid; // one thread per DP group
+        const int home = group * g_devices_per_group;
+        CHECK_HIP(hipSetDevice(home));
+
+        // thread-local sampler copy
+        OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
+        memcpy(sampler_copy, sampler, sizeof(OssSampler));
+
+        // bind this thread to its replica
+        TLS_DP_GROUP = group;
+        TLS_TD = g_models[group];
+
+        // consume only my group's requests
+        for (int idx = group; idx < N; idx += g_dp_groups) {
+            const char* input_seq = get_str_req_ptr(requests, idx);
+            int* out_tokens = get_tok_gen_ptr(requests, idx);
+
+            total_tokens += simple_getp_generate(transformer, tokenizer, (Sampler*)sampler_copy,
+                                                 input_seq, out_tokens, requests->max_seq_len);
+        }
+        free(sampler_copy);
     }
-    return num_token_out;
+    return total_tokens;
 }
 
 #endif // GETP_RUN
