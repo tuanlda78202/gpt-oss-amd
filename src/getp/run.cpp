@@ -20,13 +20,8 @@ thread_local OssTransformerHybrid* TLS_TD = nullptr;
 #define t_d TLS_TD
 
 static int g_num_devices = 1;
-static int g_pp_stages =
-#ifdef GETP_PP
-    GETP_PP
-#else
-    1
-#endif
-    ;
+static int g_pp_stages = std::getenv("PP") ? std::atoi(std::getenv("PP")) : 1;
+
 static int g_dp_groups = 1;         // how many independent copies (DP world)
 static int g_devices_per_group = 1; // = g_pp_stages
 
@@ -64,17 +59,17 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // Otherwise, each device is one DP group.
     if (g_pp_stages <= 1) {
         g_devices_per_group = 1;
-        g_dp_groups = getenv_int("GETP_DP", g_num_devices); // default: use all GPUs
+        g_dp_groups = getenv_int("DP", g_num_devices); // default: use all GPUs
         if (g_dp_groups > g_num_devices)
             g_dp_groups = g_num_devices;
     } else {
         if (g_num_devices % g_pp_stages != 0) {
-            fprintf(stderr, "GPU count (%d) is not divisible by GETP_PP (%d).\n", g_num_devices,
+            fprintf(stderr, "GPU count (%d) is not divisible by PP (%d).\n", g_num_devices,
                     g_pp_stages);
             exit(EXIT_FAILURE);
         }
         g_devices_per_group = g_pp_stages;
-        g_dp_groups = getenv_int("GETP_DP", g_num_devices / g_pp_stages);
+        g_dp_groups = getenv_int("DP", g_num_devices / g_pp_stages);
         if (g_dp_groups > (g_num_devices / g_pp_stages))
             g_dp_groups = (g_num_devices / g_pp_stages);
     }
@@ -97,21 +92,24 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     // that code will take over later.
 #pragma omp parallel for schedule(static)
     for (int g = 0; g < g_dp_groups; ++g) {
-        int home_device = g * g_devices_per_group; // first device in this group
-        CHECK_HIP(hipSetDevice(home_device));
+        int device_base = g * g_devices_per_group; // first device of this DP group
+        CHECK_HIP(hipSetDevice(device_base));
 
         g_models[g] = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
         if (!g_models[g]) {
             fprintf(stderr, "malloc model for group %d failed\n", g);
             exit(EXIT_FAILURE);
         }
-        copy_transformer_to_device_hybrid(transformer_oss, g_models[g]);
+
+        // Use the new grouped loader so PP shards land on device_base..device_base+PP-1
+        copy_transformer_to_device_hybrid_grouped(transformer_oss, g_models[g], device_base,
+                                                  g_devices_per_group);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
 #pragma omp critical
         {
-            printf("\n--- HYBRID WARM-UP COMPLETE (group %d on device %d) ---\n", g, home_device);
+            printf("\n--- HYBRID WARM-UP COMPLETE (group %d on device %d) ---\n", g, device_base);
             printf("GPU Memory Status: Total %.2f GB, Used %.2f GB, Free %.2f GB\n",
                    total_mem / (1024.0 * 1024.0 * 1024.0),
                    (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0),

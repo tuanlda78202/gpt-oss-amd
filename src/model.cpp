@@ -279,7 +279,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_host, OssTransformerHyb
     int numDevs = 1;
     CHECK_HIP(hipGetDeviceCount(&numDevs));
     int pp = numDevs;
-    if (const char* e = std::getenv("GETP_PP")) {
+    if (const char* e = std::getenv("PP")) {
         pp = std::max(1, std::min(numDevs, atoi(e)));
     }
     if (pp <= 1) {
@@ -326,6 +326,57 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_host, OssTransformerHyb
     std::memset(&t_root->weights, 0, sizeof(t_root->weights)); // prevent accidental use
     std::memset(&t_root->state, 0, sizeof(t_root->state));
     t_root->config = t_host->config; // keep global config for convenience
+}
+
+void copy_transformer_to_device_hybrid_grouped(OssTransformer* t_host, OssTransformerHybrid* t_root,
+                                               int device_base, int pp_within_group) {
+    int numDevs = 1;
+    CHECK_HIP(hipGetDeviceCount(&numDevs));
+
+    // Clamp pp to what fits from device_base onward.
+    int pp = std::max(1, std::min(pp_within_group, numDevs - device_base));
+
+    if (pp <= 1) {
+        CHECK_HIP(hipSetDevice(device_base));
+        copy_transformer_to_device_hybrid_pp(t_host, t_root, 0, t_host->config.n_layers,
+                                             /*embed*/ true, /*out*/ true);
+        t_root->pp = nullptr;
+        return;
+    }
+
+    auto* mgr = new PPManager();
+    mgr->pp = pp;
+    mgr->hidden_dim = t_host->config.hidden_dim;
+    mgr->n_layers = t_host->config.n_layers;
+    mgr->vocab_size = t_host->config.vocab_size;
+
+    auto cuts = partition_layers(mgr->n_layers, pp);
+    mgr->shards.reserve(pp);
+    for (int p = 0; p < pp; ++p) {
+        PPShard s{};
+        s.device_id = device_base + p; // <-- KEY: offset into this DP group
+        s.l_start = cuts[p].first;
+        s.l_end = cuts[p].second;
+        s.has_embed = (p == 0);
+        s.has_out = (p == pp - 1);
+
+        CHECK_HIP(hipSetDevice(s.device_id));
+        s.shard = (OssTransformerHybrid*)std::malloc(sizeof(OssTransformerHybrid));
+        std::memset(s.shard, 0, sizeof(OssTransformerHybrid));
+        copy_transformer_to_device_hybrid_pp(t_host, s.shard, s.l_start, s.l_end, s.has_embed,
+                                             s.has_out);
+        mgr->shards.push_back(s);
+    }
+
+    for (int i = 0; i < pp; i++)
+        for (int j = 0; j < pp; j++)
+            mgr->peer_ok[i][j] =
+                (i == j) ? true : enable_p2p(mgr->shards[i].device_id, mgr->shards[j].device_id);
+
+    t_root->pp = mgr;
+    std::memset(&t_root->weights, 0, sizeof(t_root->weights));
+    std::memset(&t_root->state, 0, sizeof(t_root->state));
+    t_root->config = t_host->config;
 }
 
 void free_transformer_on_device_hybrid_single(OssTransformerHybrid* t_d) {

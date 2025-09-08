@@ -326,7 +326,7 @@ cmd_run() {
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
 
   # Always use srun with GPU allocation
-  local srun_cmd="srun --gres=gpu:${n_gpus}"
+  local srun_cmd="srun --exclude=MV-DZ-MI250-01 --gres=gpu:${n_gpus}"
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
 
   if [[ -n "${log_output}" ]]; then
