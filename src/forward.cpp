@@ -193,6 +193,12 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
     // ! Embedding - batched
     embed_batch_gpu(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
 
+    // ! Cosin
+    float ntk_beta = 32.0f;
+    float ntk_alpha = 1.0f;
+    compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                      p->initial_context_length, ntk_beta, ntk_alpha, s->cos_vals, s->sin_vals);
+
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! RMSNorm - batched
         rmsnorm_batch_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
@@ -212,11 +218,6 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
                             B_stride);
 
         // ! RoPE - batched
-        float ntk_beta = 32.0f;
-        float ntk_alpha = 1.0f;
-
-        compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                          p->initial_context_length, ntk_beta, ntk_alpha, s->cos_vals, s->sin_vals);
         // TODO: 1 RoPE only
         rope_q_batch_gpu(s->q, s->cos_vals, s->sin_vals, batch_size, p->n_attn_heads, head_dim);
         rope_k_batch_gpu(s->key_cache, s->cos_vals, s->sin_vals, batch_size, p->n_kv_heads,
@@ -254,95 +255,82 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
         softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
 
-        // ! Expert processing
+        // Zero the aggregation buffer
         CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
 
-        int BKE = batch_size * p->experts_per_token;
+        const int BKE = batch_size * p->experts_per_token;
+        dim3 blk1(256), grd1((BKE + blk1.x - 1) / blk1.x);
 
-        // (A) Build assignment triples on device
-        {
-            dim3 blk(256), grd((BKE + 255) / 256);
-            hipLaunchKernelGGL(build_assignments_kernel, grd, blk, 0, 0, s->topk_i, s->topk_v,
-                               batch_size, p->experts_per_token, s->assign_expert, s->assign_token,
-                               s->assign_weight);
-        }
-
-        // (B) Count per expert and compute offsets
+        // (A) Build assignments
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
-        {
-            dim3 blk(256), grd((BKE + 255) / 256);
-            hipLaunchKernelGGL(count_by_expert_kernel, grd, blk, 0, 0, s->assign_expert, BKE,
-                               s->expert_counts, n_experts);
-        }
+        hipLaunchKernelGGL(build_assignments_and_count_kernel, grd1, blk1, 0, 0, s->topk_i,
+                           s->topk_v, batch_size, p->experts_per_token, s->assign_expert,
+                           s->assign_token, s->assign_weight, s->expert_counts, n_experts);
 
-        // Prefix sum on host (simple & fast for small n_experts)
-        std::vector<int> h_counts(n_experts), h_offsets(n_experts + 1);
-        CHECK_HIP(hipMemcpy(h_counts.data(), s->expert_counts, n_experts * sizeof(int),
+        // (B) Device-side exclusive scan -> expert_offsets[0..E]
+        hipLaunchKernelGGL(exclusive_scan_small_kernel, dim3(1), dim3(1), 0, 0, s->expert_counts,
+                           s->expert_offsets, n_experts);
+
+        // If you still need offsets on host for the per-expert loop, copy just the E+1 ints back:
+        std::vector<int> h_offsets(n_experts + 1);
+        CHECK_HIP(hipMemcpy(h_offsets.data(), s->expert_offsets, (n_experts + 1) * sizeof(int),
                             hipMemcpyDeviceToHost));
-        h_offsets[0] = 0;
-        for (int e = 0; e < n_experts; ++e)
-            h_offsets[e + 1] = h_offsets[e] + h_counts[e];
-        CHECK_HIP(hipMemcpy(s->expert_offsets, h_offsets.data(), (n_experts + 1) * sizeof(int),
-                            hipMemcpyHostToDevice));
 
         // (C) Compact into expert-grouped flat buffers
-        CHECK_HIP(
-            hipMemset(s->expert_counts, 0, n_experts * sizeof(int))); // reuse as write_counters
-        {
-            dim3 blk(256), grd((BKE + 255) / 256);
-            hipLaunchKernelGGL(compact_by_expert_kernel, grd, blk, 0, 0, s->assign_expert,
-                               s->assign_token, s->assign_weight, BKE, s->expert_offsets,
-                               s->expert_counts, s->tokens_flat, s->weights_flat);
-        }
+        CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
+        hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, 0, s->assign_expert,
+                           s->assign_token, s->assign_weight, BKE, s->expert_offsets,
+                           s->expert_counts, s->tokens_flat, s->weights_flat);
 
         // (D) Gather inputs X -> x_by_expert
         {
-            dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, BKE);
-            hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
-                               s->x_by_expert, BKE, hidden_dim);
+            bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
+                         ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
+                         (hidden_dim % 4 == 0);
+            if (vecOK) {
+                int H4 = hidden_dim >> 2;
+                dim3 blk(256, 1, 1), grd((H4 + 255) / 256, BKE);
+                hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                                   s->x_by_expert, BKE, H4);
+            } else {
+                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, BKE);
+                hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                                   s->x_by_expert, BKE, hidden_dim);
+            }
         }
 
-        // (E) Process each expert with batched operations
+        // (E) Expert compute
         const float alpha = 1.702f;
         for (int e = 0; e < n_experts; ++e) {
             int off = h_offsets[e];
-            int Ne = h_counts[e];
+            int Ne = h_offsets[e + 1] - h_offsets[e];
             if (Ne == 0)
                 continue;
 
-            // Expert-grouped workspace pointers
             float* x_e = s->x_by_expert + 1ll * off * hidden_dim;
-            float* mlp1_e = s->mlp1_by_expert + 1ll * off * (2 * p->intermediate_dim);
-            float* gate_e = s->gate_by_expert + 1ll * off * p->intermediate_dim;
-            float* up_e = s->up_by_expert + 1ll * off * p->intermediate_dim;
+            float* mlp1 = s->mlp1_by_expert + 1ll * off * (2 * p->intermediate_dim);
+            float* gate = s->gate_by_expert + 1ll * off * p->intermediate_dim;
+            float* up = s->up_by_expert + 1ll * off * p->intermediate_dim;
             float* y_e = s->y_by_expert + 1ll * off * hidden_dim;
             float* w_e = s->weights_flat + off;
             int* tok_e = s->tokens_flat + off;
 
-            // Expert weights
             long long base = 1ll * (l * n_experts + e);
             __half* w1 = w->w_mlp1 + base * (2ll * p->intermediate_dim) * hidden_dim;
             __half* b1 = w->b_mlp1 + base * (2ll * p->intermediate_dim);
             __half* w2 = w->w_mlp2 + base * hidden_dim * p->intermediate_dim;
             __half* b2 = w->b_mlp2 + base * hidden_dim;
 
-            // MLP1: batched matmul over Ne tokens
-            matvec_batch_gpu(mlp1_e, x_e, w1, b1, Ne, hidden_dim, 2 * p->intermediate_dim);
+            // GEMV/GEMM
+            matvec_batch_gpu(mlp1, x_e, w1, b1, Ne, hidden_dim, 2 * p->intermediate_dim);
+            split_gate_up_batch_gpu(mlp1, gate, up, Ne, p->intermediate_dim);
+            swiglu_batch_gpu(gate, up, Ne, p->intermediate_dim, alpha, p->swiglu_limit);
+            matvec_batch_gpu(y_e, gate, w2, b2, Ne, p->intermediate_dim, hidden_dim);
 
-            // Split and activation: batched
-            split_gate_up_batch_gpu(mlp1_e, gate_e, up_e, Ne, p->intermediate_dim);
-            swiglu_batch_gpu(gate_e, up_e, Ne, p->intermediate_dim, alpha, p->swiglu_limit);
-
-            // MLP2: batched matmul
-            matvec_batch_gpu(y_e, gate_e, w2, b2, Ne, p->intermediate_dim, hidden_dim);
-
-            // Scale by router weights and scatter-add back
-            {
-                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, Ne);
-                hipLaunchKernelGGL(scale_rows_kernel, grd, blk, 0, 0, y_e, w_e, Ne, hidden_dim);
-                hipLaunchKernelGGL(scatter_add_rows_kernel, grd, blk, 0, 0, s->e_agg, y_e, tok_e,
-                                   Ne, hidden_dim);
-            }
+            // Fuse scale + scatter
+            dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, Ne);
+            hipLaunchKernelGGL(scale_scatter_rows_kernel, grd, blk, 0, 0, s->e_agg, y_e, tok_e, w_e,
+                               Ne, hidden_dim);
         }
 
         // Residual connection - batched
