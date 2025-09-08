@@ -157,7 +157,7 @@ static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 void matvec_batch_gpu(float* xout, float* x_batch, __half* w, __half* bias,
                       int batch_size, int K /*d*/, int M /*n*/) {
     constexpr int RB    = 8;    // rows per block
-    constexpr int KTILE = 512;  // K tile
+    constexpr int KTILE = 1024;  // K tile
 
     dim3 block(64, RB, 1);
     dim3 grid(1, ceil_div(M, RB), batch_size);
