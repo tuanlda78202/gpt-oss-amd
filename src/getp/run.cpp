@@ -142,19 +142,42 @@ void clear_lines(int num_lines) {
 }
 
 void print_batch_progress(int batch_size, int* tokens_generated, int* max_tokens, bool* finished) {
+    const char* GREEN = "\033[32m";
+    const char* BLUE = "\033[34m";
+    const char* YELLOW = "\033[33m";
+    const char* RED = "\033[31m";
+    const char* RESET = "\033[0m";
+    const char* BOLD = "\033[1m";
+
     for (int i = 0; i < batch_size; i++) {
         if (finished[i]) {
-            printf("Seq #%-2d ●●●●●●●●●●●●●●●● ✓ Done\n", i + 1);
+            printf("%s#%-2d %s●●●●●●●●●●●●●●●● %s✓ Done%s\n", BOLD, i + 1, GREEN, GREEN, RESET);
         } else {
             int progress = (max_tokens[i] > 0) ? (tokens_generated[i] * 16 / max_tokens[i]) : 0;
             if (progress > 16)
                 progress = 16;
 
-            printf("Seq #%-2d ", i + 1);
-            for (int j = 0; j < 16; j++) {
-                printf(j < progress ? "●" : "○");
+            printf("%s#%-2d %s", BOLD, i + 1, RESET);
+
+            const char* progress_color;
+            if (progress <= 4) {
+                progress_color = RED;
+            } else if (progress <= 8) {
+                progress_color = YELLOW;
+            } else if (progress <= 12) {
+                progress_color = BLUE;
+            } else {
+                progress_color = GREEN;
             }
-            printf(" (%d/%d)\n", tokens_generated[i], max_tokens[i]);
+
+            for (int j = 0; j < 16; j++) {
+                if (j < progress) {
+                    printf("%s●%s", progress_color, RESET);
+                } else {
+                    printf("○");
+                }
+            }
+            printf(" %s(%d/%d)%s\n", progress_color, tokens_generated[i], max_tokens[i], RESET);
         }
     }
     fflush(stdout);
@@ -320,7 +343,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     long long num_token_out = 0;
     int batch_size = t_d->config.batch_size;
 
-    if (batch_size <= 1 || requests->num_reqs == 1) {
+    if (batch_size <= 0 || requests->num_reqs == 0) { // TODO: test bs only, need revert later
         printf("⚠️ Using single-sequence inference\n");
         fflush(stdout);
         for (int idx = 0; idx < requests->num_reqs; ++idx) {

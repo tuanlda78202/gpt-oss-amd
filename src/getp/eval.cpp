@@ -68,7 +68,7 @@ int read_inputfile(const char* input_filename, int max_token_len, int max_seq_le
         exit(EXIT_FAILURE);
     }
 
-    printf("Num requests: %d\n", reqs->num_reqs);
+    printf("num requests: %d\n", reqs->num_reqs);
 
     return 0;
 }
@@ -104,20 +104,21 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
                     Requests* requests);
 
 int verify_output(const char* generated_filename, const char* ground_truth_filename) {
-    printf("==================================================================\n🔍 Verifying "
-           "output...\n");
+    printf("\033[1;92m==================================================================\033["
+           "0m\n\033[1;92m🔍 VERIFYING "
+           "OUTPUT...\033[0m\n");
     fflush(stdout);
 
     std::ifstream generated_file(generated_filename);
     std::ifstream gt_file(ground_truth_filename);
 
     if (!generated_file.is_open()) {
-        fprintf(stderr, "❌ Cannot open generated file: %s\n", generated_filename);
+        fprintf(stderr, "❌ Cannot open output file: %s\n", generated_filename);
         return -1;
     }
 
     if (!gt_file.is_open()) {
-        fprintf(stderr, "❌ Cannot open ground truth file: %s\n", ground_truth_filename);
+        fprintf(stderr, "❌ Cannot open GT file: %s\n", ground_truth_filename);
         return -1;
     }
 
@@ -130,8 +131,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
         total_lines++;
 
         if (!std::getline(generated_file, gen_line)) {
-            fprintf(stderr, "❌ Generated file has fewer lines than ground truth at line %d\n",
-                    line_num);
+            fprintf(stderr, "❌ Output has fewer lines than GT at line %d\n", line_num);
             total_mismatches++;
             break;
         }
@@ -161,7 +161,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
         // Compare token sequences
         bool line_matches = true;
         if (gt_tokens.size() != gen_tokens.size()) {
-            printf("❌ Request %d: Length mismatch (GT: %zu tokens, Generated: %zu tokens)\n",
+            printf("❌ Request #%d: Length mismatch (GT: %zu tokens, Generated: %zu tokens)\n",
                    line_num, gt_tokens.size(), gen_tokens.size());
             line_matches = false;
         } else {
@@ -177,7 +177,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
         }
 
         if (line_matches) {
-            printf("✅ Request %d: Match (%zu tokens)\n", line_num, gt_tokens.size());
+            printf("✅ Request #%d: Match (%zu tokens)\n", line_num, gt_tokens.size());
         } else {
             total_mismatches++;
         }
@@ -185,9 +185,9 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
         line_num++;
     }
 
-    // Check if generated file has extra lines
+    // Check if output file has extra lines
     if (std::getline(generated_file, gen_line)) {
-        fprintf(stderr, "❌ Generated file has more lines than ground truth\n");
+        fprintf(stderr, "❌ Output file has more lines than GT\n");
         total_mismatches++;
     }
 
@@ -228,7 +228,8 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
 
     // ! Warm up
     start = time_in_ms();
-    printf("==================================================================\n🔥 Warming up...");
+    printf("\033[1;91m==================================================================\033["
+           "0m\n\033[1;91m🔥 WARMING UP...\033[0m");
     fflush(stdout);
     warm_up(transformer, tokenizer, batch_size);
     end = time_in_ms();
@@ -237,13 +238,15 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
 
     // ! Inference
     start = time_in_ms();
-    printf("==================================================================\n⚡️ Running "
-           "inference...\n");
+    printf("\033[1;93m==================================================================\033["
+           "0m\n\033[1;93m⚡️ RUNNING INFERENCE...\033[0m\n");
     fflush(stdout);
     long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
     end = time_in_ms();
     // Your goal is to achieve best throughput(=reduce elapsed time)!
-    fprintf(stdout, "\n️⌛️ Inference (s): %f, achieved throughput TPS (tok/s): %f\n",
+    fprintf(stdout,
+            "\n-------------------------------\n📊 Inference Summary:\n ⌛️ Inference: %f\n ⚡️ TPS: "
+            "%f\n-------------------------------\n",
             (double)(end - start) / 1000, (num_gen_tokens) / (double)(end - start) * 1000);
     fflush(stdout);
 
@@ -258,8 +261,6 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
 
     // ! Finish
     start = time_in_ms();
-    printf("==================================================================\n");
-    fflush(stdout);
     finish(transformer, tokenizer);
     end = time_in_ms();
     printf("⌛️ Finish (s): %f\n", (double)(end - start) / 1000);

@@ -39,7 +39,6 @@ print_fancy_header() {
   echo -e "${FOREST3}              https://github.com/tuanlda78202/gpt-oss-c"
   echo -e "${FOREST2}  ════════════════════════════════════════════════════════════════"
   echo -e "${NC}"
-  echo ""
 }
 
 # Color functions
@@ -333,8 +332,7 @@ cmd_run() {
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
   [[ -n "${batch_size}" ]] && args+=(-b "${batch_size}")
 
-  # Always use srun with GPU allocation
-  local srun_cmd="srun --gres=gpu:${n_gpus}"
+  local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
 
   if [[ -n "${log_output}" ]]; then
