@@ -245,8 +245,8 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     end = time_in_ms();
     // Your goal is to achieve best throughput(=reduce elapsed time)!
     fprintf(stdout,
-            "\n-------------------------------\n📊 Inference Summary:\n ⌛️ Inference: %f\n ⚡️ TPS: "
-            "%f\n-------------------------------\n",
+            "\n┌─────────────────────────────┐\n│ \033[1m⌛️ Time: %-13.6f\033[0m      │\n│ "
+            "\033[1m⚡️ TPS: %-13.6f\033[0m       │\n└─────────────────────────────┘\n",
             (double)(end - start) / 1000, (num_gen_tokens) / (double)(end - start) * 1000);
     fflush(stdout);
 
