@@ -343,7 +343,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     long long num_token_out = 0;
     int batch_size = t_d->config.batch_size;
 
-    if (batch_size <= 0 || requests->num_reqs == 0) { // TODO: test bs only, need revert later
+    if (batch_size <= 1 || requests->num_reqs == 1) {
         printf("⚠️ Using single-sequence inference\n");
         fflush(stdout);
         for (int idx = 0; idx < requests->num_reqs; ++idx) {

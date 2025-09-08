@@ -166,6 +166,20 @@ typedef struct {
     int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
     float* cos_vals;      // (head_dim/2) - persistent RoPE cos coefficients
     float* sin_vals;      // (head_dim/2) - persistent RoPE sin coefficients
+
+    //  MoE expert-batching scratch buffers
+    int* assign_expert;    // [B*K] - expert assignment per token
+    int* assign_token;     // [B*K] - token index per assignment
+    float* assign_weight;  // [B*K] - router weight per assignment
+    int* expert_counts;    // [E] - tokens per expert (temp/reused as counters)
+    int* expert_offsets;   // [E+1] - exclusive prefix sum of expert_counts
+    int* tokens_flat;      // [B*K] - tokens grouped by expert
+    float* weights_flat;   // [B*K] - weights grouped by expert
+    float* x_by_expert;    // [B*K, H] - gathered input by expert
+    float* mlp1_by_expert; // [B*K, 2*I] - MLP1 output by expert
+    float* gate_by_expert; // [B*K, I] - gate values by expert
+    float* up_by_expert;   // [B*K, I] - up values by expert
+    float* y_by_expert;    // [B*K, H] - final output by expert
 } OssRunState;
 
 // ! Main Transformer struct

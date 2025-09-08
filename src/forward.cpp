@@ -3,6 +3,7 @@
 #include "hip/attention.hip"
 #include "hip/embed.hip"
 #include "hip/matvec.hip"
+#include "hip/moe.hip"
 #include "hip/prim_add.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
@@ -256,68 +257,93 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         // ! Expert processing
         CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
 
-        int* all_topk_indices_host = new int[batch_size * p->experts_per_token];
-        float* all_topk_weights_host = new float[batch_size * p->experts_per_token];
-        int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
+        int BKE = batch_size * p->experts_per_token;
 
-        CHECK_HIP(hipMemcpy(all_topk_indices_host, s->topk_i,
-                            batch_size * safe_experts_per_token * sizeof(int),
-                            hipMemcpyDeviceToHost));
-        CHECK_HIP(hipMemcpy(all_topk_weights_host, s->topk_v,
-                            batch_size * safe_experts_per_token * sizeof(float),
-                            hipMemcpyDeviceToHost));
-
-        for (int b = 0; b < batch_size; b++) {
-            int batch_offset_hidden = b * hidden_dim;
-            int batch_offset_inter = b * intermediate_dim;
-
-            for (int idx = 0; idx < safe_experts_per_token; idx++) {
-                int e = all_topk_indices_host[b * safe_experts_per_token + idx];
-                float expert_w = all_topk_weights_host[b * safe_experts_per_token + idx];
-
-                if (e < 0 || e >= n_experts)
-                    continue;
-
-                // ! Linear 1 (Gated MLP)
-                long long w_mlp1_offset =
-                    1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
-                long long b_mlp1_offset = 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-
-                __half* w_mlp1 = w->w_mlp1 + w_mlp1_offset;
-                __half* b_mlp1 = w->b_mlp1 + b_mlp1_offset;
-
-                matvec_gpu(s->mlp1_out + b * (2 * intermediate_dim), s->t + batch_offset_hidden,
-                           w_mlp1, b_mlp1, hidden_dim, 2 * p->intermediate_dim);
-
-                // ! Split mlp1_out into gate and up
-                split_gate_up_gpu(s->mlp1_out + b * (2 * intermediate_dim),
-                                  s->gate + batch_offset_inter, s->up + batch_offset_inter,
-                                  p->intermediate_dim);
-
-                // ! SwiGLU non-linearity
-                const float alpha = 1.702f;
-                swiglu_gpu(s->gate + batch_offset_inter, s->up + batch_offset_inter,
-                           p->intermediate_dim, alpha, p->swiglu_limit);
-
-                // ! Final matmul (down project)
-                long long w_mlp2_offset =
-                    1ll * (l * n_experts + e) * hidden_dim * p->intermediate_dim;
-                long long b_mlp2_offset = 1ll * (l * n_experts + e) * hidden_dim;
-
-                __half* w_mlp2 = w->w_mlp2 + w_mlp2_offset;
-                __half* b_mlp2 = w->b_mlp2 + b_mlp2_offset;
-
-                matvec_gpu(s->tb2 + batch_offset_hidden, s->gate + batch_offset_inter, w_mlp2,
-                           b_mlp2, hidden_dim, p->intermediate_dim);
-
-                // ! Aggregate expert
-                vec_add_vec_gpu(s->e_agg + batch_offset_hidden, s->tb2 + batch_offset_hidden,
-                                expert_w, hidden_dim);
-            }
+        // (A) Build assignment triples on device
+        {
+            dim3 blk(256), grd((BKE + 255) / 256);
+            hipLaunchKernelGGL(build_assignments_kernel, grd, blk, 0, 0, s->topk_i, s->topk_v,
+                               batch_size, p->experts_per_token, s->assign_expert, s->assign_token,
+                               s->assign_weight);
         }
 
-        delete[] all_topk_indices_host;
-        delete[] all_topk_weights_host;
+        // (B) Count per expert and compute offsets
+        CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
+        {
+            dim3 blk(256), grd((BKE + 255) / 256);
+            hipLaunchKernelGGL(count_by_expert_kernel, grd, blk, 0, 0, s->assign_expert, BKE,
+                               s->expert_counts, n_experts);
+        }
+
+        // Prefix sum on host (simple & fast for small n_experts)
+        std::vector<int> h_counts(n_experts), h_offsets(n_experts + 1);
+        CHECK_HIP(hipMemcpy(h_counts.data(), s->expert_counts, n_experts * sizeof(int),
+                            hipMemcpyDeviceToHost));
+        h_offsets[0] = 0;
+        for (int e = 0; e < n_experts; ++e)
+            h_offsets[e + 1] = h_offsets[e] + h_counts[e];
+        CHECK_HIP(hipMemcpy(s->expert_offsets, h_offsets.data(), (n_experts + 1) * sizeof(int),
+                            hipMemcpyHostToDevice));
+
+        // (C) Compact into expert-grouped flat buffers
+        CHECK_HIP(
+            hipMemset(s->expert_counts, 0, n_experts * sizeof(int))); // reuse as write_counters
+        {
+            dim3 blk(256), grd((BKE + 255) / 256);
+            hipLaunchKernelGGL(compact_by_expert_kernel, grd, blk, 0, 0, s->assign_expert,
+                               s->assign_token, s->assign_weight, BKE, s->expert_offsets,
+                               s->expert_counts, s->tokens_flat, s->weights_flat);
+        }
+
+        // (D) Gather inputs X -> x_by_expert
+        {
+            dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, BKE);
+            hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                               s->x_by_expert, BKE, hidden_dim);
+        }
+
+        // (E) Process each expert with batched operations
+        const float alpha = 1.702f;
+        for (int e = 0; e < n_experts; ++e) {
+            int off = h_offsets[e];
+            int Ne = h_counts[e];
+            if (Ne == 0)
+                continue;
+
+            // Expert-grouped workspace pointers
+            float* x_e = s->x_by_expert + 1ll * off * hidden_dim;
+            float* mlp1_e = s->mlp1_by_expert + 1ll * off * (2 * p->intermediate_dim);
+            float* gate_e = s->gate_by_expert + 1ll * off * p->intermediate_dim;
+            float* up_e = s->up_by_expert + 1ll * off * p->intermediate_dim;
+            float* y_e = s->y_by_expert + 1ll * off * hidden_dim;
+            float* w_e = s->weights_flat + off;
+            int* tok_e = s->tokens_flat + off;
+
+            // Expert weights
+            long long base = 1ll * (l * n_experts + e);
+            __half* w1 = w->w_mlp1 + base * (2ll * p->intermediate_dim) * hidden_dim;
+            __half* b1 = w->b_mlp1 + base * (2ll * p->intermediate_dim);
+            __half* w2 = w->w_mlp2 + base * hidden_dim * p->intermediate_dim;
+            __half* b2 = w->b_mlp2 + base * hidden_dim;
+
+            // MLP1: batched matmul over Ne tokens
+            matvec_batch_gpu(mlp1_e, x_e, w1, b1, Ne, hidden_dim, 2 * p->intermediate_dim);
+
+            // Split and activation: batched
+            split_gate_up_batch_gpu(mlp1_e, gate_e, up_e, Ne, p->intermediate_dim);
+            swiglu_batch_gpu(gate_e, up_e, Ne, p->intermediate_dim, alpha, p->swiglu_limit);
+
+            // MLP2: batched matmul
+            matvec_batch_gpu(y_e, gate_e, w2, b2, Ne, p->intermediate_dim, hidden_dim);
+
+            // Scale by router weights and scatter-add back
+            {
+                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, Ne);
+                hipLaunchKernelGGL(scale_rows_kernel, grd, blk, 0, 0, y_e, w_e, Ne, hidden_dim);
+                hipLaunchKernelGGL(scatter_add_rows_kernel, grd, blk, 0, 0, s->e_agg, y_e, tok_e,
+                                   Ne, hidden_dim);
+            }
+        }
 
         // Residual connection - batched
         vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);

@@ -64,16 +64,6 @@ void matvec_gpu(float* xout, float* x, __half* w, __half* bias, int n, int d) {
 }
 
 // ! Batched
-__device__ __forceinline__ float warp_reduce_sum_64(float v) {
-    // 64-lane shuffle reduction for AMD wavefront
-#pragma unroll
-    for (int offset = 32; offset > 0; offset >>= 1) {
-        v += __shfl_down(v, offset, 64);
-    }
-    return v;
-}
-
-// Tunables: rows per block (RB) and K tile size (KTILE)
 template <int RB, int KTILE>
 __global__ void matvec_batch_kernel_tiled(const __half* __restrict__ A_half,
                                           const float* __restrict__ B_batch,
