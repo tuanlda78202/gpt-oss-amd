@@ -17,8 +17,6 @@
 thread_local int TLS_DP_GROUP = 0;
 thread_local OssTransformerHybrid* TLS_TD = nullptr;
 
-#define t_d TLS_TD
-
 static int g_num_devices = 1;
 static int g_pp_stages = std::getenv("PP") ? std::atoi(std::getenv("PP")) : 1;
 
@@ -168,7 +166,7 @@ long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, S
     int* prompt_tokens =
         (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
-           t_d->config.initial_context_length);
+           TLS_TD->config.initial_context_length);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
