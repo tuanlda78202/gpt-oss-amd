@@ -133,10 +133,6 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
             const float alpha = 1.702f;
             swiglu_gpu(s->gate, s->up, p->intermediate_dim, alpha, p->swiglu_limit);
 
-            // ! Copy result back to gate_up buffer
-            CHECK_HIP(hipMemcpy(s->gate_up, s->gate, p->intermediate_dim * sizeof(float),
-                                hipMemcpyDeviceToDevice));
-
             // ! Final matmul (down project)
             long long w_mlp2_offset = 1ll * (l * n_experts + e) * hidden_dim * p->intermediate_dim;
             long long b_mlp2_offset = 1ll * (l * n_experts + e) * hidden_dim;
@@ -144,7 +140,7 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
             __half* w_mlp2 = w->w_mlp2 + w_mlp2_offset;
             __half* b_mlp2 = w->b_mlp2 + b_mlp2_offset;
 
-            matvec_gpu(s->tb2, s->gate_up, w_mlp2, b_mlp2, hidden_dim, p->intermediate_dim);
+            matvec_gpu(s->tb2, s->gate, w_mlp2, b_mlp2, hidden_dim, p->intermediate_dim);
 
             // ! Aggregate expert
             vec_add_vec_gpu(s->e_agg, s->tb2, expert_w, hidden_dim);
