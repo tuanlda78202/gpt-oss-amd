@@ -2,15 +2,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-
-// 64-wide wave reduce
-__device__ __forceinline__ float warp_reduce_sum_64(float v) {
-#pragma unroll
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-        v += __shfl_down(v, off);
-    return v;
-}
-
 #ifndef K_UNROLL
 #define K_UNROLL 4
 #endif
