@@ -7,6 +7,7 @@
 #include "hip/prim_add.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
+#include "hip/scheduler.hip"
 #include "hip/softmax.hip"
 #include "hip/split_qkv.hip"
 #include "hip/swilglu.hip"
@@ -255,28 +256,23 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
         softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
 
-        // Zero the aggregation buffer
+        // Zero aggregation
         CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
 
         const int BKE = batch_size * p->experts_per_token;
         dim3 blk1(256), grd1((BKE + blk1.x - 1) / blk1.x);
 
-        // (A) Build assignments
+        // (A) Build assignments + counts
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
         hipLaunchKernelGGL(build_assignments_and_count_kernel, grd1, blk1, 0, 0, s->topk_i,
                            s->topk_v, batch_size, p->experts_per_token, s->assign_expert,
                            s->assign_token, s->assign_weight, s->expert_counts, n_experts);
 
-        // (B) Device-side exclusive scan -> expert_offsets[0..E]
+        // (B) Exclusive scan on device -> expert_offsets[0..E]
         hipLaunchKernelGGL(exclusive_scan_small_kernel, dim3(1), dim3(1), 0, 0, s->expert_counts,
                            s->expert_offsets, n_experts);
 
-        // If you still need offsets on host for the per-expert loop, copy just the E+1 ints back:
-        std::vector<int> h_offsets(n_experts + 1);
-        CHECK_HIP(hipMemcpy(h_offsets.data(), s->expert_offsets, (n_experts + 1) * sizeof(int),
-                            hipMemcpyDeviceToHost));
-
-        // (C) Compact into expert-grouped flat buffers
+        // (C) Compact by expert
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
         hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, 0, s->assign_expert,
                            s->assign_token, s->assign_weight, BKE, s->expert_offsets,
@@ -284,11 +280,11 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
 
         // (D) Gather inputs X -> x_by_expert
         {
-            bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
-                         ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
-                         (hidden_dim % 4 == 0);
+            const bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
+                               ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
+                               (hidden_dim % 4 == 0);
             if (vecOK) {
-                int H4 = hidden_dim >> 2;
+                const int H4 = hidden_dim >> 2;
                 dim3 blk(256, 1, 1), grd((H4 + 255) / 256, BKE);
                 hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
                                    s->x_by_expert, BKE, H4);
@@ -299,38 +295,86 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
             }
         }
 
-        // (E) Expert compute
-        const float alpha = 1.702f;
-        for (int e = 0; e < n_experts; ++e) {
-            int off = h_offsets[e];
-            int Ne = h_offsets[e + 1] - h_offsets[e];
-            if (Ne == 0)
-                continue;
+        // === Build work queue and read back {active_experts, max_Ne} ===
+        static int* d_work_queue = nullptr;
+        static int d_work_queue_capacity = 0; // ints
+        static Int2* d_meta = nullptr;
 
-            float* x_e = s->x_by_expert + 1ll * off * hidden_dim;
-            float* mlp1 = s->mlp1_by_expert + 1ll * off * (2 * p->intermediate_dim);
-            float* gate = s->gate_by_expert + 1ll * off * p->intermediate_dim;
-            float* up = s->up_by_expert + 1ll * off * p->intermediate_dim;
-            float* y_e = s->y_by_expert + 1ll * off * hidden_dim;
-            float* w_e = s->weights_flat + off;
-            int* tok_e = s->tokens_flat + off;
+        const int required_ints = 3 * n_experts;
+        if (required_ints > d_work_queue_capacity) {
+            if (d_work_queue)
+                CHECK_HIP(hipFree(d_work_queue));
+            CHECK_HIP(hipMalloc(&d_work_queue, required_ints * sizeof(int)));
+            d_work_queue_capacity = required_ints;
+        }
+        if (!d_meta)
+            CHECK_HIP(hipMalloc(&d_meta, sizeof(Int2)));
 
-            long long base = 1ll * (l * n_experts + e);
-            __half* w1 = w->w_mlp1 + base * (2ll * p->intermediate_dim) * hidden_dim;
-            __half* b1 = w->b_mlp1 + base * (2ll * p->intermediate_dim);
-            __half* w2 = w->w_mlp2 + base * hidden_dim * p->intermediate_dim;
-            __half* b2 = w->b_mlp2 + base * hidden_dim;
+        hipLaunchKernelGGL(build_expert_work_queue_kernel, dim3(1), dim3(1), 0, 0,
+                           s->expert_offsets, d_work_queue, d_meta, n_experts);
 
-            // GEMV/GEMM
-            matvec_batch_gpu(mlp1, x_e, w1, b1, Ne, hidden_dim, 2 * p->intermediate_dim);
-            split_gate_up_batch_gpu(mlp1, gate, up, Ne, p->intermediate_dim);
-            swiglu_batch_gpu(gate, up, Ne, p->intermediate_dim, alpha, p->swiglu_limit);
-            matvec_batch_gpu(y_e, gate, w2, b2, Ne, p->intermediate_dim, hidden_dim);
+        Int2 h_meta;
+        CHECK_HIP(hipMemcpy(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost));
+        const int active_experts = h_meta.x;
+        const int max_Ne = h_meta.y;
 
-            // Fuse scale + scatter
-            dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, Ne);
-            hipLaunchKernelGGL(scale_scatter_rows_kernel, grd, blk, 0, 0, s->e_agg, y_e, tok_e, w_e,
-                               Ne, hidden_dim);
+        if (active_experts == 0) {
+            vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
+        } else {
+            // Multi-stream parallel processing
+            constexpr int NUM_STREAMS = 4;
+            static hipStream_t expert_streams[NUM_STREAMS];
+            static bool streams_created = false;
+            if (!streams_created) {
+                for (int i = 0; i < NUM_STREAMS; ++i)
+                    CHECK_HIP(hipStreamCreate(&expert_streams[i]));
+                streams_created = true;
+            }
+            const int experts_per_stream = (active_experts + NUM_STREAMS - 1) / NUM_STREAMS;
+
+            // Strides
+            const long long mlp1_weight_stride = (2LL * p->intermediate_dim) * hidden_dim;
+            const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
+            const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
+            const long long mlp2_bias_stride = hidden_dim;
+
+            const float alpha = 1.702f;
+
+            for (int sid = 0; sid < NUM_STREAMS; ++sid) {
+                const int work_start = sid * experts_per_stream;
+                const int work_end = std::min(work_start + experts_per_stream, active_experts);
+                if (work_start >= work_end)
+                    break;
+                const int work_count = work_end - work_start;
+                hipStream_t stream = expert_streams[sid];
+
+                // MLP1: [Ne,H] x [H,2I] -> [Ne,2I]
+                multi_expert_matvec_gpu(
+                    d_work_queue, work_start, work_count, s->x_by_expert, s->mlp1_by_expert,
+                    w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
+                    w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
+                    2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, max_Ne, stream);
+
+                // split + SwiGLU: [Ne,2I] -> [Ne,I]
+                multi_expert_split_swiglu_gpu(
+                    d_work_queue, work_start, work_count, s->mlp1_by_expert, s->gate_by_expert,
+                    p->intermediate_dim, alpha, p->swiglu_limit, max_Ne, stream);
+
+                // MLP2: [Ne,I] x [I,H] -> [Ne,H]
+                multi_expert_matvec_gpu(
+                    d_work_queue, work_start, work_count, s->gate_by_expert, s->y_by_expert,
+                    w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
+                    w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim,
+                    hidden_dim, mlp2_weight_stride, mlp2_bias_stride, max_Ne, stream);
+
+                // scale + scatter -> e_agg
+                multi_expert_scale_scatter_gpu(d_work_queue, work_start, work_count, s->y_by_expert,
+                                               s->tokens_flat, s->weights_flat, s->e_agg,
+                                               hidden_dim, batch_size, max_Ne, stream);
+            }
+
+            for (int i = 0; i < NUM_STREAMS; ++i)
+                CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
         }
 
         // Residual connection - batched
