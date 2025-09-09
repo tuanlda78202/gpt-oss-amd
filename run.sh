@@ -39,7 +39,6 @@ print_fancy_header() {
   echo -e "${FOREST3}              https://github.com/tuanlda78202/gpt-oss-c"
   echo -e "${FOREST2}  ════════════════════════════════════════════════════════════════"
   echo -e "${NC}"
-  echo ""
 }
 
 # Color functions
@@ -95,7 +94,7 @@ usage() {
   echo ""
   echo -e "${RED}‍♂️ RUN COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE]${NC}"
   echo ""
   echo -e "  ${CYAN}Key Features:${NC}"
   echo -e "    • Default checkpoint: ${WHITE}${MODELBIN_ROOT}/gpt-oss-20b.bin${NC}"
@@ -120,10 +119,11 @@ usage() {
   echo -e "    ${WHITE}-s SEED${NC}                Random seed"
   echo -e "    ${WHITE}-l${NC}                     Log output to log.txt"
   echo -e "    ${WHITE}-g N_GPUS${NC}              Number of GPUs to request (default: 1)"
+  echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 2)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE]${NC}"
   echo ""
   echo -e "  ${CYAN}Features:${NC}"
   echo -e "    • Combines: ${WHITE}./run.sh build && ./run.sh run${NC}"
@@ -158,6 +158,9 @@ usage() {
   echo ""
   echo -e "  ${CYAN}# Getp mode with 2 GPUs and logging${NC}"
   echo -e "  ${GREEN}./run.sh run -g 2 -l${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Getp mode with 2 GPUs and batch size 32${NC}"
+  echo -e "  ${GREEN}./run.sh run -g 2 -b 32${NC}"
   echo ""
   echo -e "  ${CYAN}# Custom checkpoint with 4 GPUs${NC}"
   echo -e "  ${GREEN}./run.sh run -c /path/to/model.bin -g 4${NC}"
@@ -251,6 +254,7 @@ cmd_run() {
   local seed=""
   local log_output=""
   local n_gpus="1"
+  local batch_size=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -266,6 +270,7 @@ cmd_run() {
       -s) seed="$2"; shift 2 ;;
       -l) log_output="1"; shift 1 ;;
       -g) n_gpus="$2"; shift 2 ;;
+      -b) batch_size="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -306,6 +311,7 @@ cmd_run() {
   print_kv "top_p(-p)"     "${top_p:-0.9}"  "$([[ -z "${top_p:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "steps(-n)"     "${steps:-1024}" "$([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "seed(-s)"      "${seed:-time(NULL)}" "$([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "batch_size(-b)" "${batch_size:-2}" "$([[ -z "${batch_size:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "logging(-l)"   "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to log.txt)" || echo "(disabled)")"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
@@ -324,9 +330,9 @@ cmd_run() {
   [[ -n "${top_p}" ]] && args+=(-p "${top_p}")
   [[ -n "${steps}" ]] && args+=(-n "${steps}")
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
+  [[ -n "${batch_size}" ]] && args+=(-b "${batch_size}")
 
-  # Always use srun with GPU allocation
-  local srun_cmd="srun --gres=gpu:${n_gpus}"
+  local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
 
   if [[ -n "${log_output}" ]]; then

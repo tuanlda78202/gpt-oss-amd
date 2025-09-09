@@ -44,6 +44,8 @@ typedef struct {
     float rope_scaling_factor;  // e.g., 32.0
     int sliding_window;         // e.g., 128
     float swiglu_limit;         // e.g., 7.0
+
+    int batch_size; // static batch size for batched inference
 } OssConfig;
 
 // ! Learned parameters
@@ -135,31 +137,49 @@ typedef struct {
 
 // ! Scratch buffers for forward pass computation
 typedef struct {
-    // current wave of activations
-    float* x;            // activation at current time stamp (hidden_dim, )
-    float* t;            // same, but inside a residual branch (hidden_dim, )
-    float* tb;           // (head_dim * n_attn_heads, )
-    float* tb2;          // (hidden_dim, )
-    float* router_score; // router score (n_experts, )
-    float* topk_v;       // topk expert weights (experts_per_token, )
-    int* topk_i;         // topk expert indices (experts_per_token, )
-    float* mlp1_out;
-    float* gate;
-    float* up;
-    float* gate_up;
-    float* e_agg;
-    float* qkv;    // an additional buffer just for convenience (head_dim *
-                   // (n_attn_heads + 2 * n_kv_heads), )
-    float* q;      // query (n_attn_heads * head_dim,)
-    float* k;      // key (n_kv_heads * head_dim,)
-    float* v;      // value (n_kv_heads * head_dim,)
-    float* att;    // buffer for scores/attention values (n_heads, seq_len)
-    float* logits; // output logits
+    // current wave of activations (now with batch dimension B)
+    float* x;            // activation at current time stamp (B, hidden_dim)
+    float* t;            // same, but inside a residual branch (B, hidden_dim)
+    float* tb;           // (B, head_dim * n_attn_heads)
+    float* tb2;          // (B, hidden_dim)
+    float* router_score; // router score (B, n_experts)
+    float* topk_v;       // topk expert weights (B, experts_per_token)
+    int* topk_i;         // topk expert indices (B, experts_per_token)
+    float* mlp1_out;     // (B, 2 * intermediate_dim)
+    float* gate;         // (B, intermediate_dim)
+    float* up;           // (B, intermediate_dim)
+    float* gate_up;      // (B, intermediate_dim)
+    float* e_agg;        // (B, hidden_dim)
+    float* qkv;          // (B, head_dim * (n_attn_heads + 2 * n_kv_heads))
+    float* q;            // query (B, n_attn_heads * head_dim)
+    float* k;            // key (B, n_kv_heads * head_dim) - used for current step
+    float* v;            // value (B, n_kv_heads * head_dim) - used for current step
+    float* att;          // buffer for scores/attention values (B, n_heads, seq_len)
+    float* logits;       // output logits (B, vocab_size)
 
-    // ! kv cache (largest memory consumer)
-    float* key_cache;   // (layer, seq_len, kv_dim)
-    float* value_cache; // (layer, seq_len, kv_dim)
-    float* mask;
+    // ! kv cache (largest memory consumer) - now with batch dimension
+    float* key_cache;   // (layer, B, seq_len, kv_dim)
+    float* value_cache; // (layer, B, seq_len, kv_dim)
+    float* mask;        // (seq_len, seq_len) - shared across batch
+
+    int* d_batch_indices; // (max_batch_size) - persistent GPU batch indices
+    int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
+    float* cos_vals;      // (head_dim/2) - persistent RoPE cos coefficients
+    float* sin_vals;      // (head_dim/2) - persistent RoPE sin coefficients
+
+    //  MoE expert-batching scratch buffers
+    int* assign_expert;    // [B*K] - expert assignment per token
+    int* assign_token;     // [B*K] - token index per assignment
+    float* assign_weight;  // [B*K] - router weight per assignment
+    int* expert_counts;    // [E] - tokens per expert (temp/reused as counters)
+    int* expert_offsets;   // [E+1] - exclusive prefix sum of expert_counts
+    int* tokens_flat;      // [B*K] - tokens grouped by expert
+    float* weights_flat;   // [B*K] - weights grouped by expert
+    float* x_by_expert;    // [B*K, H] - gathered input by expert
+    float* mlp1_by_expert; // [B*K, 2*I] - MLP1 output by expert
+    float* gate_by_expert; // [B*K, I] - gate values by expert
+    float* up_by_expert;   // [B*K, I] - up values by expert
+    float* y_by_expert;    // [B*K, H] - final output by expert
 } OssRunState;
 
 // ! Main Transformer struct

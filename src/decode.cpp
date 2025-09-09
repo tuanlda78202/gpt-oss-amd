@@ -59,7 +59,9 @@ int main(int argc, char** argv) {
     int line_counter = 0;
     while (std::getline(input_file, line)) {
         if (line_to_decode < 0 || line_counter == line_to_decode) {
-            std::cout << "Decoding line " << line_counter << ":" << std::endl;
+            std::cout << "------------------------------------------------------------------\n⛩️  "
+                         "Decoding #"
+                      << line_counter << ":" << std::endl;
             std::istringstream iss(line);
             int token;
             while (iss >> token) {

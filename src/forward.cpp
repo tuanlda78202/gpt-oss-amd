@@ -3,9 +3,11 @@
 #include "hip/attention.hip"
 #include "hip/embed.hip"
 #include "hip/matvec.hip"
+#include "hip/moe.hip"
 #include "hip/prim_add.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
+#include "hip/scheduler.hip"
 #include "hip/softmax.hip"
 #include "hip/split_qkv.hip"
 #include "hip/swilglu.hip"
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <omp.h>
 
+// TODO: merge interface batch=1
 float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     OssConfig* p = &transformer->config;
     OssTransformerWeightsHalf* w = &transformer->weights;
@@ -100,7 +103,6 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
         // ! Expert processing
         CHECK_HIP(hipMemset(s->e_agg, 0, hidden_dim * sizeof(float)));
 
-        // TODO (explain): Copy topk_indices to host once per layer
         int topk_indices_host[16];
         float topk_weights_host[16];
         int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
@@ -160,6 +162,222 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     if (sin_vals) {
         CHECK_HIP(hipFree(sin_vals));
     }
+
+    return s->logits;
+}
+
+float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int pos, int batch_size,
+                            const int* batch_indices_h, int B_stride) {
+    OssConfig* p = &transformer->config;
+    OssTransformerWeightsHalf* w = &transformer->weights;
+    OssRunState* s = &transformer->state;
+
+    float* x = s->x;
+    int head_dim = p->head_dim;
+    int hidden_dim = p->hidden_dim;
+    int kv_dim = p->head_dim * p->n_kv_heads;
+    int kv_mul = p->n_attn_heads / p->n_kv_heads;
+    int intermediate_dim = p->intermediate_dim;
+    int n_experts = p->n_experts;
+    size_t cos_sin_size = (head_dim / 2) * sizeof(float);
+
+    CHECK_HIP(hipMemcpy(s->d_batch_indices, batch_indices_h, batch_size * sizeof(int),
+                        hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(s->d_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
+
+    // ! Embedding
+    embed_batch_gpu(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
+
+    // ! Cosin
+    float ntk_beta = 32.0f;
+    float ntk_alpha = 1.0f;
+    compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                      p->initial_context_length, ntk_beta, ntk_alpha, s->cos_vals, s->sin_vals);
+
+    for (unsigned long long l = 0; l < p->n_layers; l++) {
+        // ! RMSNorm
+        rmsnorm_batch_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
+
+        // ! QKV project
+        __half* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
+                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+        __half* b_qkv =
+            w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+
+        matvec_batch_gpu(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
+                         (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+
+        // ! Split QKV
+        split_qkv_batch_gpu(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim,
+                            p->n_attn_heads, p->n_kv_heads, l, pos, p->seq_len, s->d_batch_indices,
+                            B_stride);
+
+        // ! RoPE
+        rope_qk_fused_batch_gpu(s->q, s->key_cache, s->cos_vals, s->sin_vals, batch_size,
+                                p->n_attn_heads, p->n_kv_heads, head_dim, p->seq_len, kv_dim, l,
+                                pos, s->d_batch_indices, B_stride);
+
+        // ! GQA
+        flash_attn_decode_gpu_batch(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks,
+                                    s->tb, batch_size, pos, p->seq_len, head_dim, kv_dim, kv_mul,
+                                    p->sliding_window, l, p->n_attn_heads, s->d_batch_indices,
+                                    B_stride);
+
+        // ! Output projection
+        __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+        __half* b_o = w->b_o + 1ll * l * hidden_dim;
+
+        matvec_batch_gpu(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads,
+                         hidden_dim);
+
+        // ! Residual
+        vec_add_vec_batch_gpu(x, s->tb2, 1.0f, batch_size, hidden_dim);
+
+        // ! RMSNorm
+        rmsnorm_batch_gpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
+
+        // ! MoE Router
+        __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
+        __half* b_router = w->b_router + 1ll * l * n_experts;
+
+        matvec_batch_gpu(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim,
+                         n_experts);
+
+        // ! TopK and Softmax
+        topk_batch_gpu(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts,
+                       p->experts_per_token);
+
+        softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
+
+        // Zero aggregation
+        CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
+
+        const int BKE = batch_size * p->experts_per_token;
+        dim3 blk1(256), grd1((BKE + blk1.x - 1) / blk1.x);
+
+        // Build assignments + counts
+        CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
+        hipLaunchKernelGGL(build_assignments_and_count_kernel, grd1, blk1, 0, 0, s->topk_i,
+                           s->topk_v, batch_size, p->experts_per_token, s->assign_expert,
+                           s->assign_token, s->assign_weight, s->expert_counts, n_experts);
+
+        // Exclusive scan on device -> expert_offsets[0..E]
+        hipLaunchKernelGGL(exclusive_scan_small_kernel, dim3(1), dim3(1), 0, 0, s->expert_counts,
+                           s->expert_offsets, n_experts);
+
+        // Compact by expert
+        CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
+        hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, 0, s->assign_expert,
+                           s->assign_token, s->assign_weight, BKE, s->expert_offsets,
+                           s->expert_counts, s->tokens_flat, s->weights_flat);
+
+        // Gather inputs X -> x_by_expert
+        {
+            const bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
+                               ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
+                               (hidden_dim % 4 == 0);
+            if (vecOK) {
+                const int H4 = hidden_dim >> 2;
+                dim3 blk(256, 1, 1), grd((H4 + 255) / 256, BKE);
+                hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                                   s->x_by_expert, BKE, H4);
+            } else {
+                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, BKE);
+                hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                                   s->x_by_expert, BKE, hidden_dim);
+            }
+        }
+
+        // === Build work queue and read back {active_experts, max_Ne} ===
+        static int* d_work_queue = nullptr;
+        static int d_work_queue_capacity = 0; // ints
+        static Int2* d_meta = nullptr;
+
+        const int required_ints = 3 * n_experts;
+        if (required_ints > d_work_queue_capacity) {
+            if (d_work_queue)
+                CHECK_HIP(hipFree(d_work_queue));
+            CHECK_HIP(hipMalloc(&d_work_queue, required_ints * sizeof(int)));
+            d_work_queue_capacity = required_ints;
+        }
+        if (!d_meta)
+            CHECK_HIP(hipMalloc(&d_meta, sizeof(Int2)));
+
+        hipLaunchKernelGGL(build_expert_work_queue_kernel, dim3(1), dim3(1), 0, 0,
+                           s->expert_offsets, d_work_queue, d_meta, n_experts);
+
+        Int2 h_meta;
+        CHECK_HIP(hipMemcpy(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost));
+        const int active_experts = h_meta.x;
+        const int max_Ne = h_meta.y;
+
+        if (active_experts == 0) {
+            vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
+        } else {
+            // Multi-stream parallel processing
+            constexpr int NUM_STREAMS = 4;
+            static hipStream_t expert_streams[NUM_STREAMS];
+            static bool streams_created = false;
+            if (!streams_created) {
+                for (int i = 0; i < NUM_STREAMS; ++i)
+                    CHECK_HIP(hipStreamCreate(&expert_streams[i]));
+                streams_created = true;
+            }
+            const int experts_per_stream = (active_experts + NUM_STREAMS - 1) / NUM_STREAMS;
+
+            // Strides
+            const long long mlp1_weight_stride = (2LL * p->intermediate_dim) * hidden_dim;
+            const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
+            const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
+            const long long mlp2_bias_stride = hidden_dim;
+
+            const float alpha = 1.702f;
+
+            for (int sid = 0; sid < NUM_STREAMS; ++sid) {
+                const int work_start = sid * experts_per_stream;
+                const int work_end = std::min(work_start + experts_per_stream, active_experts);
+                if (work_start >= work_end)
+                    break;
+                const int work_count = work_end - work_start;
+                hipStream_t stream = expert_streams[sid];
+
+                // ! MLP1: [Ne,H] x [H,2I] -> [Ne,2I]
+                multi_expert_matvec_gpu(
+                    d_work_queue, work_start, work_count, s->x_by_expert, s->mlp1_by_expert,
+                    w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
+                    w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
+                    2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, max_Ne, stream);
+
+                // ! split + SwiGLU: [Ne,2I] -> [Ne,I]
+                multi_expert_split_swiglu_gpu(
+                    d_work_queue, work_start, work_count, s->mlp1_by_expert, s->gate_by_expert,
+                    p->intermediate_dim, alpha, p->swiglu_limit, max_Ne, stream);
+
+                // ! MLP2: [Ne,I] x [I,H] -> [Ne,H]
+                multi_expert_matvec_gpu(
+                    d_work_queue, work_start, work_count, s->gate_by_expert, s->y_by_expert,
+                    w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
+                    w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim,
+                    hidden_dim, mlp2_weight_stride, mlp2_bias_stride, max_Ne, stream);
+
+                // ! scale + scatter -> e_agg
+                multi_expert_scale_scatter_gpu(d_work_queue, work_start, work_count, s->y_by_expert,
+                                               s->tokens_flat, s->weights_flat, s->e_agg,
+                                               hidden_dim, batch_size, max_Ne, stream);
+            }
+            for (int i = 0; i < NUM_STREAMS; ++i)
+                CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
+        }
+
+        // Residual connection - batched
+        vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
+    }
+
+    // Final operations - batched
+    rmsnorm_batch_gpu(x, x, w->rms_out_w, batch_size, hidden_dim);
+
+    // Linear: classifier into logits - batched
+    matvec_batch_gpu(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
 
     return s->logits;
 }

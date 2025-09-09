@@ -1093,6 +1093,7 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat|getp, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -b <int>    batch size for getp mode, default 2\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1109,6 +1110,7 @@ int main(int argc, char** argv) {
     char* system_prompt = NULL;      // the (optional) system prompt to use in chat mode
     char* input_filename = NULL;
     char* output_filename = NULL;
+    int batch_size = 2; // batch size for getp mode, default 2
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1148,6 +1150,8 @@ int main(int argc, char** argv) {
             system_prompt = argv[i + 1];
         } else if (argv[i][1] == 'o') {
             output_filename = argv[i + 1];
+        } else if (argv[i][1] == 'b') {
+            batch_size = atoi(argv[i + 1]);
         } else {
             error_usage();
         }
@@ -1183,7 +1187,8 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
-        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps);
+        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps,
+             batch_size);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

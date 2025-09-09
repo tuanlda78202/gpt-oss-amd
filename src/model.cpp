@@ -72,7 +72,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     int n_kv_heads = conf->n_kv_heads;
     int seq_len = conf->seq_len;
 
-    printf("\nConverting model to hybrid precision (FP16 weights + FP32 activations)...\n");
+    printf("\nConverting model to hybrid precision...\n");
 
     // ! GPU Check
     int current_device;
@@ -126,30 +126,65 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     size_t out_size = (size_t)vocab_size * hidden_dim * sizeof(__half);
     CHECK_HIP(hipMalloc(&t_d->weights.out, out_size));
 
-    // ! Allocate FP32 state on GPU
-    CHECK_HIP(hipMalloc(&t_d->state.x, (size_t)hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.t, (size_t)hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.tb, (size_t)head_dim * n_attn_heads * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.tb2, (size_t)hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.router_score, (size_t)n_experts * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.topk_v, (size_t)experts_per_token * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.topk_i, (size_t)experts_per_token * sizeof(int)));
-    CHECK_HIP(hipMalloc(&t_d->state.mlp1_out, (size_t)2 * intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.gate, (size_t)intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.up, (size_t)intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.gate_up, (size_t)intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.e_agg, (size_t)hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.qkv,
-                        (size_t)head_dim * (n_attn_heads + 2 * n_kv_heads) * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.q, (size_t)n_attn_heads * head_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.att, (size_t)n_attn_heads * seq_len * sizeof(float)));
-    CHECK_HIP(hipMalloc(&t_d->state.logits, (size_t)vocab_size * sizeof(float)));
+    // ! Allocate FP32 state on GPU (with batch dimension B)
+    int batch_size = conf->batch_size;
+    printf("🚒 Allocating GPU buffers for batch size %d...\n", batch_size);
 
-    size_t key_cache_size = 1ll * n_layers * seq_len * n_kv_heads * head_dim * sizeof(float);
-    size_t value_cache_size = 1ll * n_layers * seq_len * n_kv_heads * head_dim * sizeof(float);
+    CHECK_HIP(hipMalloc(&t_d->state.x, (size_t)batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.t, (size_t)batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.tb, (size_t)batch_size * head_dim * n_attn_heads * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.tb2, (size_t)batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.router_score, (size_t)batch_size * n_experts * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.topk_v, (size_t)batch_size * experts_per_token * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.topk_i, (size_t)batch_size * experts_per_token * sizeof(int)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.mlp1_out, (size_t)batch_size * 2 * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.gate, (size_t)batch_size * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.up, (size_t)batch_size * intermediate_dim * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.gate_up, (size_t)batch_size * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.e_agg, (size_t)batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.qkv, (size_t)batch_size * head_dim *
+                                             (n_attn_heads + 2 * n_kv_heads) * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.q, (size_t)batch_size * n_attn_heads * head_dim * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.att, (size_t)batch_size * n_attn_heads * seq_len * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.logits, (size_t)batch_size * vocab_size * sizeof(float)));
+
+    // KV cache with batch dimension: (n_layers, batch_size, seq_len, kv_dim)
+    size_t key_cache_size =
+        1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
+    size_t value_cache_size =
+        1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
     CHECK_HIP(hipMalloc(&t_d->state.key_cache, key_cache_size));
     CHECK_HIP(hipMalloc(&t_d->state.value_cache, value_cache_size));
     CHECK_HIP(hipMalloc(&t_d->state.mask, (size_t)seq_len * seq_len * sizeof(float)));
+
+    CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.d_tokens, (size_t)batch_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
+
+    // MoE expert-batching scratch buffers
+    int BK_max = batch_size * experts_per_token;
+    CHECK_HIP(hipMalloc(&t_d->state.assign_expert, (size_t)BK_max * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.assign_token, (size_t)BK_max * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.assign_weight, (size_t)BK_max * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.expert_counts, (size_t)n_experts * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.expert_offsets, (size_t)(n_experts + 1) * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.tokens_flat, (size_t)BK_max * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.weights_flat, (size_t)BK_max * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.x_by_expert, (size_t)BK_max * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.mlp1_by_expert,
+                        (size_t)BK_max * 2 * intermediate_dim * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.gate_by_expert, (size_t)BK_max * intermediate_dim * sizeof(float)));
+    CHECK_HIP(
+        hipMalloc(&t_d->state.up_by_expert, (size_t)BK_max * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMalloc(&t_d->state.y_by_expert, (size_t)BK_max * hidden_dim * sizeof(float)));
 
     printf("Converting and transferring weights...\n");
 
@@ -221,24 +256,24 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
 
     free(small_buffer);
 
-    // ! Initialize FP32 state buffers (zero initialization)
-    CHECK_HIP(hipMemset(t_d->state.x, 0, hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.t, 0, hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.tb, 0, head_dim * n_attn_heads * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.tb2, 0, hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.router_score, 0, n_experts * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.topk_v, 0, experts_per_token * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.topk_i, 0, experts_per_token * sizeof(int)));
-    CHECK_HIP(hipMemset(t_d->state.mlp1_out, 0, 2 * intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.gate, 0, intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.up, 0, intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.gate_up, 0, intermediate_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.e_agg, 0, hidden_dim * sizeof(float)));
-    CHECK_HIP(
-        hipMemset(t_d->state.qkv, 0, head_dim * (n_attn_heads + 2 * n_kv_heads) * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.q, 0, n_attn_heads * head_dim * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.att, 0, n_attn_heads * seq_len * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.logits, 0, vocab_size * sizeof(float)));
+    // ! Initialize FP32 state buffers (zero initialization) with batch dimension
+    CHECK_HIP(hipMemset(t_d->state.x, 0, batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.t, 0, batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.tb, 0, batch_size * head_dim * n_attn_heads * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.tb2, 0, batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.router_score, 0, batch_size * n_experts * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.topk_v, 0, batch_size * experts_per_token * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.topk_i, 0, batch_size * experts_per_token * sizeof(int)));
+    CHECK_HIP(hipMemset(t_d->state.mlp1_out, 0, batch_size * 2 * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.gate, 0, batch_size * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.up, 0, batch_size * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.gate_up, 0, batch_size * intermediate_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.e_agg, 0, batch_size * hidden_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.qkv, 0,
+                        batch_size * head_dim * (n_attn_heads + 2 * n_kv_heads) * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.q, 0, batch_size * n_attn_heads * head_dim * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.att, 0, batch_size * n_attn_heads * seq_len * sizeof(float)));
+    CHECK_HIP(hipMemset(t_d->state.logits, 0, batch_size * vocab_size * sizeof(float)));
     CHECK_HIP(hipMemset(t_d->state.key_cache, 0, key_cache_size));
     CHECK_HIP(hipMemset(t_d->state.value_cache, 0, value_cache_size));
     if (conf->sliding_window > 0) {
@@ -265,7 +300,8 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
 }
 
 void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d) {
-    printf("Freeing hybrid model GPU memory...\n");
+    printf("\033[1;92m==================================================================\033["
+           "0m\n\033[1;92m♻️  FREE GPU MEMORY...\033[0m\n");
 
     // Free FP16 weights
     CHECK_HIP(hipFree(t_d->weights.token_embedding_table));
@@ -305,9 +341,26 @@ void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.key_cache));
     CHECK_HIP(hipFree(t_d->state.value_cache));
     CHECK_HIP(hipFree(t_d->state.mask));
+    CHECK_HIP(hipFree(t_d->state.d_batch_indices));
+    CHECK_HIP(hipFree(t_d->state.d_tokens));
+    CHECK_HIP(hipFree(t_d->state.cos_vals));
+    CHECK_HIP(hipFree(t_d->state.sin_vals));
+
+    CHECK_HIP(hipFree(t_d->state.assign_expert));
+    CHECK_HIP(hipFree(t_d->state.assign_token));
+    CHECK_HIP(hipFree(t_d->state.assign_weight));
+    CHECK_HIP(hipFree(t_d->state.expert_counts));
+    CHECK_HIP(hipFree(t_d->state.expert_offsets));
+    CHECK_HIP(hipFree(t_d->state.tokens_flat));
+    CHECK_HIP(hipFree(t_d->state.weights_flat));
+    CHECK_HIP(hipFree(t_d->state.x_by_expert));
+    CHECK_HIP(hipFree(t_d->state.mlp1_by_expert));
+    CHECK_HIP(hipFree(t_d->state.gate_by_expert));
+    CHECK_HIP(hipFree(t_d->state.up_by_expert));
+    CHECK_HIP(hipFree(t_d->state.y_by_expert));
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
-    printf("GPU memory freed: %.1f GB free / %.1f GB total\n",
-           free_mem / (1024.0 * 1024.0 * 1024.0), total_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("GPU memory: %.1f GB free / %.1f GB total\n", free_mem / (1024.0 * 1024.0 * 1024.0),
+           total_mem / (1024.0 * 1024.0 * 1024.0));
 }

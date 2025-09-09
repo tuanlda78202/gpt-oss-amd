@@ -79,6 +79,7 @@ build/
 uv.lock
 .vscode/
 note.txt
+digest.txt
 legacy.hip/
 time_log.py
 tests/data/input.txt
