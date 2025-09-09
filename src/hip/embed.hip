@@ -57,7 +57,7 @@ void convert_embedding_batch_kernel_vec(const __half* __restrict__ emb_table,
 
     // Process in half2 chunks
     const int pairs = (hidden_dim - t0 >= VEC) ? (VEC >> 1) : ((hidden_dim - t0) >> 1);
-#pragma unroll
+#pragma unroll VEC >> 1
     for (int i = 0; i < pairs; ++i) {
         const __half2 h2 = reinterpret_cast<const __half2*>(base)[i];
         const float2 f2  = __half22float2(h2);

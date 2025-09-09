@@ -98,39 +98,6 @@ void compute_cosin_gpu(int pos, float base, int head_dim, float scaling_factor,
     CHECK_HIP(hipGetLastError());
 }
 
-__global__ void apply_rotary_emb_batch_kernel(
-    float* __restrict__ x_batch,  // (B, n_heads, head_dim)
-    const float* __restrict__ cosv,
-    const float* __restrict__ sinv,
-    int batch_size, int n_heads, int head_dim)
-{
-    const int half = head_dim >> 1;
-    const int total_per_batch = n_heads * half;
-
-    int b = blockIdx.y;  // batch index
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;  // index within batch
-
-    if (b >= batch_size || idx >= total_per_batch) return;
-
-    int h = idx / half;  // head index
-    int i = idx % half;  // position within head
-
-    int x_offset = b * (n_heads * head_dim);  // offset for this batch
-
-    float x1 = x_batch[x_offset + h * head_dim + i];
-    float x2 = x_batch[x_offset + h * head_dim + half + i];
-
-    float c = cosv[i];
-    float s = sinv[i];
-
-    // (x1, x2) <- rot((x1, x2), theta)
-    float o1 = fmaf(-x2, s, x1 * c);  // x1*c - x2*s
-    float o2 = fmaf( x1, s, x2 * c);  // x2*c + x1*s
-
-    x_batch[x_offset + h * head_dim + i]         = o1;
-    x_batch[x_offset + h * head_dim + half + i]  = o2;
-}
-
 void rope_gpu(float* x, float* cosv, float* sinv, int n_heads, int head_dim)
 {
     const int half = head_dim >> 1;
@@ -143,67 +110,102 @@ void rope_gpu(float* x, float* cosv, float* sinv, int n_heads, int head_dim)
     CHECK_HIP(hipGetLastError());
 }
 
-void rope_q_batch_gpu(float* x_batch, float* cosv, float* sinv, int batch_size, int n_heads, int head_dim)
+__global__ void rope_qk_fused_batch_kernel(
+    float* __restrict__ q_batch,          // [B, n_q_heads, head_dim] (packed)
+    float* __restrict__ k_cache,          // cache layout as in your current code
+    const float* __restrict__ cosv,       // [head_dim/2]
+    const float* __restrict__ sinv,       // [head_dim/2]
+    int batch_size, int n_q_heads, int n_kv_heads, int head_dim,
+    int seq_len, int kv_dim, int layer_idx, int pos,
+    const int* __restrict__ batch_indices, int B_stride)
 {
     const int half = head_dim >> 1;
-    const int total_per_batch = n_heads * half;
-    const int block = 256;
-    const int grid_x = (total_per_batch + block - 1) / block;
+    if (half <= 0) return;
 
-    hipLaunchKernelGGL(apply_rotary_emb_batch_kernel, dim3(grid_x, batch_size), dim3(block), 0, 0,
-                       x_batch, cosv, sinv, batch_size, n_heads, head_dim);
-    CHECK_HIP(hipGetLastError());
-}
+    extern __shared__ float shmem[];
+    float* sh_cos = shmem;
+    float* sh_sin = shmem + half;
 
-__global__ void apply_rotary_to_kcache_at_pos_batch_kernel(float* k_cache,
-                                                           const float* cosv,
-                                                           const float* sinv,
-                                                           int batch_size,
-                                                           int n_kv_heads,
-                                                           int head_dim,
-                                                           int seq_len,
-                                                           int kv_dim,
-                                                           int layer_idx,
-                                                           int pos,
-                                                           const int* __restrict__ batch_indices,
-                                                           int B_stride) {
-    int h = blockIdx.x;
-    int b = blockIdx.y;
-    int tid = threadIdx.x;
-    int half = head_dim >> 1;
+    const int b = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
 
-    if (h >= n_kv_heads || b >= batch_size)
-        return;
+    if (b >= batch_size) return;
 
-    const int gb = batch_indices[b];
-    const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
-    const long long batch_stride = 1ll * seq_len  * kv_dim;
-
-    long long base = 1ll * layer_idx * layer_stride
-                   + 1ll * gb        * batch_stride
-                   + 1ll * pos       * kv_dim
-                   + 1ll * h         * head_dim;
-
-    float* x = k_cache + base;
-
+    // Stage cos/sin into shared (each block handles one batch row)
     for (int i = tid; i < half; i += blockDim.x) {
-        float x1 = x[i];
-        float x2 = x[half + i];
-        float c = cosv[i];
-        float s = sinv[i];
-        x[i] = fmaf(-x2, s, x1 * c);
-        x[half + i] = fmaf(x1, s, x2 * c);
+        sh_cos[i] = cosv[i];
+        sh_sin[i] = sinv[i];
+    }
+    __syncthreads();
+
+    // ---- Q part (batched tensor) ----
+    {
+        const int total_q = n_q_heads * half;
+        const int q_base  = b * (n_q_heads * head_dim);
+        for (int t = blockIdx.x * blockDim.x + tid; t < total_q; t += stride) {
+            int h = t / half;
+            int i = t % half;
+            float* x = q_batch + q_base + h * head_dim;
+            float x1 = x[i];
+            float x2 = x[half + i];
+            float c = sh_cos[i];
+            float s = sh_sin[i];
+            x[i]         = fmaf(-x2, s, x1 * c); // x1*c - x2*s
+            x[half + i]  = fmaf( x1, s, x2 * c); // x2*c + x1*s
+        }
+    }
+
+    // ---- K-cache part (at position `pos`) ----
+    {
+        const int total_k = n_kv_heads * half;
+
+        const int gb = batch_indices[b];
+        const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
+        const long long batch_stride = 1ll * seq_len  * kv_dim;
+        const long long base_k = 1ll * layer_idx * layer_stride
+                               + 1ll * gb        * batch_stride
+                               + 1ll * pos       * kv_dim; // start of this (b,pos) row
+
+        for (int t = blockIdx.x * blockDim.x + tid; t < total_k; t += stride) {
+            int h = t / half;
+            int i = t % half;
+            float* x = k_cache + base_k + 1ll * h * head_dim;
+            float x1 = x[i];
+            float x2 = x[half + i];
+            float c = sh_cos[i];
+            float s = sh_sin[i];
+            x[i]         = fmaf(-x2, s, x1 * c);
+            x[half + i]  = fmaf( x1, s, x2 * c);
+        }
     }
 }
 
-inline void rope_k_batch_gpu(float* k_cache, float* cosv, float* sinv, int batch_size,
-                                         int n_kv_heads, int head_dim, int seq_len, int kv_dim,
-                                         int layer_idx, int pos,
-                                         const int* __restrict__ batch_indices, int B_stride) {
-    dim3 grid(n_kv_heads, batch_size);
-    dim3 block(256);
-    hipLaunchKernelGGL(apply_rotary_to_kcache_at_pos_batch_kernel, grid, block, 0, 0, k_cache, cosv,
-                       sinv, batch_size, n_kv_heads, head_dim, seq_len, kv_dim, layer_idx, pos,
+inline void rope_qk_fused_batch_gpu(float* q_batch, float* k_cache,
+                                    const float* cosv, const float* sinv,
+                                    int batch_size, int n_q_heads, int n_kv_heads, int head_dim,
+                                    int seq_len, int kv_dim, int layer_idx, int pos,
+                                    const int* __restrict__ batch_indices, int B_stride)
+{
+    if ((head_dim & 1) != 0) {
+        fprintf(stderr, "RoPE: head_dim must be even, got %d\n", head_dim);
+        return;
+    }
+
+    const int half = head_dim >> 1;
+    const int block = 256;
+    const int max_total = max(n_q_heads, n_kv_heads) * half;
+    const int grid_x = (max_total + block - 1) / block;
+
+    dim3 grid(max(grid_x, 1), batch_size);
+    dim3 blk(block);
+
+    size_t shmem_bytes = (size_t)half * 2 * sizeof(float); // cos + sin
+
+    hipLaunchKernelGGL(rope_qk_fused_batch_kernel, grid, blk, shmem_bytes, 0,
+                       q_batch, k_cache, cosv, sinv,
+                       batch_size, n_q_heads, n_kv_heads, head_dim,
+                       seq_len, kv_dim, layer_idx, pos,
                        batch_indices, B_stride);
     CHECK_HIP(hipGetLastError());
 }
