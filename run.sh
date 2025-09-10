@@ -92,15 +92,16 @@ usage() {
   echo -e "    ${WHITE}fast${NC}     - Uses 'make runfast'"
   echo -e "    ${WHITE}omp${NC}      - Uses 'make runomp' (recommended)"
   echo ""
-  echo -e "${RED}‍♂️ RUN COMMANDS:${NC}"
+  echo -e "${RED}🏃‍♂️ RUN COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f]${NC}"
   echo ""
   echo -e "  ${CYAN}Key Features:${NC}"
   echo -e "    • Default checkpoint: ${WHITE}${MODELBIN_ROOT}/gpt-oss-20b.bin${NC}"
   echo -e "    • Default mode: ${WHITE}getp${NC} (uses 20b model)"
   echo -e "    • GPU allocation: Automatically uses ${WHITE}'srun --gres=gpu:N_GPUS'${NC}"
   echo -e "    • Logging: Save output to ${WHITE}log.txt${NC} with -l flag"
+  echo -e "    • Profiling: Enable forward timing with ${WHITE}-f${NC} flag"
   echo ""
   echo -e "  ${CYAN}Mode-specific defaults for getp:${NC}"
   echo -e "    • Input defaults to: ${WHITE}tests/data/input.txt${NC}"
@@ -120,6 +121,7 @@ usage() {
   echo -e "    ${WHITE}-l${NC}                     Log output to log.txt"
   echo -e "    ${WHITE}-g N_GPUS${NC}              Number of GPUs to request (default: 1)"
   echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 2)"
+  echo -e "    ${WHITE}-f${NC}                     Enable forward pass profiling (shows timing breakdown)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
@@ -152,15 +154,15 @@ usage() {
   echo -e "  ${CYAN}build/${NC}                     # Build artifacts"
   echo -e "  ${WHITE}log.txt${NC}                    # Output log (when using -l flag)"
   echo ""
-  echo -e "${GREEN} EXAMPLE USAGE:${NC}"
+  echo -e "${GREEN}📊 EXAMPLE USAGE:${NC}"
   echo -e "  ${CYAN}# Basic getp mode with 1 GPU${NC}"
   echo -e "  ${GREEN}./run.sh run${NC}"
   echo ""
-  echo -e "  ${CYAN}# Getp mode with 2 GPUs and logging${NC}"
-  echo -e "  ${GREEN}./run.sh run -g 2 -l${NC}"
+  echo -e "  ${CYAN}# Getp mode with profiling and logging${NC}"
+  echo -e "  ${GREEN}./run.sh run -f -l${NC}"
   echo ""
-  echo -e "  ${CYAN}# Getp mode with 2 GPUs and batch size 32${NC}"
-  echo -e "  ${GREEN}./run.sh run -g 2 -b 32${NC}"
+  echo -e "  ${CYAN}# Getp mode with 2 GPUs, batch size 32, and profiling${NC}"
+  echo -e "  ${GREEN}./run.sh run -g 2 -b 32 -f${NC}"
   echo ""
   echo -e "  ${CYAN}# Custom checkpoint with 4 GPUs${NC}"
   echo -e "  ${GREEN}./run.sh run -c /path/to/model.bin -g 4${NC}"
@@ -255,6 +257,7 @@ cmd_run() {
   local log_output=""
   local n_gpus="1"
   local batch_size=""
+  local enable_profiling=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -271,6 +274,7 @@ cmd_run() {
       -l) log_output="1"; shift 1 ;;
       -g) n_gpus="$2"; shift 2 ;;
       -b) batch_size="$2"; shift 2 ;;
+      -f) enable_profiling="1"; shift 1 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -312,6 +316,7 @@ cmd_run() {
   print_kv "steps(-n)"     "${steps:-1024}" "$([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "seed(-s)"      "${seed:-time(NULL)}" "$([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "batch_size(-b)" "${batch_size:-2}" "$([[ -z "${batch_size:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "profiling(-f)" "${enable_profiling:+enabled}" "$([[ -n "${enable_profiling}" ]] && echo "(forward timing)" || echo "(disabled)")"
   print_kv "logging(-l)"   "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to log.txt)" || echo "(disabled)")"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
@@ -331,6 +336,7 @@ cmd_run() {
   [[ -n "${steps}" ]] && args+=(-n "${steps}")
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
   [[ -n "${batch_size}" ]] && args+=(-b "${batch_size}")
+  [[ -n "${enable_profiling}" ]] && args+=(-f "1")
 
   local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"

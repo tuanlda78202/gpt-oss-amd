@@ -20,6 +20,11 @@
 #include <cstring>
 #include <omp.h>
 
+// Global profiling flag - off by default
+static bool g_enable_profiling = false;
+
+void set_profiling_enabled(bool enabled) { g_enable_profiling = enabled; }
+
 // Timing infrastructure
 struct BatchForwardTimings {
     double setup_time;
@@ -94,9 +99,17 @@ struct BatchForwardTimings {
 // Global timing instance
 static BatchForwardTimings g_batch_timings;
 
-void reset_batch_timings() { g_batch_timings.reset(); }
+void reset_batch_timings() {
+    if (g_enable_profiling) {
+        g_batch_timings.reset();
+    }
+}
 
-void print_batch_timing_summary() { g_batch_timings.print_summary(); }
+void print_batch_timing_summary() {
+    if (g_enable_profiling) {
+        g_batch_timings.print_summary();
+    }
+}
 
 // TODO: merge interface batch=1
 float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
@@ -248,16 +261,19 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
 float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                             const int* pos_per_token_h, int batch_size, const int* batch_indices_h,
                             int B_stride) {
-    // Create timing events
+    // Create timing events only if profiling is enabled
     hipEvent_t start_total, end_total;
     hipEvent_t start_section, end_section;
-    CHECK_HIP(hipEventCreate(&start_total));
-    CHECK_HIP(hipEventCreate(&end_total));
-    CHECK_HIP(hipEventCreate(&start_section));
-    CHECK_HIP(hipEventCreate(&end_section));
 
-    CHECK_HIP(hipEventRecord(start_total, 0));
-    CHECK_HIP(hipEventRecord(start_section, 0));
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventCreate(&start_total));
+        CHECK_HIP(hipEventCreate(&end_total));
+        CHECK_HIP(hipEventCreate(&start_section));
+        CHECK_HIP(hipEventCreate(&end_section));
+
+        CHECK_HIP(hipEventRecord(start_total, 0));
+        CHECK_HIP(hipEventRecord(start_section, 0));
+    }
 
     OssConfig* p = &transformer->config;
     OssTransformerWeightsHalf* w = &transformer->weights;
@@ -284,30 +300,40 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                         hipMemcpyHostToDevice));
 
     // Record setup time
-    CHECK_HIP(hipEventRecord(end_section, 0));
-    CHECK_HIP(hipEventSynchronize(end_section));
-    float setup_ms;
-    CHECK_HIP(hipEventElapsedTime(&setup_ms, start_section, end_section));
-    g_batch_timings.setup_time += setup_ms;
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float setup_ms;
+        CHECK_HIP(hipEventElapsedTime(&setup_ms, start_section, end_section));
+        g_batch_timings.setup_time += setup_ms;
+    }
 
     // ! Embedding
-    CHECK_HIP(hipEventRecord(start_section, 0));
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventRecord(start_section, 0));
+    }
     embed_batch_gpu(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
-    CHECK_HIP(hipEventRecord(end_section, 0));
-    CHECK_HIP(hipEventSynchronize(end_section));
-    float embedding_ms;
-    CHECK_HIP(hipEventElapsedTime(&embedding_ms, start_section, end_section));
-    g_batch_timings.embedding_time += embedding_ms;
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float embedding_ms;
+        CHECK_HIP(hipEventElapsedTime(&embedding_ms, start_section, end_section));
+        g_batch_timings.embedding_time += embedding_ms;
+    }
 
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! RMSNorm
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         rmsnorm_batch_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float rmsnorm_ms;
-        CHECK_HIP(hipEventElapsedTime(&rmsnorm_ms, start_section, end_section));
-        g_batch_timings.layer_rmsnorm_time += rmsnorm_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float rmsnorm_ms;
+            CHECK_HIP(hipEventElapsedTime(&rmsnorm_ms, start_section, end_section));
+            g_batch_timings.layer_rmsnorm_time += rmsnorm_ms;
+        }
 
         // ! QKV project
         __half* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
@@ -315,29 +341,39 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
         __half* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         matvec_batch_gpu(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
                          (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float qkv_ms;
-        CHECK_HIP(hipEventElapsedTime(&qkv_ms, start_section, end_section));
-        g_batch_timings.qkv_projection_time += qkv_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float qkv_ms;
+            CHECK_HIP(hipEventElapsedTime(&qkv_ms, start_section, end_section));
+            g_batch_timings.qkv_projection_time += qkv_ms;
+        }
 
         // ! Split QKV -> write KV at each token's own pos
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         split_qkv_batch_gpu_mixedpos(s->qkv, s->q, s->key_cache, s->value_cache, batch_size,
                                      head_dim, p->n_attn_heads, p->n_kv_heads, l,
                                      s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
                                      /*stream=*/0, kv_dim);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float split_qkv_ms;
-        CHECK_HIP(hipEventElapsedTime(&split_qkv_ms, start_section, end_section));
-        g_batch_timings.split_qkv_time += split_qkv_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float split_qkv_ms;
+            CHECK_HIP(hipEventElapsedTime(&split_qkv_ms, start_section, end_section));
+            g_batch_timings.split_qkv_time += split_qkv_ms;
+        }
 
         // ! RoPE (Q and K) per token
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         {
             const float ntk_beta = 32.0f;
             const float ntk_alpha = 1.0f;
@@ -348,13 +384,17 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                                           p->initial_context_length, ntk_beta, ntk_alpha,
                                           /*stream=*/0);
         }
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float rope_ms;
-        CHECK_HIP(hipEventElapsedTime(&rope_ms, start_section, end_section));
-        g_batch_timings.rope_time += rope_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float rope_ms;
+            CHECK_HIP(hipEventElapsedTime(&rope_ms, start_section, end_section));
+            g_batch_timings.rope_time += rope_ms;
+        }
 
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         flash_attn_decode_gpu_batch_mixed(
             /*q_batch=*/s->q,                      // (B, H*D)
             /*k_cache=*/(const void*)s->key_cache, // base; wrapper does layer/slot/pos math
@@ -375,48 +415,64 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
             /*B_stride=*/(long long)B_stride,       // elements per (B*T*kv_dim) per layer
             /*max_pos_in_batch=*/max_pos_in_batch,  // from host
             /*stream=*/0);                          // ✅ (fixed typo)
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float attn_ms;
-        CHECK_HIP(hipEventElapsedTime(&attn_ms, start_section, end_section));
-        g_batch_timings.attention_time += attn_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float attn_ms;
+            CHECK_HIP(hipEventElapsedTime(&attn_ms, start_section, end_section));
+            g_batch_timings.attention_time += attn_ms;
+        }
 
         // ! Output projection
         __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         __half* b_o = w->b_o + 1ll * l * hidden_dim;
 
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         matvec_batch_gpu(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads,
                          hidden_dim);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float out_proj_ms;
-        CHECK_HIP(hipEventElapsedTime(&out_proj_ms, start_section, end_section));
-        g_batch_timings.output_projection_time += out_proj_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float out_proj_ms;
+            CHECK_HIP(hipEventElapsedTime(&out_proj_ms, start_section, end_section));
+            g_batch_timings.output_projection_time += out_proj_ms;
+        }
 
         // ! Residual
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         vec_add_vec_batch_gpu(x, s->tb2, 1.0f, batch_size, hidden_dim);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float residual_ms;
-        CHECK_HIP(hipEventElapsedTime(&residual_ms, start_section, end_section));
-        g_batch_timings.residual_time += residual_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float residual_ms;
+            CHECK_HIP(hipEventElapsedTime(&residual_ms, start_section, end_section));
+            g_batch_timings.residual_time += residual_ms;
+        }
 
         // ! RMSNorm
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         rmsnorm_batch_gpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float mlp_rmsnorm_ms;
-        CHECK_HIP(hipEventElapsedTime(&mlp_rmsnorm_ms, start_section, end_section));
-        g_batch_timings.mlp_rmsnorm_time += mlp_rmsnorm_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float mlp_rmsnorm_ms;
+            CHECK_HIP(hipEventElapsedTime(&mlp_rmsnorm_ms, start_section, end_section));
+            g_batch_timings.mlp_rmsnorm_time += mlp_rmsnorm_ms;
+        }
 
         // ! MoE Router
         __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         __half* b_router = w->b_router + 1ll * l * n_experts;
 
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
         matvec_batch_gpu(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim,
                          n_experts);
 
@@ -425,14 +481,18 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                        p->experts_per_token);
 
         softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float moe_routing_ms;
-        CHECK_HIP(hipEventElapsedTime(&moe_routing_ms, start_section, end_section));
-        g_batch_timings.moe_routing_time += moe_routing_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float moe_routing_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_routing_ms, start_section, end_section));
+            g_batch_timings.moe_routing_time += moe_routing_ms;
+        }
 
         // Expert processing timing
-        CHECK_HIP(hipEventRecord(start_section, 0));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
 
         // Zero aggregation
         CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
@@ -555,42 +615,50 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
         }
 
         // End expert processing timing
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float expert_processing_ms;
-        CHECK_HIP(hipEventElapsedTime(&expert_processing_ms, start_section, end_section));
-        g_batch_timings.expert_processing_time += expert_processing_ms;
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float expert_processing_ms;
+            CHECK_HIP(hipEventElapsedTime(&expert_processing_ms, start_section, end_section));
+            g_batch_timings.expert_processing_time += expert_processing_ms;
+        }
 
         // Residual connection - batched
         vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
     }
 
     // Final operations - batched
-    CHECK_HIP(hipEventRecord(start_section, 0));
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventRecord(start_section, 0));
+    }
     rmsnorm_batch_gpu(x, x, w->rms_out_w, batch_size, hidden_dim);
 
     // Linear: classifier into logits - batched
     matvec_batch_gpu(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
-    CHECK_HIP(hipEventRecord(end_section, 0));
-    CHECK_HIP(hipEventSynchronize(end_section));
-    float final_ops_ms;
-    CHECK_HIP(hipEventElapsedTime(&final_ops_ms, start_section, end_section));
-    g_batch_timings.final_ops_time += final_ops_ms;
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float final_ops_ms;
+        CHECK_HIP(hipEventElapsedTime(&final_ops_ms, start_section, end_section));
+        g_batch_timings.final_ops_time += final_ops_ms;
+    }
 
     // Record total time
-    CHECK_HIP(hipEventRecord(end_total, 0));
-    CHECK_HIP(hipEventSynchronize(end_total));
-    float total_ms;
-    CHECK_HIP(hipEventElapsedTime(&total_ms, start_total, end_total));
-    g_batch_timings.total_time += total_ms;
-    g_batch_timings.num_calls++;
-    g_batch_timings.total_layers += p->n_layers;
+    if (g_enable_profiling) {
+        CHECK_HIP(hipEventRecord(end_total, 0));
+        CHECK_HIP(hipEventSynchronize(end_total));
+        float total_ms;
+        CHECK_HIP(hipEventElapsedTime(&total_ms, start_total, end_total));
+        g_batch_timings.total_time += total_ms;
+        g_batch_timings.num_calls++;
+        g_batch_timings.total_layers += p->n_layers;
 
-    // Cleanup events
-    CHECK_HIP(hipEventDestroy(start_total));
-    CHECK_HIP(hipEventDestroy(end_total));
-    CHECK_HIP(hipEventDestroy(start_section));
-    CHECK_HIP(hipEventDestroy(end_section));
+        // Cleanup events
+        CHECK_HIP(hipEventDestroy(start_total));
+        CHECK_HIP(hipEventDestroy(end_total));
+        CHECK_HIP(hipEventDestroy(start_section));
+        CHECK_HIP(hipEventDestroy(end_section));
+    }
 
     return s->logits;
 }
