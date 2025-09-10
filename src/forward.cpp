@@ -25,7 +25,7 @@ static bool g_enable_profiling = false;
 
 void set_profiling_enabled(bool enabled) { g_enable_profiling = enabled; }
 
-// Timing infrastructure
+// Detailed timing infrastructure with MoE breakdown
 struct BatchForwardTimings {
     double setup_time;
     double embedding_time;
@@ -39,6 +39,20 @@ struct BatchForwardTimings {
     double mlp_rmsnorm_time;
     double moe_routing_time;
     double expert_processing_time;
+
+    // Detailed MoE Expert Processing Breakdown
+    double moe_setup_time;       // memset operations
+    double moe_assignment_time;  // build assignments and counting
+    double moe_scan_time;        // exclusive scan
+    double moe_compact_time;     // compact by expert
+    double moe_gather_time;      // gather inputs
+    double moe_queue_build_time; // work queue building + metadata
+    double moe_mlp1_time;        // MLP1 matrix multiplication
+    double moe_swiglu_time;      // SwiGLU activation
+    double moe_mlp2_time;        // MLP2 matrix multiplication
+    double moe_scatter_time;     // scale and scatter
+    double moe_sync_time;        // stream synchronization
+
     double final_ops_time;
     double total_time;
 
@@ -51,6 +65,12 @@ struct BatchForwardTimings {
         setup_time = embedding_time = layer_rmsnorm_time = qkv_projection_time = 0.0;
         split_qkv_time = rope_time = attention_time = output_projection_time = 0.0;
         residual_time = mlp_rmsnorm_time = moe_routing_time = expert_processing_time = 0.0;
+
+        // Reset detailed MoE timings
+        moe_setup_time = moe_assignment_time = moe_scan_time = moe_compact_time = 0.0;
+        moe_gather_time = moe_queue_build_time = moe_mlp1_time = moe_swiglu_time = 0.0;
+        moe_mlp2_time = moe_scatter_time = moe_sync_time = 0.0;
+
         final_ops_time = total_time = 0.0;
         num_calls = total_layers = 0;
     }
@@ -59,39 +79,73 @@ struct BatchForwardTimings {
         if (num_calls == 0)
             return;
 
-        printf("%.*s\n", 60, "================================================================");
+        printf("%.*s\n", 70,
+               "======================================================================");
         printf("BATCH FORWARD TIMING SUMMARY (%d calls, %d total layers)\n", num_calls,
                total_layers);
-        printf("%.*s\n", 60, "================================================================");
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Setup & Memory", setup_time / num_calls,
+        printf("%.*s\n", 70,
+               "======================================================================");
+
+        // Main sections
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Setup & Memory", setup_time / num_calls,
                100.0 * setup_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Embedding", embedding_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Embedding", embedding_time / num_calls,
                100.0 * embedding_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Layer RMSNorm", layer_rmsnorm_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Layer RMSNorm", layer_rmsnorm_time / num_calls,
                100.0 * layer_rmsnorm_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "QKV Projection", qkv_projection_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "QKV Projection", qkv_projection_time / num_calls,
                100.0 * qkv_projection_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Split QKV", split_qkv_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Split QKV", split_qkv_time / num_calls,
                100.0 * split_qkv_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "RoPE", rope_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "RoPE", rope_time / num_calls,
                100.0 * rope_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Attention", attention_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Attention", attention_time / num_calls,
                100.0 * attention_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Output Projection",
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Output Projection",
                output_projection_time / num_calls, 100.0 * output_projection_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Residual", residual_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Residual", residual_time / num_calls,
                100.0 * residual_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "MLP RMSNorm", mlp_rmsnorm_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "MLP RMSNorm", mlp_rmsnorm_time / num_calls,
                100.0 * mlp_rmsnorm_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "MoE Routing", moe_routing_time / num_calls,
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "MoE Routing", moe_routing_time / num_calls,
                100.0 * moe_routing_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Expert Processing",
+
+        // Expert Processing total
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Expert Processing [TOTAL]",
                expert_processing_time / num_calls, 100.0 * expert_processing_time / total_time);
-        printf("%-20s: %8.3f ms (%.1f%%)\n", "Final Operations", final_ops_time / num_calls,
+
+        // Detailed MoE Expert Processing Breakdown
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "MoE Setup/Memset", moe_setup_time / num_calls,
+               100.0 * moe_setup_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "Assignment/Counting",
+               moe_assignment_time / num_calls, 100.0 * moe_assignment_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "Exclusive Scan", moe_scan_time / num_calls,
+               100.0 * moe_scan_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "Compact by Expert", moe_compact_time / num_calls,
+               100.0 * moe_compact_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "Gather Inputs", moe_gather_time / num_calls,
+               100.0 * moe_gather_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "Queue Build/Meta",
+               moe_queue_build_time / num_calls, 100.0 * moe_queue_build_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "MLP1 MatVec", moe_mlp1_time / num_calls,
+               100.0 * moe_mlp1_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "SwiGLU Activation", moe_swiglu_time / num_calls,
+               100.0 * moe_swiglu_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "MLP2 MatVec", moe_mlp2_time / num_calls,
+               100.0 * moe_mlp2_time / total_time);
+        printf("  ├─ %-21s: %8.3f ms (%.1f%%)\n", "Scale/Scatter", moe_scatter_time / num_calls,
+               100.0 * moe_scatter_time / total_time);
+        printf("  └─ %-21s: %8.3f ms (%.1f%%)\n", "Stream Sync", moe_sync_time / num_calls,
+               100.0 * moe_sync_time / total_time);
+
+        printf("%-25s: %8.3f ms (%.1f%%)\n", "Final Operations", final_ops_time / num_calls,
                100.0 * final_ops_time / total_time);
-        printf("%.*s\n", 60, "================================================================");
-        printf("%-20s: %8.3f ms\n", "TOTAL", total_time / num_calls);
-        printf("%.*s\n", 60, "================================================================");
+
+        printf("%.*s\n", 70,
+               "======================================================================");
+        printf("%-25s: %8.3f ms\n", "TOTAL", total_time / num_calls);
+        printf("%.*s\n", 70,
+               "======================================================================");
         fflush(stdout);
     }
 };
@@ -264,12 +318,15 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
     // Create timing events only if profiling is enabled
     hipEvent_t start_total, end_total;
     hipEvent_t start_section, end_section;
+    hipEvent_t start_moe_sub, end_moe_sub; // For detailed MoE breakdown
 
     if (g_enable_profiling) {
         CHECK_HIP(hipEventCreate(&start_total));
         CHECK_HIP(hipEventCreate(&end_total));
         CHECK_HIP(hipEventCreate(&start_section));
         CHECK_HIP(hipEventCreate(&end_section));
+        CHECK_HIP(hipEventCreate(&start_moe_sub));
+        CHECK_HIP(hipEventCreate(&end_moe_sub));
 
         CHECK_HIP(hipEventRecord(start_total, 0));
         CHECK_HIP(hipEventRecord(start_section, 0));
@@ -489,34 +546,77 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
             g_batch_timings.moe_routing_time += moe_routing_ms;
         }
 
-        // Expert processing timing
+        // Expert processing timing (with detailed breakdown)
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
 
-        // Zero aggregation
+        // MoE Setup - Zero aggregation
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+        }
         CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+            CHECK_HIP(hipEventSynchronize(end_moe_sub));
+            float moe_setup_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_setup_ms, start_moe_sub, end_moe_sub));
+            g_batch_timings.moe_setup_time += moe_setup_ms;
+        }
 
         const int BKE = batch_size * p->experts_per_token;
         dim3 blk1(256), grd1((BKE + blk1.x - 1) / blk1.x);
 
         // Build assignments + counts
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+        }
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
         hipLaunchKernelGGL(build_assignments_and_count_kernel, grd1, blk1, 0, 0, s->topk_i,
                            s->topk_v, batch_size, p->experts_per_token, s->assign_expert,
                            s->assign_token, s->assign_weight, s->expert_counts, n_experts);
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+            CHECK_HIP(hipEventSynchronize(end_moe_sub));
+            float moe_assignment_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_assignment_ms, start_moe_sub, end_moe_sub));
+            g_batch_timings.moe_assignment_time += moe_assignment_ms;
+        }
 
         // Exclusive scan on device -> expert_offsets[0..E]
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+        }
         hipLaunchKernelGGL(exclusive_scan_small_kernel, dim3(1), dim3(1), 0, 0, s->expert_counts,
                            s->expert_offsets, n_experts);
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+            CHECK_HIP(hipEventSynchronize(end_moe_sub));
+            float moe_scan_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_scan_ms, start_moe_sub, end_moe_sub));
+            g_batch_timings.moe_scan_time += moe_scan_ms;
+        }
 
         // Compact by expert
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+        }
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
         hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, 0, s->assign_expert,
                            s->assign_token, s->assign_weight, BKE, s->expert_offsets,
                            s->expert_counts, s->tokens_flat, s->weights_flat);
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+            CHECK_HIP(hipEventSynchronize(end_moe_sub));
+            float moe_compact_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_compact_ms, start_moe_sub, end_moe_sub));
+            g_batch_timings.moe_compact_time += moe_compact_ms;
+        }
 
         // Gather inputs X -> x_by_expert
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+        }
         {
             const bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
                                ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
@@ -532,8 +632,19 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                                    s->x_by_expert, BKE, hidden_dim);
             }
         }
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+            CHECK_HIP(hipEventSynchronize(end_moe_sub));
+            float moe_gather_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_gather_ms, start_moe_sub, end_moe_sub));
+            g_batch_timings.moe_gather_time += moe_gather_ms;
+        }
 
         // === Build work queue and read back {active_experts, max_Ne} ===
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+        }
+
         static int* d_work_queue = nullptr;
         static int d_work_queue_capacity = 0; // ints
         static Int2* d_meta = nullptr;
@@ -556,6 +667,14 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
         const int active_experts = h_meta.x;
         const int max_Ne = h_meta.y;
 
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+            CHECK_HIP(hipEventSynchronize(end_moe_sub));
+            float moe_queue_build_ms;
+            CHECK_HIP(hipEventElapsedTime(&moe_queue_build_ms, start_moe_sub, end_moe_sub));
+            g_batch_timings.moe_queue_build_time += moe_queue_build_ms;
+        }
+
         if (active_experts == 0) {
             vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
         } else {
@@ -575,8 +694,12 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
             const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
             const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
             const long long mlp2_bias_stride = hidden_dim;
-
             const float alpha = 1.702f;
+
+            // MLP1 Processing
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            }
 
             for (int sid = 0; sid < NUM_STREAMS; ++sid) {
                 const int work_start = sid * experts_per_stream;
@@ -592,11 +715,61 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                     w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
                     w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
                     2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, max_Ne, stream);
+            }
+
+            for (int i = 0; i < NUM_STREAMS; ++i)
+                CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
+
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+                CHECK_HIP(hipEventSynchronize(end_moe_sub));
+                float moe_mlp1_ms;
+                CHECK_HIP(hipEventElapsedTime(&moe_mlp1_ms, start_moe_sub, end_moe_sub));
+                g_batch_timings.moe_mlp1_time += moe_mlp1_ms;
+            }
+
+            // SwiGLU Processing
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            }
+
+            for (int sid = 0; sid < NUM_STREAMS; ++sid) {
+                const int work_start = sid * experts_per_stream;
+                const int work_end = std::min(work_start + experts_per_stream, active_experts);
+                if (work_start >= work_end)
+                    break;
+                const int work_count = work_end - work_start;
+                hipStream_t stream = expert_streams[sid];
 
                 // ! split + SwiGLU: [Ne,2I] -> [Ne,I]
                 multi_expert_split_swiglu_gpu(
                     d_work_queue, work_start, work_count, s->mlp1_by_expert, s->gate_by_expert,
                     p->intermediate_dim, alpha, p->swiglu_limit, max_Ne, stream);
+            }
+
+            for (int i = 0; i < NUM_STREAMS; ++i)
+                CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
+
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+                CHECK_HIP(hipEventSynchronize(end_moe_sub));
+                float moe_swiglu_ms;
+                CHECK_HIP(hipEventElapsedTime(&moe_swiglu_ms, start_moe_sub, end_moe_sub));
+                g_batch_timings.moe_swiglu_time += moe_swiglu_ms;
+            }
+
+            // MLP2 Processing
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            }
+
+            for (int sid = 0; sid < NUM_STREAMS; ++sid) {
+                const int work_start = sid * experts_per_stream;
+                const int work_end = std::min(work_start + experts_per_stream, active_experts);
+                if (work_start >= work_end)
+                    break;
+                const int work_count = work_end - work_start;
+                hipStream_t stream = expert_streams[sid];
 
                 // ! MLP2: [Ne,I] x [I,H] -> [Ne,H]
                 multi_expert_matvec_gpu(
@@ -604,14 +777,61 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
                     w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
                     w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim,
                     hidden_dim, mlp2_weight_stride, mlp2_bias_stride, max_Ne, stream);
+            }
+
+            for (int i = 0; i < NUM_STREAMS; ++i)
+                CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
+
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+                CHECK_HIP(hipEventSynchronize(end_moe_sub));
+                float moe_mlp2_ms;
+                CHECK_HIP(hipEventElapsedTime(&moe_mlp2_ms, start_moe_sub, end_moe_sub));
+                g_batch_timings.moe_mlp2_time += moe_mlp2_ms;
+            }
+
+            // Scale and Scatter Processing
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            }
+
+            for (int sid = 0; sid < NUM_STREAMS; ++sid) {
+                const int work_start = sid * experts_per_stream;
+                const int work_end = std::min(work_start + experts_per_stream, active_experts);
+                if (work_start >= work_end)
+                    break;
+                const int work_count = work_end - work_start;
+                hipStream_t stream = expert_streams[sid];
 
                 // ! scale + scatter -> e_agg
                 multi_expert_scale_scatter_gpu(d_work_queue, work_start, work_count, s->y_by_expert,
                                                s->tokens_flat, s->weights_flat, s->e_agg,
                                                hidden_dim, batch_size, max_Ne, stream);
             }
+
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+                CHECK_HIP(hipEventSynchronize(end_moe_sub));
+                float moe_scatter_ms;
+                CHECK_HIP(hipEventElapsedTime(&moe_scatter_ms, start_moe_sub, end_moe_sub));
+                g_batch_timings.moe_scatter_time += moe_scatter_ms;
+            }
+
+            // Final Stream Synchronization
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            }
+
             for (int i = 0; i < NUM_STREAMS; ++i)
                 CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
+
+            if (g_enable_profiling) {
+                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
+                CHECK_HIP(hipEventSynchronize(end_moe_sub));
+                float moe_sync_ms;
+                CHECK_HIP(hipEventElapsedTime(&moe_sync_ms, start_moe_sub, end_moe_sub));
+                g_batch_timings.moe_sync_time += moe_sync_ms;
+            }
         }
 
         // End expert processing timing
@@ -643,7 +863,7 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
         g_batch_timings.final_ops_time += final_ops_ms;
     }
 
-    // Record total time
+    // Record total time and cleanup events
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(end_total, 0));
         CHECK_HIP(hipEventSynchronize(end_total));
@@ -658,6 +878,8 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
         CHECK_HIP(hipEventDestroy(end_total));
         CHECK_HIP(hipEventDestroy(start_section));
         CHECK_HIP(hipEventDestroy(end_section));
+        CHECK_HIP(hipEventDestroy(start_moe_sub));
+        CHECK_HIP(hipEventDestroy(end_moe_sub));
     }
 
     return s->logits;

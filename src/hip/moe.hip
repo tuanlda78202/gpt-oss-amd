@@ -211,7 +211,7 @@ inline void multi_expert_matvec_gpu(
     int maxNe, hipStream_t stream)
 {
     constexpr int RB    = 8;
-    constexpr int KTILE = 1024;
+    constexpr int KTILE = 2048;
     dim3 block(64, RB, 1);
     dim3 grid(maxNe, (M + RB - 1) / RB, work_count);
     hipLaunchKernelGGL((multi_expert_matvec_kernel<RB, KTILE>),
