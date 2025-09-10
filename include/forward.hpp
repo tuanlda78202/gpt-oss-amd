@@ -3,8 +3,9 @@
 
 // TODO: rmv unused
 float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos);
-float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int pos,
-                            int batch_size);
+float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
+                            const int* pos_per_token_h, int batch_size, const int* batch_indices_h,
+                            int B_stride);
 
 void embed_batch_gpu(float* x_batch, __half* emb_table, int* tokens, int batch_size,
                      int hidden_dim);

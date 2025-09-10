@@ -14,6 +14,10 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
+// Forward declarations for timing functions
+extern void reset_batch_timings();
+extern void print_batch_timing_summary();
+
 OssTransformerHybrid* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
@@ -35,9 +39,16 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
     printf("-------------------------------\n");
+
+    // Reset timing statistics at start
+    reset_batch_timings();
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
+    // Print timing summary before cleanup
+    printf("\n🕒 BATCH FORWARD PROFILING RESULTS:\n");
+    print_batch_timing_summary();
+
     free_transformer_on_device_hybrid(t_d);
     free(t_d);
 
@@ -244,39 +255,53 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
 
     print_batch_progress(batch_size, tokens_generated, max_generation_tokens, finished);
 
+    // Timing variables for this batch
+    double total_forward_time = 0.0;
+    int forward_calls = 0;
+
     while (active_sequences > 0) {
-        bool process_batch = false;
         int* batch_tokens = (int*)malloc(batch_size * sizeof(int));
         int* batch_positions = (int*)malloc(batch_size * sizeof(int));
         int* batch_indices = (int*)malloc(batch_size * sizeof(int));
         int valid_batch_size = 0;
 
-        // Collect sequences that need processing at the same position
-        int target_pos = -1;
-        for (int b = 0; b < batch_size; b++) {
+        // Continuous batching: collect ANY ready tokens (mixed positions allowed!)
+        for (int b = 0; b < batch_size && valid_batch_size < batch_size; b++) {
             if (!finished[b] && pos[b] < steps) {
-                if (target_pos == -1)
-                    target_pos = pos[b];
-                if (pos[b] == target_pos) {
-                    batch_tokens[valid_batch_size] = current_tokens[b];
-                    batch_positions[valid_batch_size] = pos[b];
-                    batch_indices[valid_batch_size] = b;
-                    valid_batch_size++;
-                    process_batch = true;
-                }
+                batch_tokens[valid_batch_size] = current_tokens[b];
+                batch_positions[valid_batch_size] = pos[b];
+                batch_indices[valid_batch_size] = b;
+                valid_batch_size++;
             }
         }
 
-        if (!process_batch || valid_batch_size == 0) {
+        if (valid_batch_size == 0) {
             free(batch_tokens);
             free(batch_positions);
             free(batch_indices);
             break;
         }
 
-        // Forward pass for the batch
-        float* batch_logits = forward_hybrid_batch(t_d, batch_tokens, target_pos, valid_batch_size,
-                                                   batch_indices, t_d->config.batch_size);
+        // Timing for individual forward pass
+        hipEvent_t start_forward, end_forward;
+        CHECK_HIP(hipEventCreate(&start_forward));
+        CHECK_HIP(hipEventCreate(&end_forward));
+        CHECK_HIP(hipEventRecord(start_forward, 0));
+
+        // Forward pass for the batch with mixed positions
+        float* batch_logits =
+            forward_hybrid_batch(t_d, batch_tokens, batch_positions, valid_batch_size,
+                                 batch_indices, t_d->config.batch_size);
+
+        CHECK_HIP(hipEventRecord(end_forward, 0));
+        CHECK_HIP(hipEventSynchronize(end_forward));
+        float forward_ms;
+        CHECK_HIP(hipEventElapsedTime(&forward_ms, start_forward, end_forward));
+        total_forward_time += forward_ms;
+        forward_calls++;
+
+        CHECK_HIP(hipEventDestroy(start_forward));
+        CHECK_HIP(hipEventDestroy(end_forward));
 
         // Process results for each sequence in the batch
         for (int i = 0; i < valid_batch_size; i++) {
@@ -322,6 +347,10 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
         free(batch_positions);
         free(batch_indices);
     }
+
+    // Print batch timing info
+    printf("\n⏱️ Batch timing: %d forward calls, %.3f ms total, %.3f ms/call\n", forward_calls,
+           total_forward_time, total_forward_time / forward_calls);
 
     // Cleanup
     for (int b = 0; b < batch_size; b++) {

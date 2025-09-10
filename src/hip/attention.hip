@@ -542,7 +542,7 @@ __global__ void flash_attn_decode_kernel(const float* __restrict__ q,
     }
 }
 
-static inline int fa_next_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
+static inline int fa_next_pow21(int x){ int p=1; while(p<x) p<<=1; return p; }
 
 // Heuristic: chunk if we can spawn >= 4*#heads CTAs
 static inline int choose_chunk_size(int L, int heads, int target_cta_per_head=8) {
@@ -565,7 +565,7 @@ void flash_attn_decode_gpu(const float* q,
     int n_chunks = (L + chunk_size - 1) / chunk_size;
 
     // Pick threads per block (64..256) matching head_dim
-    int tpb = fa_next_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
+    int tpb = fa_next_pow21(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
     size_t shmem = (size_t)head_dim * sizeof(float);
 
     if (n_chunks <= 1) {
@@ -776,7 +776,7 @@ __global__ void flash_attn_decode_chunk_kernel_batched(
 // Also applies attention sink per (b, h)
 // ============================================================
 __launch_bounds__(256, 2)
-__global__ void flash_attn_reduce_chunks_kernel_batched(
+__global__ void flash_attn_reduce_chunks_kernel_batched1(
     const float* __restrict__ partial_O,     // (B, H, C, D)
     const float* __restrict__ partial_m,     // (B, H, C)
     const float* __restrict__ partial_l,     // (B, H, C)
@@ -998,7 +998,7 @@ void flash_attn_decode_gpu_batch(
     int n_chunks   = (L + chunk_size - 1) / chunk_size;
 
     // threads per block (64..256) matching head_dim
-    int tpb = fa_next_pow2(head_dim);
+    int tpb = fa_next_pow21(head_dim);
     if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
     size_t shmem = (size_t)head_dim * sizeof(float);
 
@@ -1041,7 +1041,7 @@ void flash_attn_decode_gpu_batch(
     // Kernel 2: reduce (heads × batch)
     {
         dim3 grid2(n_attn_heads, batch_size), block2(tpb);
-        hipLaunchKernelGGL(flash_attn_reduce_chunks_kernel_batched, grid2, block2, 0, 0,
+        hipLaunchKernelGGL(flash_attn_reduce_chunks_kernel_batched1, grid2, block2, 0, 0,
                            partial_O, partial_m, partial_l,
                            attn_sinks_head, tb_batch,
                            head_dim, n_chunks, n_attn_heads);

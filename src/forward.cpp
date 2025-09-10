@@ -1,6 +1,7 @@
 #include "../include/model.hpp"
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
+#include "hip/continuous_batch_shims.hip"
 #include "hip/embed.hip"
 #include "hip/matvec.hip"
 #include "hip/moe.hip"
@@ -18,6 +19,84 @@
 #include <cstdlib>
 #include <cstring>
 #include <omp.h>
+
+// Timing infrastructure
+struct BatchForwardTimings {
+    double setup_time;
+    double embedding_time;
+    double layer_rmsnorm_time;
+    double qkv_projection_time;
+    double split_qkv_time;
+    double rope_time;
+    double attention_time;
+    double output_projection_time;
+    double residual_time;
+    double mlp_rmsnorm_time;
+    double moe_routing_time;
+    double expert_processing_time;
+    double final_ops_time;
+    double total_time;
+
+    int num_calls;
+    int total_layers;
+
+    BatchForwardTimings() { reset(); }
+
+    void reset() {
+        setup_time = embedding_time = layer_rmsnorm_time = qkv_projection_time = 0.0;
+        split_qkv_time = rope_time = attention_time = output_projection_time = 0.0;
+        residual_time = mlp_rmsnorm_time = moe_routing_time = expert_processing_time = 0.0;
+        final_ops_time = total_time = 0.0;
+        num_calls = total_layers = 0;
+    }
+
+    void print_summary() {
+        if (num_calls == 0)
+            return;
+
+        printf("%.*s\n", 60, "================================================================");
+        printf("BATCH FORWARD TIMING SUMMARY (%d calls, %d total layers)\n", num_calls,
+               total_layers);
+        printf("%.*s\n", 60, "================================================================");
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Setup & Memory", setup_time / num_calls,
+               100.0 * setup_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Embedding", embedding_time / num_calls,
+               100.0 * embedding_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Layer RMSNorm", layer_rmsnorm_time / num_calls,
+               100.0 * layer_rmsnorm_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "QKV Projection", qkv_projection_time / num_calls,
+               100.0 * qkv_projection_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Split QKV", split_qkv_time / num_calls,
+               100.0 * split_qkv_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "RoPE", rope_time / num_calls,
+               100.0 * rope_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Attention", attention_time / num_calls,
+               100.0 * attention_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Output Projection",
+               output_projection_time / num_calls, 100.0 * output_projection_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Residual", residual_time / num_calls,
+               100.0 * residual_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "MLP RMSNorm", mlp_rmsnorm_time / num_calls,
+               100.0 * mlp_rmsnorm_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "MoE Routing", moe_routing_time / num_calls,
+               100.0 * moe_routing_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Expert Processing",
+               expert_processing_time / num_calls, 100.0 * expert_processing_time / total_time);
+        printf("%-20s: %8.3f ms (%.1f%%)\n", "Final Operations", final_ops_time / num_calls,
+               100.0 * final_ops_time / total_time);
+        printf("%.*s\n", 60, "================================================================");
+        printf("%-20s: %8.3f ms\n", "TOTAL", total_time / num_calls);
+        printf("%.*s\n", 60, "================================================================");
+        fflush(stdout);
+    }
+};
+
+// Global timing instance
+static BatchForwardTimings g_batch_timings;
+
+void reset_batch_timings() { g_batch_timings.reset(); }
+
+void print_batch_timing_summary() { g_batch_timings.print_summary(); }
 
 // TODO: merge interface batch=1
 float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
@@ -166,8 +245,20 @@ float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
     return s->logits;
 }
 
-float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int pos, int batch_size,
-                            const int* batch_indices_h, int B_stride) {
+float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens,
+                            const int* pos_per_token_h, int batch_size, const int* batch_indices_h,
+                            int B_stride) {
+    // Create timing events
+    hipEvent_t start_total, end_total;
+    hipEvent_t start_section, end_section;
+    CHECK_HIP(hipEventCreate(&start_total));
+    CHECK_HIP(hipEventCreate(&end_total));
+    CHECK_HIP(hipEventCreate(&start_section));
+    CHECK_HIP(hipEventCreate(&end_section));
+
+    CHECK_HIP(hipEventRecord(start_total, 0));
+    CHECK_HIP(hipEventRecord(start_section, 0));
+
     OssConfig* p = &transformer->config;
     OssTransformerWeightsHalf* w = &transformer->weights;
     OssRunState* s = &transformer->state;
@@ -181,22 +272,42 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
     int n_experts = p->n_experts;
     size_t cos_sin_size = (head_dim / 2) * sizeof(float);
 
+    int max_pos_in_batch = 0;
+    for (int i = 0; i < batch_size; ++i)
+        if (pos_per_token_h[i] > max_pos_in_batch)
+            max_pos_in_batch = pos_per_token_h[i];
+
     CHECK_HIP(hipMemcpy(s->d_batch_indices, batch_indices_h, batch_size * sizeof(int),
                         hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(s->d_tokens, tokens, batch_size * sizeof(int), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(s->d_pos_per_token, pos_per_token_h, batch_size * sizeof(int),
+                        hipMemcpyHostToDevice));
+
+    // Record setup time
+    CHECK_HIP(hipEventRecord(end_section, 0));
+    CHECK_HIP(hipEventSynchronize(end_section));
+    float setup_ms;
+    CHECK_HIP(hipEventElapsedTime(&setup_ms, start_section, end_section));
+    g_batch_timings.setup_time += setup_ms;
 
     // ! Embedding
+    CHECK_HIP(hipEventRecord(start_section, 0));
     embed_batch_gpu(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
-
-    // ! Cosin
-    float ntk_beta = 32.0f;
-    float ntk_alpha = 1.0f;
-    compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                      p->initial_context_length, ntk_beta, ntk_alpha, s->cos_vals, s->sin_vals);
+    CHECK_HIP(hipEventRecord(end_section, 0));
+    CHECK_HIP(hipEventSynchronize(end_section));
+    float embedding_ms;
+    CHECK_HIP(hipEventElapsedTime(&embedding_ms, start_section, end_section));
+    g_batch_timings.embedding_time += embedding_ms;
 
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! RMSNorm
+        CHECK_HIP(hipEventRecord(start_section, 0));
         rmsnorm_batch_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float rmsnorm_ms;
+        CHECK_HIP(hipEventElapsedTime(&rmsnorm_ms, start_section, end_section));
+        g_batch_timings.layer_rmsnorm_time += rmsnorm_ms;
 
         // ! QKV project
         __half* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
@@ -204,42 +315,108 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
         __half* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
+        CHECK_HIP(hipEventRecord(start_section, 0));
         matvec_batch_gpu(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
                          (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float qkv_ms;
+        CHECK_HIP(hipEventElapsedTime(&qkv_ms, start_section, end_section));
+        g_batch_timings.qkv_projection_time += qkv_ms;
 
-        // ! Split QKV
-        split_qkv_batch_gpu(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim,
-                            p->n_attn_heads, p->n_kv_heads, l, pos, p->seq_len, s->d_batch_indices,
-                            B_stride);
+        // ! Split QKV -> write KV at each token's own pos
+        CHECK_HIP(hipEventRecord(start_section, 0));
+        split_qkv_batch_gpu_mixedpos(s->qkv, s->q, s->key_cache, s->value_cache, batch_size,
+                                     head_dim, p->n_attn_heads, p->n_kv_heads, l,
+                                     s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
+                                     /*stream=*/0, kv_dim);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float split_qkv_ms;
+        CHECK_HIP(hipEventElapsedTime(&split_qkv_ms, start_section, end_section));
+        g_batch_timings.split_qkv_time += split_qkv_ms;
 
-        // ! RoPE
-        rope_qk_fused_batch_gpu(s->q, s->key_cache, s->cos_vals, s->sin_vals, batch_size,
-                                p->n_attn_heads, p->n_kv_heads, head_dim, p->seq_len, kv_dim, l,
-                                pos, s->d_batch_indices, B_stride);
+        // ! RoPE (Q and K) per token
+        CHECK_HIP(hipEventRecord(start_section, 0));
+        {
+            const float ntk_beta = 32.0f;
+            const float ntk_alpha = 1.0f;
+            rope_qk_fused_batch_gpu_mixed(s->q, s->key_cache, batch_size, p->n_attn_heads,
+                                          p->n_kv_heads, head_dim, p->seq_len, kv_dim, l,
+                                          s->d_pos_per_token, s->d_batch_indices, B_stride,
+                                          p->rope_theta, p->rope_scaling_factor,
+                                          p->initial_context_length, ntk_beta, ntk_alpha,
+                                          /*stream=*/0);
+        }
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float rope_ms;
+        CHECK_HIP(hipEventElapsedTime(&rope_ms, start_section, end_section));
+        g_batch_timings.rope_time += rope_ms;
 
-        // ! GQA
-        flash_attn_decode_gpu_batch(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks,
-                                    s->tb, batch_size, pos, p->seq_len, head_dim, kv_dim, kv_mul,
-                                    p->sliding_window, l, p->n_attn_heads, s->d_batch_indices,
-                                    B_stride);
+        CHECK_HIP(hipEventRecord(start_section, 0));
+        flash_attn_decode_gpu_batch_mixed(
+            /*q_batch=*/s->q,                      // (B, H*D)
+            /*k_cache=*/(const void*)s->key_cache, // base; wrapper does layer/slot/pos math
+            /*v_cache=*/(const void*)s->value_cache,
+            /*mask=*/s->mask,             // (T, T)
+            /*attn_sinks=*/w->attn_sinks, // pass base; wrapper slices by layer
+            /*tb_batch=*/s->tb,           // (B, H*D) output
+            /*B=*/batch_size,
+            /*seq_len=*/p->seq_len,
+            /*head_dim=*/head_dim,
+            /*kv_dim=*/kv_dim,
+            /*kv_mul=*/kv_mul,
+            /*sliding_window=*/p->sliding_window,
+            /*layer_idx=*/(int)l,
+            /*n_attn_heads=*/p->n_attn_heads,
+            /*d_pos_per_token=*/s->d_pos_per_token, // (B) device
+            /*d_batch_indices=*/s->d_batch_indices, // (B) device
+            /*B_stride=*/(long long)B_stride,       // elements per (B*T*kv_dim) per layer
+            /*max_pos_in_batch=*/max_pos_in_batch,  // from host
+            /*stream=*/0);                          // ✅ (fixed typo)
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float attn_ms;
+        CHECK_HIP(hipEventElapsedTime(&attn_ms, start_section, end_section));
+        g_batch_timings.attention_time += attn_ms;
 
         // ! Output projection
         __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         __half* b_o = w->b_o + 1ll * l * hidden_dim;
 
+        CHECK_HIP(hipEventRecord(start_section, 0));
         matvec_batch_gpu(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads,
                          hidden_dim);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float out_proj_ms;
+        CHECK_HIP(hipEventElapsedTime(&out_proj_ms, start_section, end_section));
+        g_batch_timings.output_projection_time += out_proj_ms;
 
         // ! Residual
+        CHECK_HIP(hipEventRecord(start_section, 0));
         vec_add_vec_batch_gpu(x, s->tb2, 1.0f, batch_size, hidden_dim);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float residual_ms;
+        CHECK_HIP(hipEventElapsedTime(&residual_ms, start_section, end_section));
+        g_batch_timings.residual_time += residual_ms;
 
         // ! RMSNorm
+        CHECK_HIP(hipEventRecord(start_section, 0));
         rmsnorm_batch_gpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float mlp_rmsnorm_ms;
+        CHECK_HIP(hipEventElapsedTime(&mlp_rmsnorm_ms, start_section, end_section));
+        g_batch_timings.mlp_rmsnorm_time += mlp_rmsnorm_ms;
 
         // ! MoE Router
         __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         __half* b_router = w->b_router + 1ll * l * n_experts;
 
+        CHECK_HIP(hipEventRecord(start_section, 0));
         matvec_batch_gpu(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim,
                          n_experts);
 
@@ -248,6 +425,14 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
                        p->experts_per_token);
 
         softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float moe_routing_ms;
+        CHECK_HIP(hipEventElapsedTime(&moe_routing_ms, start_section, end_section));
+        g_batch_timings.moe_routing_time += moe_routing_ms;
+
+        // Expert processing timing
+        CHECK_HIP(hipEventRecord(start_section, 0));
 
         // Zero aggregation
         CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
@@ -369,15 +554,43 @@ float* forward_hybrid_batch(OssTransformerHybrid* transformer, int* tokens, int 
                 CHECK_HIP(hipStreamSynchronize(expert_streams[i]));
         }
 
+        // End expert processing timing
+        CHECK_HIP(hipEventRecord(end_section, 0));
+        CHECK_HIP(hipEventSynchronize(end_section));
+        float expert_processing_ms;
+        CHECK_HIP(hipEventElapsedTime(&expert_processing_ms, start_section, end_section));
+        g_batch_timings.expert_processing_time += expert_processing_ms;
+
         // Residual connection - batched
         vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
     }
 
     // Final operations - batched
+    CHECK_HIP(hipEventRecord(start_section, 0));
     rmsnorm_batch_gpu(x, x, w->rms_out_w, batch_size, hidden_dim);
 
     // Linear: classifier into logits - batched
     matvec_batch_gpu(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
+    CHECK_HIP(hipEventRecord(end_section, 0));
+    CHECK_HIP(hipEventSynchronize(end_section));
+    float final_ops_ms;
+    CHECK_HIP(hipEventElapsedTime(&final_ops_ms, start_section, end_section));
+    g_batch_timings.final_ops_time += final_ops_ms;
+
+    // Record total time
+    CHECK_HIP(hipEventRecord(end_total, 0));
+    CHECK_HIP(hipEventSynchronize(end_total));
+    float total_ms;
+    CHECK_HIP(hipEventElapsedTime(&total_ms, start_total, end_total));
+    g_batch_timings.total_time += total_ms;
+    g_batch_timings.num_calls++;
+    g_batch_timings.total_layers += p->n_layers;
+
+    // Cleanup events
+    CHECK_HIP(hipEventDestroy(start_total));
+    CHECK_HIP(hipEventDestroy(end_total));
+    CHECK_HIP(hipEventDestroy(start_section));
+    CHECK_HIP(hipEventDestroy(end_section));
 
     return s->logits;
 }

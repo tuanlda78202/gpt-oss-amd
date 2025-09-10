@@ -165,6 +165,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
 
     CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.d_tokens, (size_t)batch_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.d_pos_per_token, (size_t)batch_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
 
@@ -343,6 +344,7 @@ void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.mask));
     CHECK_HIP(hipFree(t_d->state.d_batch_indices));
     CHECK_HIP(hipFree(t_d->state.d_tokens));
+    CHECK_HIP(hipFree(t_d->state.d_pos_per_token));
     CHECK_HIP(hipFree(t_d->state.cos_vals));
     CHECK_HIP(hipFree(t_d->state.sin_vals));
 

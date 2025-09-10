@@ -164,6 +164,7 @@ typedef struct {
 
     int* d_batch_indices; // (max_batch_size) - persistent GPU batch indices
     int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
+    int* d_pos_per_token; // (max_batch_size) - persistent GPU positions per token
     float* cos_vals;      // (head_dim/2) - persistent RoPE cos coefficients
     float* sin_vals;      // (head_dim/2) - persistent RoPE sin coefficients
 
