@@ -256,7 +256,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     }
 
     // ! TODO: remember remove verification later
-    const char* ground_truth_file = "tests/gt/output.txt";
+    const char* ground_truth_file = "tests/gt/output_20b.txt";
     int verification_result = verify_output(output_filename, ground_truth_file);
 
     // ! Finish

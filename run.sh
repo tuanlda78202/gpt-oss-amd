@@ -136,7 +136,7 @@ usage() {
   echo -e "  ${GREEN}./run.sh decode [-i OUTPUT_FILE] [-l]${NC}"
   echo ""
   echo -e "  ${CYAN}Features:${NC}"
-  echo -e "    • Default input: ${WHITE}tests/gt/output.txt${NC} (GT file)"
+  echo -e "    • Default input: ${WHITE}tests/gt/output_20b.txt${NC} (GT file)"
   echo -e "    • ${WHITE}-l${NC} flag saves decoded output to ${WHITE}gt_decoded.txt${NC}"
   echo ""
   echo -e "${CYAN} TOKENIZER COMMANDS:${NC}"
@@ -384,7 +384,7 @@ cmd_all() {
 }
 
 cmd_decode() {
-  local infile="tests/gt/output.txt"
+  local infile="tests/gt/output_20b.txt"
   local log_output=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -395,7 +395,7 @@ cmd_decode() {
     esac
   done
   print_header "${BLUE}" "DECODE"
-  print_kv "input(-i)" "${infile}" "$([[ "${infile}" == "tests/gt/output.txt" ]] && echo "(run.sh default GT)" || echo "(provided)")"
+  print_kv "input(-i)" "${infile}" "$([[ "${infile}" == "tests/gt/output_20b.txt" ]] && echo "(run.sh default GT)" || echo "(provided)")"
   print_kv "logging(-l)" "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to gt_decoded.txt)" || echo "(disabled)")"
   print_step "make decode"
   print_executing "make decode"

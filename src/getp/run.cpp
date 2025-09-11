@@ -243,7 +243,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
 
     // Calculate max tokens for each sequence
     for (int b = 0; b < batch_size; b++) {
-        max_generation_tokens[b] = steps - num_prompt_tokens[b];
+        max_generation_tokens[b] = steps - 1 - num_prompt_tokens[b];
         if (max_generation_tokens[b] < 0)
             max_generation_tokens[b] = 0;
     }
@@ -262,7 +262,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
 
         // Continuous batching: collect ANY ready tokens (mixed positions allowed!)
         for (int b = 0; b < batch_size && valid_batch_size < batch_size; b++) {
-            if (!finished[b] && pos[b] < steps) {
+            if (!finished[b] && pos[b] + 1 < steps) {
                 batch_tokens[valid_batch_size] = current_tokens[b];
                 batch_positions[valid_batch_size] = pos[b];
                 batch_indices[valid_batch_size] = b;
@@ -322,7 +322,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
             }
 
             // Check for termination
-            if (next_token == 199999 || next_token == 200002 || pos[b] >= steps) {
+            if (next_token == 199999 || next_token == 200002 || pos[b] + 1 >= steps) {
                 finished[b] = true;
                 active_sequences--;
                 if (output_tokens_batch[b]) {
