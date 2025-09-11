@@ -111,7 +111,7 @@ __global__ void fa_reduce_kernel(
     const float* __restrict__ partial_O,     // (B,H,C,D)
     const float* __restrict__ partial_m,     // (B,H,C)
     const float* __restrict__ partial_l,     // (B,H,C)
-    const __half* __restrict__ attn_sinks_half, // (H)
+    const __hip_bfloat16* __restrict__ attn_sinks_half, // (H)
     float* __restrict__ tb_batch,            // (B,H*D)
     int head_dim, int n_chunks, int n_attn_heads
 ) {
@@ -152,7 +152,7 @@ __global__ void fa_reduce_kernel(
     }
 
     if (attn_sinks_half != nullptr) {
-        float sink_s = __half2float(attn_sinks_half[h]);
+        float sink_s = __bfloat162float(attn_sinks_half[h]);
         if (isfinite(sink_s)) {
             const float m_prev = m; const float l_prev = l;
             const float m_new  = fmaxf(m_prev, sink_s);
@@ -179,7 +179,7 @@ void fa(
     const void*  k_cache,      // base pointer
     const void*  v_cache,      // base pointer
     const float* mask,         // (T, T)
-    const __half* attn_sinks,  // (L, H) — pass attn_sinks + layer_idx*H
+    const __hip_bfloat16* attn_sinks,  // (L, H) — pass attn_sinks + layer_idx*H
     float* tb_batch,           // (B, H*D)
     int B,
     int seq_len, int head_dim, int kv_dim, int kv_mul,
@@ -198,7 +198,7 @@ void fa(
 
     int tpb = fa_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
     size_t shmem = (size_t)head_dim * sizeof(float);
-    const __half* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
+    const __hip_bfloat16* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
 
     // Workspace (TODO: reuse allocator if you have one)
     float* partial_O; float* partial_m; float* partial_l;

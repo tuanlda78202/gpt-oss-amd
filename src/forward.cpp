@@ -37,7 +37,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
     }
 
     OssConfig* p = &transformer->config;
-    OssTransformerWeightsHalf* w = &transformer->weights;
+    OssTransformerWeightsBFloat16* w = &transformer->weights;
     OssRunState* s = &transformer->state;
 
     float* x = s->x;
@@ -96,9 +96,10 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
 
         // ! QKV project
-        __half* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
-                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-        __half* b_qkv =
+        __hip_bfloat16* w_qkv =
+            w->w_qkv +
+            1ll * l * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+        __hip_bfloat16* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
         if (g_enable_profiling) {
@@ -168,8 +169,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
 
         // ! Output projection
-        __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
-        __half* b_o = w->b_o + 1ll * l * hidden_dim;
+        __hip_bfloat16* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+        __hip_bfloat16* b_o = w->b_o + 1ll * l * hidden_dim;
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
@@ -210,8 +211,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
 
         // ! MoE Router
-        __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
-        __half* b_router = w->b_router + 1ll * l * n_experts;
+        __hip_bfloat16* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
+        __hip_bfloat16* b_router = w->b_router + 1ll * l * n_experts;
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));

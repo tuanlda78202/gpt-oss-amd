@@ -1,6 +1,6 @@
 #include "../include/model.hpp"
 
-void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
+void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
 
@@ -12,7 +12,7 @@ void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size
     }
 
     // Allocate temporary conversion buffer
-    __half* conversion_buffer = (__half*)malloc(chunk_size);
+    __hip_bfloat16* conversion_buffer = (__hip_bfloat16*)malloc(chunk_size);
     if (!conversion_buffer) {
         fprintf(stderr, "Failed to allocate conversion buffer for %s\n", tensor_name);
         exit(EXIT_FAILURE);
@@ -20,17 +20,17 @@ void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size
 
     size_t bytes_processed = 0;
     size_t chunks_processed = 0;
-    size_t total_elements = total_size / sizeof(__half);
+    size_t total_elements = total_size / sizeof(__hip_bfloat16);
 
     while (bytes_processed < total_size) {
         size_t current_chunk_bytes = (total_size - bytes_processed < chunk_size)
                                          ? (total_size - bytes_processed)
                                          : chunk_size;
-        size_t current_chunk_elements = current_chunk_bytes / sizeof(__half);
+        size_t current_chunk_elements = current_chunk_bytes / sizeof(__hip_bfloat16);
 
-        size_t element_offset = bytes_processed / sizeof(__half);
+        size_t element_offset = bytes_processed / sizeof(__hip_bfloat16);
         for (size_t i = 0; i < current_chunk_elements; i++) {
-            conversion_buffer[i] = __float2half(h_ptr[element_offset + i]);
+            conversion_buffer[i] = __float2bfloat16(h_ptr[element_offset + i]);
         }
 
         // Transfer converted chunk directly to GPU
@@ -53,8 +53,8 @@ void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size
     }
 }
 
-// ! Hybrid precision (FP16 weights + FP32 activations)
-void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHybrid* t_d) {
+// ! Hybrid precision (BF16 weights + FP32 activations)
+void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d) {
     memcpy(&t_d->config, &t_fp32->config, sizeof(OssConfig));
 
     OssConfig* conf = &t_fp32->config;
@@ -86,44 +86,50 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     printf("GPU %d (%s): %.1f GB free / %.1f GB total\n", current_device, deviceProp.name,
            free_mem / (1024.0 * 1024.0 * 1024.0), total_mem / (1024.0 * 1024.0 * 1024.0));
 
-    // ! Allocate FP16 weights on GPU
-    size_t token_emb_size = (size_t)vocab_size * hidden_dim * sizeof(__half);
+    // ! Allocate BF16 weights on GPU
+    size_t token_emb_size = (size_t)vocab_size * hidden_dim * sizeof(__hip_bfloat16);
     size_t mlp1_size =
-        1ll * n_layers * n_experts * 2 * intermediate_dim * hidden_dim * sizeof(__half);
-    size_t mlp2_size = 1ll * n_layers * n_experts * hidden_dim * intermediate_dim * sizeof(__half);
+        1ll * n_layers * n_experts * 2 * intermediate_dim * hidden_dim * sizeof(__hip_bfloat16);
+    size_t mlp2_size =
+        1ll * n_layers * n_experts * hidden_dim * intermediate_dim * sizeof(__hip_bfloat16);
 
     CHECK_HIP(hipMalloc(&t_d->weights.token_embedding_table, token_emb_size));
-    CHECK_HIP(hipMalloc(&t_d->weights.rms_attn_w, (size_t)n_layers * hidden_dim * sizeof(__half)));
-    CHECK_HIP(hipMalloc(&t_d->weights.rms_ffn_w, (size_t)n_layers * hidden_dim * sizeof(__half)));
+    CHECK_HIP(hipMalloc(&t_d->weights.rms_attn_w,
+                        (size_t)n_layers * hidden_dim * sizeof(__hip_bfloat16)));
+    CHECK_HIP(
+        hipMalloc(&t_d->weights.rms_ffn_w, (size_t)n_layers * hidden_dim * sizeof(__hip_bfloat16)));
 
     size_t qkv_size = (size_t)n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) *
-                      hidden_dim * sizeof(__half);
+                      hidden_dim * sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.w_qkv, qkv_size));
 
-    size_t w_o_size = (size_t)n_layers * hidden_dim * head_dim * n_attn_heads * sizeof(__half);
+    size_t w_o_size =
+        (size_t)n_layers * hidden_dim * head_dim * n_attn_heads * sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.w_o, w_o_size));
 
-    size_t b_qkv_size =
-        (size_t)n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(__half);
+    size_t b_qkv_size = (size_t)n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) *
+                        sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.b_qkv, b_qkv_size));
-    CHECK_HIP(hipMalloc(&t_d->weights.b_o, (size_t)n_layers * hidden_dim * sizeof(__half)));
-    CHECK_HIP(
-        hipMalloc(&t_d->weights.attn_sinks, (size_t)n_layers * n_attn_heads * sizeof(__half)));
+    CHECK_HIP(hipMalloc(&t_d->weights.b_o, (size_t)n_layers * hidden_dim * sizeof(__hip_bfloat16)));
+    CHECK_HIP(hipMalloc(&t_d->weights.attn_sinks,
+                        (size_t)n_layers * n_attn_heads * sizeof(__hip_bfloat16)));
 
-    size_t router_size = (size_t)n_layers * hidden_dim * n_experts * sizeof(__half);
+    size_t router_size = (size_t)n_layers * hidden_dim * n_experts * sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.w_router, router_size));
-    CHECK_HIP(hipMalloc(&t_d->weights.b_router, (size_t)n_layers * n_experts * sizeof(__half)));
+    CHECK_HIP(
+        hipMalloc(&t_d->weights.b_router, (size_t)n_layers * n_experts * sizeof(__hip_bfloat16)));
 
     CHECK_HIP(hipMalloc(&t_d->weights.w_mlp1, mlp1_size));
     CHECK_HIP(hipMalloc(&t_d->weights.w_mlp2, mlp2_size));
 
-    size_t b_mlp1_size = (size_t)n_layers * n_experts * 2 * intermediate_dim * sizeof(__half);
-    size_t b_mlp2_size = (size_t)n_layers * n_experts * hidden_dim * sizeof(__half);
+    size_t b_mlp1_size =
+        (size_t)n_layers * n_experts * 2 * intermediate_dim * sizeof(__hip_bfloat16);
+    size_t b_mlp2_size = (size_t)n_layers * n_experts * hidden_dim * sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.b_mlp1, b_mlp1_size));
     CHECK_HIP(hipMalloc(&t_d->weights.b_mlp2, b_mlp2_size));
 
-    CHECK_HIP(hipMalloc(&t_d->weights.rms_out_w, (size_t)hidden_dim * sizeof(__half)));
-    size_t out_size = (size_t)vocab_size * hidden_dim * sizeof(__half);
+    CHECK_HIP(hipMalloc(&t_d->weights.rms_out_w, (size_t)hidden_dim * sizeof(__hip_bfloat16)));
+    size_t out_size = (size_t)vocab_size * hidden_dim * sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.out, out_size));
 
     // ! Allocate FP32 state on GPU (with batch dimension B)
@@ -202,7 +208,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     copy_large_tensor_streaming(&t_d->weights.out, weights->out, out_size, "out");
 
     // Convert small tensors directly
-    __half* small_buffer = (__half*)malloc(1024 * 1024 * sizeof(__half));
+    __hip_bfloat16* small_buffer = (__hip_bfloat16*)malloc(1024 * 1024 * sizeof(__hip_bfloat16));
     if (!small_buffer) {
         fprintf(stderr, "Failed to allocate small conversion buffer\n");
         exit(EXIT_FAILURE);
@@ -211,48 +217,48 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     // Convert and copy small weights
     size_t rms_size = n_layers * hidden_dim;
     for (size_t i = 0; i < rms_size; i++) {
-        small_buffer[i] = __float2half(weights->rms_attn_w[i]);
+        small_buffer[i] = __float2bfloat16(weights->rms_attn_w[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.rms_attn_w, small_buffer, rms_size * sizeof(__half),
+    CHECK_HIP(hipMemcpy(t_d->weights.rms_attn_w, small_buffer, rms_size * sizeof(__hip_bfloat16),
                         hipMemcpyHostToDevice));
 
     for (size_t i = 0; i < rms_size; i++) {
-        small_buffer[i] = __float2half(weights->rms_ffn_w[i]);
+        small_buffer[i] = __float2bfloat16(weights->rms_ffn_w[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.rms_ffn_w, small_buffer, rms_size * sizeof(__half),
+    CHECK_HIP(hipMemcpy(t_d->weights.rms_ffn_w, small_buffer, rms_size * sizeof(__hip_bfloat16),
                         hipMemcpyHostToDevice));
 
     size_t b_qkv_elements = n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads);
     for (size_t i = 0; i < b_qkv_elements; i++) {
-        small_buffer[i] = __float2half(weights->b_qkv[i]);
+        small_buffer[i] = __float2bfloat16(weights->b_qkv[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.b_qkv, small_buffer, b_qkv_elements * sizeof(__half),
+    CHECK_HIP(hipMemcpy(t_d->weights.b_qkv, small_buffer, b_qkv_elements * sizeof(__hip_bfloat16),
                         hipMemcpyHostToDevice));
 
     for (size_t i = 0; i < rms_size; i++) {
-        small_buffer[i] = __float2half(weights->b_o[i]);
+        small_buffer[i] = __float2bfloat16(weights->b_o[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.b_o, small_buffer, rms_size * sizeof(__half),
+    CHECK_HIP(hipMemcpy(t_d->weights.b_o, small_buffer, rms_size * sizeof(__hip_bfloat16),
                         hipMemcpyHostToDevice));
 
     size_t attn_sinks_elements = n_layers * n_attn_heads;
     for (size_t i = 0; i < attn_sinks_elements; i++) {
-        small_buffer[i] = __float2half(weights->attn_sinks[i]);
+        small_buffer[i] = __float2bfloat16(weights->attn_sinks[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.attn_sinks, small_buffer, attn_sinks_elements * sizeof(__half),
-                        hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(t_d->weights.attn_sinks, small_buffer,
+                        attn_sinks_elements * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
 
     size_t b_router_elements = n_layers * n_experts;
     for (size_t i = 0; i < b_router_elements; i++) {
-        small_buffer[i] = __float2half(weights->b_router[i]);
+        small_buffer[i] = __float2bfloat16(weights->b_router[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.b_router, small_buffer, b_router_elements * sizeof(__half),
-                        hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(t_d->weights.b_router, small_buffer,
+                        b_router_elements * sizeof(__hip_bfloat16), hipMemcpyHostToDevice));
 
     for (size_t i = 0; i < (size_t)hidden_dim; i++) {
-        small_buffer[i] = __float2half(weights->rms_out_w[i]);
+        small_buffer[i] = __float2bfloat16(weights->rms_out_w[i]);
     }
-    CHECK_HIP(hipMemcpy(t_d->weights.rms_out_w, small_buffer, hidden_dim * sizeof(__half),
+    CHECK_HIP(hipMemcpy(t_d->weights.rms_out_w, small_buffer, hidden_dim * sizeof(__hip_bfloat16),
                         hipMemcpyHostToDevice));
 
     free(small_buffer);
@@ -300,11 +306,11 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
            used_mem / (1024.0 * 1024.0 * 1024.0));
 }
 
-void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d) {
+void free_transformer_on_device(OssTransformerHybrid* t_d) {
     printf("\033[1;92m==================================================================\033["
            "0m\n\033[1;92m♻️  FREE GPU MEMORY...\033[0m\n");
 
-    // Free FP16 weights
+    // Free BF16 weights
     CHECK_HIP(hipFree(t_d->weights.token_embedding_table));
     CHECK_HIP(hipFree(t_d->weights.rms_attn_w));
     CHECK_HIP(hipFree(t_d->weights.rms_ffn_w));
