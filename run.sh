@@ -94,7 +94,7 @@ usage() {
   echo ""
   echo -e "${RED}🏃‍♂️ RUN COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
   echo ""
   echo -e "  ${CYAN}Key Features:${NC}"
   echo -e "    • Default checkpoint: ${WHITE}${MODELBIN_ROOT}/gpt-oss-20b.bin${NC}"
@@ -103,13 +103,17 @@ usage() {
   echo -e "    • Logging: Save output to ${WHITE}log.txt${NC} with -l flag"
   echo -e "    • Profiling: Enable forward timing with ${WHITE}-f${NC} flag"
   echo ""
+  echo -e "  ${CYAN}Model Selection Shortcuts:${NC}"
+  echo -e "    ${WHITE}-m 20${NC}   - Auto-select 20B model (${MODELBIN_ROOT}/gpt-oss-20b.bin, tests/gt/output_20b.txt)"
+  echo -e "    ${WHITE}-m 120${NC}  - Auto-select 120B model (${MODELBIN_ROOT}/gpt-oss-120b.bin, tests/gt/output_120b.txt)"
+  echo ""
   echo -e "  ${CYAN}Mode-specific defaults for getp:${NC}"
   echo -e "    • Input defaults to: ${WHITE}tests/data/input.txt${NC}"
   echo -e "    • Output defaults to: ${WHITE}tests/data/output.txt${NC}"
   echo ""
   echo -e "  ${CYAN}Parameters:${NC}"
   echo -e "    ${WHITE}-c, --checkpoint PATH${NC}  Specify model checkpoint"
-  echo -e "    ${WHITE}-m MODE${NC}                Set run mode (default: getp)"
+  echo -e "    ${WHITE}-m MODE${NC}                Set run mode (default: getp) or model size (20/120)"
   echo -e "    ${WHITE}-i INPUT${NC}               Input file path"
   echo -e "    ${WHITE}-o OUTPUT${NC}              Output file path"
   echo -e "    ${WHITE}-z TOKENIZER${NC}           Tokenizer path"
@@ -122,10 +126,11 @@ usage() {
   echo -e "    ${WHITE}-g N_GPUS${NC}              Number of GPUs to request (default: 1)"
   echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 2)"
   echo -e "    ${WHITE}-f${NC}                     Enable forward pass profiling (shows timing breakdown)"
+  echo -e "    ${WHITE}-v VERIFY_FILE${NC}         Ground truth file for verification (default: tests/gt/output_20b.txt)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE]${NC}"
+  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
   echo ""
   echo -e "  ${CYAN}Features:${NC}"
   echo -e "    • Combines: ${WHITE}./run.sh build && ./run.sh run${NC}"
@@ -155,8 +160,14 @@ usage() {
   echo -e "  ${WHITE}log.txt${NC}                    # Output log (when using -l flag)"
   echo ""
   echo -e "${GREEN}📊 EXAMPLE USAGE:${NC}"
-  echo -e "  ${CYAN}# Basic getp mode with 1 GPU${NC}"
+  echo -e "  ${CYAN}# Basic getp mode with 1 GPU (default 20B model)${NC}"
   echo -e "  ${GREEN}./run.sh run${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Use 20B model explicitly${NC}"
+  echo -e "  ${GREEN}./run.sh run -m 20${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Use 120B model with 4 GPUs${NC}"
+  echo -e "  ${GREEN}./run.sh run -m 120 -g 4${NC}"
   echo ""
   echo -e "  ${CYAN}# Getp mode with profiling and logging${NC}"
   echo -e "  ${GREEN}./run.sh run -f -l${NC}"
@@ -258,6 +269,7 @@ cmd_run() {
   local n_gpus="1"
   local batch_size=""
   local enable_profiling=""
+  local verify_file=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -275,10 +287,25 @@ cmd_run() {
       -g) n_gpus="$2"; shift 2 ;;
       -b) batch_size="$2"; shift 2 ;;
       -f) enable_profiling="1"; shift 1 ;;
+      -v) verify_file="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
   done
+
+  # Handle model size shortcuts (20/120) for mode
+  local model_size=""
+  if [[ "${mode}" == "20" ]]; then
+    model_size="20b"
+    mode="getp"
+    [[ -z "${ckpt}" ]] && ckpt="${MODELBIN_ROOT}/gpt-oss-20b.bin"
+    [[ -z "${verify_file}" ]] && verify_file="tests/gt/output_20b.txt"
+  elif [[ "${mode}" == "120" ]]; then
+    model_size="120b"
+    mode="getp"
+    [[ -z "${ckpt}" ]] && ckpt="${MODELBIN_ROOT}/gpt-oss-120b.bin"
+    [[ -z "${verify_file}" ]] && verify_file="tests/gt/output_120b.txt"
+  fi
 
   ckpt="$(find_checkpoint "${ckpt}")"
   if [[ -z "${ckpt}" ]]; then
@@ -293,21 +320,28 @@ cmd_run() {
   if [[ "${mode}" == "getp" ]]; then
     [[ -z "${inp}" ]] && inp="tests/data/input.txt"
     [[ -z "${out}" ]] && out="tests/data/output.txt"
+    [[ -z "${verify_file}" ]] && verify_file="tests/gt/output_20b.txt"
   fi
 
   print_header "${RED}" "RUN"
   print_kv "cwd"           "$(pwd)"
   print_kv "MODELBIN_ROOT" "${MODELBIN_ROOT:-<unset>}"
   print_kv "checkpoint"    "${ckpt}"
-  print_kv "mode"          "${mode}" "$([[ "${mode}" == "getp" ]] && echo "(default)" || echo "(provided)")"
+  print_kv "mode"          "${mode}" "$([[ "${mode}" == "getp" && -z "${model_size}" ]] && echo "(default)" || [[ -n "${model_size}" ]] && echo "(${model_size} model)" || echo "(provided)")"
   print_kv "gpus(-g)"      "${n_gpus}" "$([[ "${n_gpus}" == "1" ]] && echo "(default)" || echo "(requested)")"
 
   if [[ "${mode}" == "getp" ]]; then
     print_kv "input(-i)"  "${inp}"  "$([[ "${inp}" == "tests/data/input.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
     print_kv "output(-o)" "${out}"  "$([[ "${out}" == "tests/data/output.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
+    if [[ -n "${model_size}" ]]; then
+      print_kv "verify(-v)" "${verify_file}"  "(${model_size} model default)"
+    else
+      print_kv "verify(-v)" "${verify_file}"  "$([[ "${verify_file}" == "tests/gt/output_20b.txt" ]] && echo "(run.sh default for getp)" || echo "(provided)")"
+    fi
   else
     [[ -n "${inp:-}"  ]] && print_kv "input(-i)"  "${inp}" "(provided)"
     [[ -n "${out:-}"  ]] && print_kv "output(-o)" "${out}" "(provided)"
+    [[ -n "${verify_file:-}" ]] && print_kv "verify(-v)" "${verify_file}" "(provided)"
   fi
   print_kv "tokenizer(-z)" "${tok:-<unset>}"
   print_kv "system(-y)"    "${sys:-<unset>}"
@@ -337,6 +371,7 @@ cmd_run() {
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
   [[ -n "${batch_size}" ]] && args+=(-b "${batch_size}")
   [[ -n "${enable_profiling}" ]] && args+=(-f "1")
+  [[ -n "${verify_file}" ]] && args+=(-v "${verify_file}")
 
   local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"

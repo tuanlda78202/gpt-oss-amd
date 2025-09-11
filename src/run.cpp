@@ -1095,6 +1095,8 @@ void error_usage() {
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     fprintf(stderr, "  -b <int>    batch size for getp mode, default 2\n");
     fprintf(stderr, "  -f <0|1>    enable forward profiling (0=off, 1=on), default 0\n");
+    fprintf(stderr, "  -v <string> verification/ground truth file for getp mode, default "
+                    "tests/gt/output_20b.txt\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1111,8 +1113,9 @@ int main(int argc, char** argv) {
     char* system_prompt = NULL;      // the (optional) system prompt to use in chat mode
     char* input_filename = NULL;
     char* output_filename = NULL;
-    int batch_size = 2;       // batch size for getp mode, default 2
-    int enable_profiling = 0; // profiling flag, default off
+    int batch_size = 2;           // batch size for getp mode, default 2
+    int enable_profiling = 0;     // profiling flag, default off
+    char* verify_filename = NULL; // verification file for getp mode
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1156,6 +1159,8 @@ int main(int argc, char** argv) {
             batch_size = atoi(argv[i + 1]);
         } else if (argv[i][1] == 'f') {
             enable_profiling = atoi(argv[i + 1]);
+        } else if (argv[i][1] == 'v') {
+            verify_filename = argv[i + 1];
         } else {
             error_usage();
         }
@@ -1199,8 +1204,8 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
-        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps,
-             batch_size);
+        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps, batch_size,
+             verify_filename);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

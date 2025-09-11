@@ -209,7 +209,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
 }
 
 void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* input_filename,
-          char* output_filename, int steps, int batch_size) {
+          char* output_filename, int steps, int batch_size, char* verify_filename) {
     // ! I/O
     Requests requests;
     int num_reqs;
@@ -255,8 +255,8 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
         exit(EXIT_FAILURE);
     }
 
-    // ! TODO: remember remove verification later
-    const char* ground_truth_file = "tests/gt/output_20b.txt";
+    // ! Verification with configurable ground truth file
+    const char* ground_truth_file = verify_filename ? verify_filename : "tests/gt/output_20b.txt";
     int verification_result = verify_output(output_filename, ground_truth_file);
 
     // ! Finish
