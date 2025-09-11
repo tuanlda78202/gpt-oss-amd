@@ -1,12 +1,12 @@
 #include "BLAS.hip"
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 
 template <int RB, int KTILE>
-__global__ void matvec_kernel(const __half* __restrict__ A_half,
+__global__ void matvec_kernel(const __hip_bfloat16* __restrict__ A_half,
                                           const float* __restrict__ B_batch,
                                           float* __restrict__ C_batch,
-                                          const __half* __restrict__ bias,
+                                          const __hip_bfloat16* __restrict__ bias,
                                           int batch_size, int M, int K) {
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -43,10 +43,10 @@ __global__ void matvec_kernel(const __half* __restrict__ A_half,
         for (int j4 = lane; j4 < vecRow; j4 += warpSize) {
             const int j = j4 << 2;
 
-            half2 a0 = *reinterpret_cast<const half2*>(&A_half[a_base + k0 + j + 0]);
-            half2 a1 = *reinterpret_cast<const half2*>(&A_half[a_base + k0 + j + 2]);
-            float2 af0 = __half22float2(a0);
-            float2 af1 = __half22float2(a1);
+            __hip_bfloat162 a0 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base + k0 + j + 0]);
+            __hip_bfloat162 a1 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base + k0 + j + 2]);
+            float2 af0 = __bfloat1622float2(a0);
+            float2 af1 = __bfloat1622float2(a1);
             float4 bv = *reinterpret_cast<const float4*>(&sB[j]);
 
             acc = fmaf(af0.x, bv.x, acc);
@@ -56,7 +56,7 @@ __global__ void matvec_kernel(const __half* __restrict__ A_half,
         }
         for (int j = (vecRow << 2) + lane; j < Ktile; j += warpSize) {
             float b = sB[j];
-            float a = __half2float(A_half[a_base + k0 + j]);
+            float a = __bfloat162float(A_half[a_base + k0 + j]);
             acc = fmaf(a, b, acc);
         }
         __syncthreads();
@@ -65,14 +65,14 @@ __global__ void matvec_kernel(const __half* __restrict__ A_half,
     acc = warp_reduce_sum_64(acc);
 
     if (lane == 0) {
-        float badd = bias ? __half2float(bias[row]) : 0.0f;
+        float badd = bias ? __bfloat162float(bias[row]) : 0.0f;
         C[row] = acc + badd;
     }
 }
 
 static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-void matvec(float* xout, float* x_batch, __half* w, __half* bias,
+void matvec(float* xout, float* x_batch, __hip_bfloat16* w, __hip_bfloat16* bias,
                       int batch_size, int K /*d*/, int M /*n*/) {
     constexpr int RB    = 8;     // rows per block
     constexpr int KTILE = 2048;  // K tile

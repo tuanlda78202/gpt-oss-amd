@@ -23,7 +23,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
 
     transformer_oss->config.batch_size = batch_size;
 
-    copy_transformer_to_device_hybrid(transformer_oss, t_d);
+    copy_transformer_to_device(transformer_oss, t_d);
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
@@ -41,7 +41,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
     print_batch_timing_summary();
 
-    free_transformer_on_device_hybrid(t_d);
+    free_transformer_on_device(t_d);
     free(t_d);
 
     size_t free_mem, total_mem;

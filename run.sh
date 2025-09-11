@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${MODELBIN_ROOT:=/gpu_trainee/final-project/modelbin}"
+: "${MODELBIN_ROOT:=/nfs/gpu_trainee/final-project/modelbin}"
 export MODELBIN_ROOT
 export OMP_NUM_THREADS=96
 

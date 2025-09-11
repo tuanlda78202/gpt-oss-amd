@@ -1,6 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 
 // ! Multi-expert MatVec
 template <int RB, int KTILE>
@@ -9,8 +9,8 @@ __global__ void moe_matvec_kernel(
     int work_start, int work_count,       // slice (per stream)
     const float* __restrict__ x_by_expert,// [sum Ne, K]
     float* __restrict__ out_by_expert,    // [sum Ne, M]
-    const __half* __restrict__ weights_base, // expert 0 base
-    const __half* __restrict__ bias_base,    // expert 0 base (nullable)
+    const __hip_bfloat16* __restrict__ weights_base, // expert 0 base
+    const __hip_bfloat16* __restrict__ bias_base,    // expert 0 base (nullable)
     int K, int M,
     long long expert_weight_stride,
     long long expert_bias_stride)
@@ -23,8 +23,8 @@ __global__ void moe_matvec_kernel(
     const int off = work_queue[q + 1];
     const int Ne  = work_queue[q + 2];
 
-    const __half* __restrict__ A_half = weights_base + (long long)e * expert_weight_stride;
-    const __half* __restrict__ bias   = bias_base ? (bias_base + (long long)e * expert_bias_stride) : nullptr;
+    const __hip_bfloat16* __restrict__ A_half = weights_base + (long long)e * expert_weight_stride;
+    const __hip_bfloat16* __restrict__ bias   = bias_base ? (bias_base + (long long)e * expert_bias_stride) : nullptr;
 
     const float* __restrict__ B_batch = x_by_expert + (long long)off * K;
     float*       __restrict__ C_batch = out_by_expert + (long long)off * M;
@@ -65,10 +65,10 @@ __global__ void moe_matvec_kernel(
         for (int j4 = lane; j4 < vecRow; j4 += 64) {
             const int j = j4 << 2;
 
-            half2 a0 = *reinterpret_cast<const half2*>(&A_half[a_base + k0 + j + 0]);
-            half2 a1 = *reinterpret_cast<const half2*>(&A_half[a_base + k0 + j + 2]);
-            float2 af0 = __half22float2(a0);
-            float2 af1 = __half22float2(a1);
+            __hip_bfloat162 a0 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base + k0 + j + 0]);
+            __hip_bfloat162 a1 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base + k0 + j + 2]);
+            float2 af0 = __bfloat1622float2(a0);
+            float2 af1 = __bfloat1622float2(a1);
 
             float4 bv = *reinterpret_cast<const float4*>(&sB[j]);
             acc = fmaf(af0.x, bv.x, acc);
@@ -78,7 +78,7 @@ __global__ void moe_matvec_kernel(
         }
         for (int j = (vecRow << 2) + lane; j < Ktile; j += 64) {
             const float b = sB[j];
-            const float a = __half2float(A_half[a_base + k0 + j]);
+            const float a = __bfloat162float(A_half[a_base + k0 + j]);
             acc = fmaf(a, b, acc);
         }
         __syncthreads();
@@ -87,7 +87,7 @@ __global__ void moe_matvec_kernel(
     acc = warp_reduce_sum_64(acc);
 
     if (lane == 0) {
-        float badd = bias ? __half2float(bias[row]) : 0.0f;
+        float badd = bias ? __bfloat162float(bias[row]) : 0.0f;
         C[row] = acc + badd;
     }
 }
@@ -95,7 +95,7 @@ __global__ void moe_matvec_kernel(
 inline void moe_matvec(
     const int* work_queue, int work_start, int work_count,
     const float* x_by_expert, float* out_by_expert,
-    const __half* weights_base, const __half* bias_base,
+    const __hip_bfloat16* weights_base, const __hip_bfloat16* bias_base,
     int K, int M, long long expert_weight_stride, long long expert_bias_stride,
     int maxNe, hipStream_t stream)
 {
