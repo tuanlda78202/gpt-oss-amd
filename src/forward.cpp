@@ -1,18 +1,16 @@
 #include "../include/model.hpp"
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
-#include "hip/continuous_batch_shims.hip"
 #include "hip/embed.hip"
 #include "hip/matvec.hip"
 #include "hip/moe.hip"
-#include "hip/prim_add.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
 #include "hip/scheduler.hip"
 #include "hip/softmax.hip"
 #include "hip/split_qkv.hip"
-#include "hip/swilglu.hip"
 #include "hip/topk.hip"
+#include "hip/vecadd.hip"
 #include "profiler.cpp"
 #include <cassert>
 #include <cmath>
@@ -20,153 +18,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <omp.h>
-
-// TODO: merge interface batch=1
-float* forward_hybrid(OssTransformerHybrid* transformer, int token, int pos) {
-    OssConfig* p = &transformer->config;
-    OssTransformerWeightsHalf* w = &transformer->weights;
-    OssRunState* s = &transformer->state;
-
-    float* x = s->x;
-    int head_dim = p->head_dim;
-    int hidden_dim = p->hidden_dim;
-    int kv_dim = p->head_dim * p->n_kv_heads;
-    int kv_mul = p->n_attn_heads / p->n_kv_heads;
-    int intermediate_dim = p->intermediate_dim;
-    int n_experts = p->n_experts;
-
-    float* cos_vals = nullptr;
-    float* sin_vals = nullptr;
-    size_t cos_sin_size = (head_dim / 2) * sizeof(float);
-
-    CHECK_HIP(hipMalloc(&cos_vals, cos_sin_size));
-    CHECK_HIP(hipMalloc(&sin_vals, cos_sin_size));
-
-    // ! Embedding
-    embed_gpu(x, w->token_embedding_table + token * hidden_dim, hidden_dim);
-
-    for (unsigned long long l = 0; l < p->n_layers; l++) {
-        // ! RMSNorm
-        rmsnorm_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
-
-        // ! KV cache management
-        int loff = l * p->seq_len * kv_dim;
-        long long kv_offset = loff + pos * kv_dim;
-        s->k = s->key_cache + kv_offset;
-        s->v = s->value_cache + kv_offset;
-
-        // ! QKV project
-        __half* w_qkv = w->w_qkv + 1ll * l * hidden_dim *
-                                       (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-        __half* b_qkv =
-            w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-
-        matvec_gpu(s->qkv, s->t, w_qkv, b_qkv, hidden_dim,
-                   (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
-
-        // ! Split QKV
-        split_qkv_gpu(s->qkv, s->q, s->k, s->v, head_dim, p->n_attn_heads, p->n_kv_heads);
-
-        // ! RoPE
-        float ntk_beta = 32.0f;
-        float ntk_alpha = 1.0f;
-
-        compute_cosin_gpu(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
-                          p->initial_context_length, ntk_beta, ntk_alpha, cos_vals, sin_vals);
-        rope_gpu(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
-        rope_gpu(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
-
-        // ! GQA
-        flash_attn_decode_gpu(s->q, s->key_cache + loff, s->value_cache + loff, s->mask,
-                              w->attn_sinks + l * p->n_attn_heads, s->tb, pos, p->seq_len, head_dim,
-                              kv_dim, kv_mul, p->sliding_window, l, p->n_attn_heads);
-
-        // ! Output projection
-        __half* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
-        __half* b_o = w->b_o + 1ll * l * hidden_dim;
-
-        matvec_gpu(s->tb2, s->tb, w_o, b_o, head_dim * p->n_attn_heads, hidden_dim);
-
-        // ! Residual connection
-        vec_add_vec_gpu(x, s->tb2, 1.0f, hidden_dim);
-
-        // ! RMSNorm
-        rmsnorm_gpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
-
-        // ! MoE Router
-        __half* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
-        __half* b_router = w->b_router + 1ll * l * n_experts;
-
-        matvec_gpu(s->router_score, s->t, w_router, b_router, hidden_dim, n_experts);
-
-        topk_gpu(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
-        softmax_gpu(s->topk_v, p->experts_per_token);
-
-        // ! Expert processing
-        CHECK_HIP(hipMemset(s->e_agg, 0, hidden_dim * sizeof(float)));
-
-        int topk_indices_host[16];
-        float topk_weights_host[16];
-        int safe_experts_per_token = (p->experts_per_token > 16) ? 16 : p->experts_per_token;
-
-        CHECK_HIP(hipMemcpy(topk_indices_host, s->topk_i, safe_experts_per_token * sizeof(int),
-                            hipMemcpyDeviceToHost));
-        CHECK_HIP(hipMemcpy(topk_weights_host, s->topk_v, safe_experts_per_token * sizeof(float),
-                            hipMemcpyDeviceToHost));
-
-        for (int idx = 0; idx < safe_experts_per_token; idx++) {
-            int e = topk_indices_host[idx];
-            float expert_w = topk_weights_host[idx];
-
-            // ! Linear 1 (Gated MLP)
-            long long w_mlp1_offset =
-                1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
-            long long b_mlp1_offset = 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
-
-            __half* w_mlp1 = w->w_mlp1 + w_mlp1_offset;
-            __half* b_mlp1 = w->b_mlp1 + b_mlp1_offset;
-
-            matvec_gpu(s->mlp1_out, s->t, w_mlp1, b_mlp1, hidden_dim, 2 * p->intermediate_dim);
-
-            // ! Split mlp1_out into gate and up
-            split_gate_up_gpu(s->mlp1_out, s->gate, s->up, p->intermediate_dim);
-
-            // ! SwiGLU non-linearity
-            const float alpha = 1.702f;
-            swiglu_gpu(s->gate, s->up, p->intermediate_dim, alpha, p->swiglu_limit);
-
-            // ! Final matmul (down project)
-            long long w_mlp2_offset = 1ll * (l * n_experts + e) * hidden_dim * p->intermediate_dim;
-            long long b_mlp2_offset = 1ll * (l * n_experts + e) * hidden_dim;
-
-            __half* w_mlp2 = w->w_mlp2 + w_mlp2_offset;
-            __half* b_mlp2 = w->b_mlp2 + b_mlp2_offset;
-
-            matvec_gpu(s->tb2, s->gate, w_mlp2, b_mlp2, hidden_dim, p->intermediate_dim);
-
-            // ! Aggregate expert
-            vec_add_vec_gpu(s->e_agg, s->tb2, expert_w, hidden_dim);
-        }
-
-        // Residual connection
-        vec_add_vec_gpu(x, s->e_agg, 1.0f, hidden_dim);
-    }
-
-    // Final operations
-    rmsnorm_gpu(x, x, w->rms_out_w, hidden_dim);
-
-    // Linear: classifier into logits
-    matvec_gpu(s->logits, x, w->out, nullptr, hidden_dim, p->vocab_size);
-
-    if (cos_vals) {
-        CHECK_HIP(hipFree(cos_vals));
-    }
-    if (sin_vals) {
-        CHECK_HIP(hipFree(sin_vals));
-    }
-
-    return s->logits;
-}
 
 float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_per_token_h,
                int batch_size, const int* batch_indices_h, int B_stride) {
@@ -181,7 +32,6 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         CHECK_HIP(hipEventCreate(&end_section));
         CHECK_HIP(hipEventCreate(&start_moe_sub));
         CHECK_HIP(hipEventCreate(&end_moe_sub));
-
         CHECK_HIP(hipEventRecord(start_total, 0));
         CHECK_HIP(hipEventRecord(start_section, 0));
     }
@@ -222,7 +72,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(start_section, 0));
     }
-    embed_batch_gpu(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
+    embed(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(end_section, 0));
         CHECK_HIP(hipEventSynchronize(end_section));
@@ -236,7 +86,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        rmsnorm_batch_gpu(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
+        rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -254,8 +104,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        matvec_batch_gpu(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
-                         (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        matvec(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
+               (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -264,14 +114,13 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.qkv_projection_time += qkv_ms;
         }
 
-        // ! Split QKV -> write KV
+        // ! Split QKV
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        split_qkv_batch_gpu_mixedpos(s->qkv, s->q, s->key_cache, s->value_cache, batch_size,
-                                     head_dim, p->n_attn_heads, p->n_kv_heads, l,
-                                     s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
-                                     /*stream=*/0, kv_dim);
+        split_qkv(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim, p->n_attn_heads,
+                  p->n_kv_heads, l, s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
+                  /*stream=*/0, kv_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -280,19 +129,18 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.split_qkv_time += split_qkv_ms;
         }
 
-        // ! RoPE (Q and K) per token
+        // ! RoPE (Q and K)
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
         {
             const float ntk_beta = 32.0f;
             const float ntk_alpha = 1.0f;
-            rope_qk_fused_batch_gpu_mixed(s->q, s->key_cache, batch_size, p->n_attn_heads,
-                                          p->n_kv_heads, head_dim, p->seq_len, kv_dim, l,
-                                          s->d_pos_per_token, s->d_batch_indices, B_stride,
-                                          p->rope_theta, p->rope_scaling_factor,
-                                          p->initial_context_length, ntk_beta, ntk_alpha,
-                                          /*stream=*/0);
+            rope_qk(s->q, s->key_cache, batch_size, p->n_attn_heads, p->n_kv_heads, head_dim,
+                    p->seq_len, kv_dim, l, s->d_pos_per_token, s->d_batch_indices, B_stride,
+                    p->rope_theta, p->rope_scaling_factor, p->initial_context_length, ntk_beta,
+                    ntk_alpha,
+                    /*stream=*/0);
         }
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
@@ -327,8 +175,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        matvec_batch_gpu(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads,
-                         hidden_dim);
+        matvec(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads, hidden_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -341,7 +188,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        vec_add_vec_batch_gpu(x, s->tb2, 1.0f, batch_size, hidden_dim);
+        vecadd(x, s->tb2, 1.0f, batch_size, hidden_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -354,7 +201,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        rmsnorm_batch_gpu(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
+        rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -370,14 +217,12 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        matvec_batch_gpu(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim,
-                         n_experts);
+        matvec(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim, n_experts);
 
         // ! TopK and Softmax
-        topk_batch_gpu(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts,
-                       p->experts_per_token);
+        topk(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts, p->experts_per_token);
 
-        softmax_batch_gpu(s->topk_v, batch_size, p->experts_per_token);
+        softmax(s->topk_v, batch_size, p->experts_per_token);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -515,7 +360,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
 
         if (active_experts == 0) {
-            vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
+            vecadd(x, s->e_agg, 1.0f, batch_size, hidden_dim);
         } else {
             CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
 
@@ -595,17 +440,17 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
 
         // ! Residual
-        vec_add_vec_batch_gpu(x, s->e_agg, 1.0f, batch_size, hidden_dim);
+        vecadd(x, s->e_agg, 1.0f, batch_size, hidden_dim);
     }
 
     // ! RMSNorm
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(start_section, 0));
     }
-    rmsnorm_batch_gpu(x, x, w->rms_out_w, batch_size, hidden_dim);
+    rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim);
 
     // ! Linear logits
-    matvec_batch_gpu(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
+    matvec(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(end_section, 0));
         CHECK_HIP(hipEventSynchronize(end_section));

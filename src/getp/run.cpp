@@ -25,7 +25,6 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
 
     copy_transformer_to_device_hybrid(transformer_oss, t_d);
 
-    // ! GPU stats
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
@@ -36,18 +35,15 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
     printf("-------------------------------\n");
 
-    // Reset timing statistics at start
     reset_batch_timings();
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
-    // Print timing summary before cleanup
     print_batch_timing_summary();
 
     free_transformer_on_device_hybrid(t_d);
     free(t_d);
 
-    // ! GPU stats
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
@@ -59,87 +55,6 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     printf("-------------------------------\n");
 }
 
-long long simple_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
-                               const char* input_seq, int* output_tokens, int steps) {
-    // <|start|>: 200006
-    // <|end|>: 200007
-    // <|return|>: 200002
-    // <|message|>: 200008
-    // <|channel|>: 200005
-    // <|constrain|>: 200003
-    // <|endoftext|>: 199999
-
-    // Inference here
-    OssSampler* sampler_oss = (OssSampler*)sampler;
-
-    const char* empty_prompt = "";
-    if (input_seq == NULL) {
-        input_seq = empty_prompt;
-    }
-
-    // encode the (string) prompt into tokens sequence
-    int num_prompt_tokens = 0;
-    int* prompt_tokens =
-        (int*)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
-           t_d->config.initial_context_length);
-    if (num_prompt_tokens < 1) {
-        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // start the main loop
-    int next;                     // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;                  // position in the sequence
-
-    // print the very first token should be removed
-    const char* first_piece = decode_piece(tokenizer, 200006, token);
-    safe_printf(first_piece);
-    fflush(stdout);
-
-    while (pos < steps) {
-        // forward the transformer to get logits for the next token
-        float* logits = forward_hybrid(t_d, token, pos);
-
-        // advance the state machine
-        pos++;
-        if (pos < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample_oss_gpu(sampler_oss, logits);
-            // save the output token, it will be printed to file
-            output_tokens[pos - num_prompt_tokens] = next;
-        }
-
-        // data-dependent terminating condition: the EOS (=199999 or =200002) token
-        // delimits sequences
-        if (next == 199999 || next == 200002) {
-            break;
-        }
-
-        // print the token as string, decode it with the Tokenizer object
-        // should be removed
-        const char* piece = decode_piece(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-        fflush(stdout);
-
-        token = next;
-    }
-
-    // should be removed
-    printf("\n");
-
-    // Marker for end of sequence
-    output_tokens[pos - num_prompt_tokens + 1] = -1;
-
-    free(prompt_tokens);
-
-    return pos - num_prompt_tokens + 1;
-}
-
 void clear_lines(int num_lines) {
     for (int i = 0; i < num_lines; i++) {
         printf("\033[A\033[K");
@@ -147,7 +62,7 @@ void clear_lines(int num_lines) {
     fflush(stdout);
 }
 
-void print_batch_progress(int batch_size, int* tokens_generated, int* max_tokens, bool* finished) {
+void progress_bar(int batch_size, int* tokens_generated, int* max_tokens, bool* finished) {
     const char* GREEN = "\033[32m";
     const char* BLUE = "\033[34m";
     const char* YELLOW = "\033[33m";
@@ -189,10 +104,8 @@ void print_batch_progress(int batch_size, int* tokens_generated, int* max_tokens
     fflush(stdout);
 }
 
-// Batched inference for multiple requests
-long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
-                                const char** input_seqs, int** output_tokens_batch, int batch_size,
-                                int steps) {
+long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
+                   const char** input_seqs, int** output_tokens_batch, int batch_size, int steps) {
     OssSampler* sampler_oss = (OssSampler*)sampler;
     long long total_tokens_out = 0;
 
@@ -227,7 +140,6 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
         finished[b] = false;
     }
 
-    // Print first tokens
     for (int b = 0; b < batch_size; b++) {
         printf("#%d: ", b + 1);
         const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
@@ -241,16 +153,13 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
     int* tokens_generated = (int*)calloc(batch_size, sizeof(int));
     int* max_generation_tokens = (int*)malloc(batch_size * sizeof(int));
 
-    // Calculate max tokens for each sequence
     for (int b = 0; b < batch_size; b++) {
         max_generation_tokens[b] = steps - 1 - num_prompt_tokens[b];
         if (max_generation_tokens[b] < 0)
             max_generation_tokens[b] = 0;
     }
+    progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
 
-    print_batch_progress(batch_size, tokens_generated, max_generation_tokens, finished);
-
-    // Timing variables for this batch
     double total_forward_time = 0.0;
     int forward_calls = 0;
 
@@ -260,7 +169,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
         int* batch_indices = (int*)malloc(batch_size * sizeof(int));
         int valid_batch_size = 0;
 
-        // Continuous batching: collect ANY ready tokens (mixed positions allowed!)
+        // Continuous batching
         for (int b = 0; b < batch_size && valid_batch_size < batch_size; b++) {
             if (!finished[b] && pos[b] + 1 < steps) {
                 batch_tokens[valid_batch_size] = current_tokens[b];
@@ -277,25 +186,9 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
             break;
         }
 
-        // Timing for individual forward pass
-        hipEvent_t start_forward, end_forward;
-        CHECK_HIP(hipEventCreate(&start_forward));
-        CHECK_HIP(hipEventCreate(&end_forward));
-        CHECK_HIP(hipEventRecord(start_forward, 0));
-
         // Forward pass for the batch with mixed positions
         float* batch_logits = forward(t_d, batch_tokens, batch_positions, valid_batch_size,
                                       batch_indices, t_d->config.batch_size);
-
-        CHECK_HIP(hipEventRecord(end_forward, 0));
-        CHECK_HIP(hipEventSynchronize(end_forward));
-        float forward_ms;
-        CHECK_HIP(hipEventElapsedTime(&forward_ms, start_forward, end_forward));
-        total_forward_time += forward_ms;
-        forward_calls++;
-
-        CHECK_HIP(hipEventDestroy(start_forward));
-        CHECK_HIP(hipEventDestroy(end_forward));
 
         // Process results for each sequence in the batch
         for (int i = 0; i < valid_batch_size; i++) {
@@ -312,6 +205,7 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
                 // Generation phase - sample from logits
                 float* seq_logits = batch_logits + i * t_d->config.vocab_size;
                 next_token = sample_oss_gpu(sampler_oss, seq_logits);
+
                 // Save output token
                 int output_idx = pos[b] - num_prompt_tokens[b];
                 if (output_tokens_batch[b]) {
@@ -335,18 +229,13 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
         }
 
         clear_lines(batch_size);
-        print_batch_progress(batch_size, tokens_generated, max_generation_tokens, finished);
+        progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
 
         free(batch_tokens);
         free(batch_positions);
         free(batch_indices);
     }
 
-    // Print batch timing info
-    printf("\n⏱️ Batch timing: %d forward calls, %.3f ms total, %.3f ms/call\n", forward_calls,
-           total_forward_time, total_forward_time / forward_calls);
-
-    // Cleanup
     for (int b = 0; b < batch_size; b++) {
         free(prompt_tokens[b]);
     }
@@ -366,51 +255,36 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
     long long num_token_out = 0;
     int batch_size = t_d->config.batch_size;
 
-    if (batch_size <= 1 || requests->num_reqs == 1) {
-        printf("⚠️ Using single-sequence inference\n");
-        fflush(stdout);
-        for (int idx = 0; idx < requests->num_reqs; ++idx) {
-            const char* input_seq = get_str_req_ptr(requests, idx);
-            int* output_tokens = get_tok_gen_ptr(requests, idx);
-            num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq,
-                                                  output_tokens, requests->max_seq_len);
+    for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += batch_size) {
+        int current_batch_size = ((requests->num_reqs - start_idx) < batch_size)
+                                     ? (requests->num_reqs - start_idx)
+                                     : batch_size;
+
+        printf("\n📦 Batch %d/%d (#%d->%d):\n", (start_idx / batch_size) + 1,
+               (requests->num_reqs + batch_size - 1) / batch_size, start_idx + 1,
+               start_idx + current_batch_size);
+
+        const char** input_seqs = (const char**)malloc(batch_size * sizeof(const char*));
+        int** output_tokens_batch = (int**)malloc(batch_size * sizeof(int*));
+
+        for (int i = 0; i < current_batch_size; i++) {
+            int req_idx = start_idx + i;
+            input_seqs[i] = get_str_req_ptr(requests, req_idx);
+            output_tokens_batch[i] = get_tok_gen_ptr(requests, req_idx);
         }
-    } else {
-        printf("🚀 Using batched inference with batch_size = %d\n", batch_size);
-        fflush(stdout);
 
-        for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += batch_size) {
-            int current_batch_size = ((requests->num_reqs - start_idx) < batch_size)
-                                         ? (requests->num_reqs - start_idx)
-                                         : batch_size;
-
-            printf("\n📦 Batch %d/%d (#%d->%d):\n", (start_idx / batch_size) + 1,
-                   (requests->num_reqs + batch_size - 1) / batch_size, start_idx + 1,
-                   start_idx + current_batch_size);
-
-            const char** input_seqs = (const char**)malloc(batch_size * sizeof(const char*));
-            int** output_tokens_batch = (int**)malloc(batch_size * sizeof(int*));
-
-            for (int i = 0; i < current_batch_size; i++) {
-                int req_idx = start_idx + i;
-                input_seqs[i] = get_str_req_ptr(requests, req_idx);
-                output_tokens_batch[i] = get_tok_gen_ptr(requests, req_idx);
-            }
-
-            // Fill remaining slots with nulls if needed
-            for (int i = current_batch_size; i < batch_size; i++) {
-                input_seqs[i] = "";
-                output_tokens_batch[i] = nullptr;
-            }
-
-            // Process batch
-            num_token_out += batched_getp_generate(transformer, tokenizer, sampler, input_seqs,
-                                                   output_tokens_batch, current_batch_size,
-                                                   requests->max_seq_len);
-
-            free(input_seqs);
-            free(output_tokens_batch);
+        // Fill remaining slots with nulls if needed
+        for (int i = current_batch_size; i < batch_size; i++) {
+            input_seqs[i] = "";
+            output_tokens_batch[i] = nullptr;
         }
+
+        // Process batch
+        num_token_out += generate(transformer, tokenizer, sampler, input_seqs, output_tokens_batch,
+                                  current_batch_size, requests->max_seq_len);
+
+        free(input_seqs);
+        free(output_tokens_batch);
     }
 
     return num_token_out;

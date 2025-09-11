@@ -2,10 +2,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// Small POD for device->host metadata (active_experts, max_Ne)
 struct Int2 { int x; int y; };
 
-// Local 64-lane reduction to avoid symbol conflicts
 __device__ __forceinline__ float warp_reduce_sum64_local(float v) {
 #pragma unroll
     for (int offset = 32; offset > 0; offset >>= 1) {

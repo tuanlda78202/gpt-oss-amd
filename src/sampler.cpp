@@ -116,10 +116,10 @@ int sample_oss_gpu(OssSampler* sampler, float* logits_d) {
     }
 
     if (sampler->temperature == 0.0f) {
-        sample_argmax_hip_device(logits_d, sampler->vocab_size, result_d);
+        sample_argmax(logits_d, sampler->vocab_size, result_d);
     } else {
-        sample_multinomial_hip_device(logits_d, sampler->vocab_size, sampler->temperature,
-                                      sampler->rng_state, result_d);
+        sample_multinomial(logits_d, sampler->vocab_size, sampler->temperature, sampler->rng_state,
+                           result_d);
         sampler->rng_state = (sampler->rng_state * 1103515245 + 12345) & 0x7fffffff;
     }
 
