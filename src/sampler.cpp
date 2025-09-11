@@ -7,7 +7,6 @@
 #include <omp.h>
 
 int sample_argmax_oss(float* probabilities, int n) {
-    // return the index that has the highest probability
     int max_i = 0;
     float max_p = probabilities[0];
     for (int i = 1; i < n; i++) {
@@ -20,8 +19,6 @@ int sample_argmax_oss(float* probabilities, int n) {
 }
 
 int sample_mult_oss(float* probabilities, int n, float coin) {
-    // sample index from probabilities (they must sum to 1!)
-    // coin is a random number in [0, 1), usually from random_f32()
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
@@ -29,7 +26,7 @@ int sample_mult_oss(float* probabilities, int n, float coin) {
             return i;
         }
     }
-    return n - 1; // in case of rounding errors
+    return n - 1;
 }
 
 int compare_oss(const void* a, const void* b) {
@@ -116,10 +113,10 @@ int sample_oss_gpu(OssSampler* sampler, float* logits_d) {
     }
 
     if (sampler->temperature == 0.0f) {
-        sample_argmax_hip_device(logits_d, sampler->vocab_size, result_d);
+        sample_argmax(logits_d, sampler->vocab_size, result_d);
     } else {
-        sample_multinomial_hip_device(logits_d, sampler->vocab_size, sampler->temperature,
-                                      sampler->rng_state, result_d);
+        sample_multinomial(logits_d, sampler->vocab_size, sampler->temperature, sampler->rng_state,
+                           result_d);
         sampler->rng_state = (sampler->rng_state * 1103515245 + 12345) & 0x7fffffff;
     }
 

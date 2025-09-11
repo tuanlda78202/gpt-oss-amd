@@ -41,7 +41,8 @@ int* get_tok_gen_ptr(Requests* reqs, int idx) {
     return reqs->tok_gens + idx * (reqs->max_seq_len + 1);
 }
 
-int read_inputfile(const char* input_filename, int max_token_len, int max_seq_len, Requests* reqs) {
+int read_inputfile(const char* input_filename, int max_token_len, int max_seq_len, Requests* reqs,
+                   int truncate_lines) {
     std::string filename = input_filename;
     int num_reqs = 0;
 
@@ -52,6 +53,12 @@ int read_inputfile(const char* input_filename, int max_token_len, int max_seq_le
         // Read the number of Requests
         std::getline(openFile, line);
         num_reqs = atoi(line.c_str());
+
+        // Apply truncation if requested
+        if (truncate_lines > 0 && truncate_lines < num_reqs) {
+            printf("Truncating input from %d to %d lines\n", num_reqs, truncate_lines);
+            num_reqs = truncate_lines;
+        }
 
         build_requests(reqs, num_reqs, max_token_len, max_seq_len);
 
@@ -209,7 +216,8 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
 }
 
 void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* input_filename,
-          char* output_filename, int steps, int batch_size) {
+          char* output_filename, int steps, int batch_size, char* verify_filename,
+          int truncate_lines) {
     // ! I/O
     Requests requests;
     int num_reqs;
@@ -218,8 +226,8 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     if (input_filename == NULL || output_filename == NULL) {
         exit(EXIT_FAILURE);
     }
-    if (EXIT_FAILURE ==
-        read_inputfile(input_filename, tokenizer->max_token_length, steps, &requests)) {
+    if (EXIT_FAILURE == read_inputfile(input_filename, tokenizer->max_token_length, steps,
+                                       &requests, truncate_lines)) {
         fprintf(stderr, "cannot read input file: %s\n", input_filename);
         exit(EXIT_FAILURE);
     }
@@ -255,8 +263,8 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
         exit(EXIT_FAILURE);
     }
 
-    // ! TODO: remember remove verification later
-    const char* ground_truth_file = "tests/gt/output.txt";
+    // ! Verification with configurable ground truth file
+    const char* ground_truth_file = verify_filename ? verify_filename : "tests/gt/output_20b.txt";
     int verification_result = verify_output(output_filename, ground_truth_file);
 
     // ! Finish

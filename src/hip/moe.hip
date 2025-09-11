@@ -2,49 +2,9 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// Small POD for device->host metadata (active_experts, max_Ne)
-struct Int2 { int x; int y; };
-
-// Local 64-lane reduction to avoid symbol conflicts
-__device__ __forceinline__ float warp_reduce_sum64_local(float v) {
-#pragma unroll
-    for (int offset = 32; offset > 0; offset >>= 1) {
-        v += __shfl_down(v, offset, 64);
-    }
-    return v;
-}
-
-// Build work queue and compute {active_experts, max_Ne}
-__global__ void build_expert_work_queue_kernel(
-    const int* __restrict__ expert_offsets, // [E+1]
-    int* __restrict__ work_queue,           // [3*E] triplets {expert_id, off, Ne}
-    Int2* __restrict__ meta,                // [1] {active_experts, max_Ne}
-    int E)
-{
-    // single thread
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-
-    int active = 0;
-    int maxNe  = 0;
-    for (int e = 0; e < E; ++e) {
-        int off = expert_offsets[e];
-        int ne  = expert_offsets[e + 1] - off;
-        if (ne > 0) {
-            int i3 = active * 3;
-            work_queue[i3 + 0] = e;
-            work_queue[i3 + 1] = off;
-            work_queue[i3 + 2] = ne;
-            ++active;
-            if (ne > maxNe) maxNe = ne;
-        }
-    }
-    meta[0].x = active;
-    meta[0].y = maxNe;
-}
-
-// -------- Multi-expert MATVEC (stream-aware) --------
+// ! Multi-expert MatVec
 template <int RB, int KTILE>
-__global__ void multi_expert_matvec_kernel(
+__global__ void moe_matvec_kernel(
     const int* __restrict__ work_queue,   // [work_count * 3]
     int work_start, int work_count,       // slice (per stream)
     const float* __restrict__ x_by_expert,// [sum Ne, K]
@@ -124,7 +84,7 @@ __global__ void multi_expert_matvec_kernel(
         __syncthreads();
     }
 
-    acc = warp_reduce_sum64_local(acc);
+    acc = warp_reduce_sum_64(acc);
 
     if (lane == 0) {
         float badd = bias ? __half2float(bias[row]) : 0.0f;
@@ -132,7 +92,27 @@ __global__ void multi_expert_matvec_kernel(
     }
 }
 
-__global__ void multi_expert_split_swiglu_fused_kernel(
+inline void moe_matvec(
+    const int* work_queue, int work_start, int work_count,
+    const float* x_by_expert, float* out_by_expert,
+    const __half* weights_base, const __half* bias_base,
+    int K, int M, long long expert_weight_stride, long long expert_bias_stride,
+    int maxNe, hipStream_t stream)
+{
+    constexpr int RB    = 8;
+    constexpr int KTILE = 2048;
+    dim3 block(64, RB, 1);
+    dim3 grid(maxNe, (M + RB - 1) / RB, work_count);
+    hipLaunchKernelGGL((moe_matvec_kernel<RB, KTILE>),
+        grid, block, 0, stream,
+        work_queue, work_start, work_count,
+        x_by_expert, out_by_expert,
+        weights_base, bias_base,
+        K, M, expert_weight_stride, expert_bias_stride);
+}
+
+// ! Multi-expert SWIGLU Split
+__global__ void moe_split_swiglu_kernel(
     const int* __restrict__ work_queue,
     int work_start, int work_count,
     const float* __restrict__ mlp1_by_expert,  // [sum Ne, 2I]
@@ -173,7 +153,22 @@ __global__ void multi_expert_split_swiglu_fused_kernel(
     dst[out_offset] = gate_val;
 }
 
-__global__ void multi_expert_scale_scatter_kernel(
+inline void moe_split_swiglu(
+    const int* work_queue, int work_start, int work_count,
+    const float* mlp1_by_expert, float* gate_by_expert,
+    int I, float alpha, float swiglu_limit, int maxNe,
+    hipStream_t stream)
+{
+    dim3 block(64);
+    dim3 grid((I + 63) / 64, maxNe, work_count);
+    hipLaunchKernelGGL(moe_split_swiglu_kernel,
+        grid, block, 0, stream,
+        work_queue, work_start, work_count,
+        mlp1_by_expert, gate_by_expert, I, alpha, swiglu_limit);
+}
+
+// ! Multi-expert Scale & Scatter-Add
+__global__ void moe_scale_scatter_kernel(
     const int* __restrict__ work_queue,
     int work_start, int work_count,
     const float* __restrict__ y_by_expert, // [sum Ne, H]
@@ -202,41 +197,7 @@ __global__ void multi_expert_scale_scatter_kernel(
     atomicAdd(&e_agg[(long long)b * H + col], val);
 }
 
-// ------------- Host wrappers (stream-aware) -------------
-inline void multi_expert_matvec_gpu(
-    const int* work_queue, int work_start, int work_count,
-    const float* x_by_expert, float* out_by_expert,
-    const __half* weights_base, const __half* bias_base,
-    int K, int M, long long expert_weight_stride, long long expert_bias_stride,
-    int maxNe, hipStream_t stream)
-{
-    constexpr int RB    = 8;
-    constexpr int KTILE = 1024;
-    dim3 block(64, RB, 1);
-    dim3 grid(maxNe, (M + RB - 1) / RB, work_count);
-    hipLaunchKernelGGL((multi_expert_matvec_kernel<RB, KTILE>),
-        grid, block, 0, stream,
-        work_queue, work_start, work_count,
-        x_by_expert, out_by_expert,
-        weights_base, bias_base,
-        K, M, expert_weight_stride, expert_bias_stride);
-}
-
-inline void multi_expert_split_swiglu_gpu(
-    const int* work_queue, int work_start, int work_count,
-    const float* mlp1_by_expert, float* gate_by_expert,
-    int I, float alpha, float swiglu_limit, int maxNe,
-    hipStream_t stream)
-{
-    dim3 block(64);
-    dim3 grid((I + 63) / 64, maxNe, work_count);
-    hipLaunchKernelGGL(multi_expert_split_swiglu_fused_kernel,
-        grid, block, 0, stream,
-        work_queue, work_start, work_count,
-        mlp1_by_expert, gate_by_expert, I, alpha, swiglu_limit);
-}
-
-inline void multi_expert_scale_scatter_gpu(
+inline void moe_scale_scatter(
     const int* work_queue, int work_start, int work_count,
     const float* y_by_expert, const int* tokens_flat, const float* weights_flat,
     float* e_agg, int H, int batch_size, int maxNe,
@@ -244,7 +205,7 @@ inline void multi_expert_scale_scatter_gpu(
 {
     dim3 block(256);
     dim3 grid((H + 255) / 256, maxNe, work_count);
-    hipLaunchKernelGGL(multi_expert_scale_scatter_kernel,
+    hipLaunchKernelGGL(moe_scale_scatter_kernel,
         grid, block, 0, stream,
         work_queue, work_start, work_count,
         y_by_expert, tokens_flat, weights_flat,

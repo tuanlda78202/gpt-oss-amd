@@ -27,6 +27,8 @@
 
 // #define MATRIX_CORE 1
 
+struct Int2 { int x; int y; };
+
 __device__ float warp_reduce_sum(float val) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
@@ -37,18 +39,6 @@ __device__ float warp_reduce_sum(float val) {
 __device__ __forceinline__ float warp_reduce_sum_64(float v) {
 #pragma unroll
     for (int ofs = 32; ofs > 0; ofs >>= 1) v += __shfl_down(v, ofs, 64);
-    return v;
-}
-
-__device__ __forceinline__ float block_reduce_sum_float(float v) {
-    __shared__ float smem[32];
-    int lane = threadIdx.x & 63;
-    int warp = threadIdx.x >> 6;
-    v = warp_reduce_sum_64(v);
-    if (lane == 0) smem[warp] = v;
-    __syncthreads();
-    v = (threadIdx.x < (blockDim.x >> 6)) ? smem[lane] : 0.0f;
-    if (warp == 0) v = warp_reduce_sum_64(v);
     return v;
 }
 
