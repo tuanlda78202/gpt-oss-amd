@@ -5,140 +5,7 @@
 #include <cmath>
 
 __launch_bounds__(256, 2)
-__global__ void flash_attn_decode_kernel_batched_mixed(
-    const float* __restrict__ q_batch,      // (B, H*D)
-    const void*  __restrict__ k_cache_base, // base of K-cache
-    const void*  __restrict__ v_cache_base, // base of V-cache
-    const float* __restrict__ mask,         // (T, T)
-    const __half* __restrict__ attn_sinks_half, // (H)
-    float* __restrict__ tb_batch,           // (B, H*D)
-    int seq_len, int head_dim, int kv_dim, int kv_mul,
-    int sliding_window, int layer_idx, int n_attn_heads,
-    const int* __restrict__ pos_per_token,  // (B)  <-- mixed-pos
-    const int* __restrict__ batch_indices,  // (B)  slot per token
-    long long B_stride                      // elements per (B*T*kv_dim) per layer
-) {
-    const int h   = blockIdx.x;
-    const int b   = blockIdx.y;
-    const int tid = threadIdx.x;
-    if (h >= n_attn_heads) return;
-
-    const int g = h / kv_mul;
-
-    const float* q_b  = q_batch   + (long long)b * (n_attn_heads * head_dim);
-    float*       tb_b = tb_batch  + (long long)b * (n_attn_heads * head_dim);
-    const float* q_head = q_b + (long long)h * head_dim;
-    float* tb_head = tb_b + (long long)h * head_dim;
-
-    extern __shared__ float q_sh[];
-    const float inv_sqrt_d = rsqrtf((float)head_dim);
-    for (int i = tid; i < head_dim; i += blockDim.x) q_sh[i] = q_head[i] * inv_sqrt_d;
-    __syncthreads();
-    for (int i = tid; i < head_dim; i += blockDim.x) tb_head[i] = 0.0f;
-
-    __shared__ float m_shared, l_shared, scale_old_shared, scale_new_shared, s_shared;
-    __shared__ int masked_step;
-    if (tid == 0) { m_shared = -3.402823466e+38f; l_shared = 0.0f; }
-    __syncthreads();
-
-    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0);
-
-    const int gb = batch_indices[b];
-    const int pos_b = pos_per_token[b];          // <-- per token position
-    const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
-    const long long batch_stride = 1ll * seq_len * kv_dim;
-
-#if USE_FP16_KV
-    const __half* k_layer = (const __half*)k_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-    const __half* v_layer = (const __half*)v_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-#else
-    const float*  k_layer = (const float* )k_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-    const float*  v_layer = (const float* )v_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-#endif
-
-    for (int t = 0; t <= pos_b; ++t) {
-#if USE_FP16_KV
-        const __half* __restrict__ k_head_h = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
-        float partial = 0.0f;
-        int i = tid * 2;
-        for (; i + 1 < head_dim; i += blockDim.x * 2) {
-            __half2 kh2 = *reinterpret_cast<const __half2*>(&k_head_h[i]);
-            float2 kf = __half22float2(kh2);
-            partial += q_sh[i] * kf.x + q_sh[i + 1] * kf.y;
-        }
-        for (; i < head_dim; i += blockDim.x) partial += q_sh[i] * __half2float(k_head_h[i]);
-#else
-        const float*  __restrict__ k_head_f = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
-        float partial = 0.0f;
-        for (int i = tid; i < head_dim; i += blockDim.x) partial += q_sh[i] * k_head_f[i];
-#endif
-        partial = block_reduce_sum(partial);
-
-        if (tid == 0) {
-            float s = partial;
-            if (use_mask) s += mask[(long long)pos_b * seq_len + t];   // per-token pos
-            s_shared = s; masked_step = !isfinite(s);
-        }
-        __syncthreads();
-        if (masked_step) continue;
-
-        if (tid == 0) {
-            const float s = s_shared;
-            const float m_prev = m_shared;
-            const float l_prev = l_shared;
-            const float m_new  = fmaxf(m_prev, s);
-            const float alpha  = __expf(m_prev - m_new);
-            const float p      = __expf(s - m_new);
-            const float l_new  = alpha * l_prev + p;
-            scale_old_shared = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
-            scale_new_shared = (l_new > 0.0f) ? p / l_new : 0.0f;
-            m_shared = m_new; l_shared = l_new;
-        }
-        __syncthreads();
-
-#if USE_FP16_KV
-        const __half* __restrict__ v_head_h = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
-        int j = tid * 2;
-        for (; j + 1 < head_dim; j += blockDim.x * 2) {
-            __half2 vh2 = *reinterpret_cast<const __half2*>(&v_head_h[j]);
-            float2 vf = __half22float2(vh2);
-            float o0 = tb_head[j]; float o1 = tb_head[j + 1];
-            o0 = scale_old_shared * o0 + scale_new_shared * vf.x;
-            o1 = scale_old_shared * o1 + scale_new_shared * vf.y;
-            tb_head[j] = o0; tb_head[j + 1] = o1;
-        }
-        for (; j < head_dim; j += blockDim.x) {
-            float o = tb_head[j];
-            o = scale_old_shared * o + scale_new_shared * __half2float(v_head_h[j]);
-            tb_head[j] = o;
-        }
-#else
-        const float*  __restrict__ v_head_f = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
-        for (int j = tid; j < head_dim; j += blockDim.x) {
-            float o = tb_head[j];
-            o = scale_old_shared * o + scale_new_shared * v_head_f[j];
-            tb_head[j] = o;
-        }
-#endif
-    }
-
-    // per-head sink (same math)
-    if (attn_sinks_half != nullptr) {
-        float sink_s = __half2float(attn_sinks_half[h]);
-        if (isfinite(sink_s)) {
-            const float m_prev = m_shared; const float l_prev = l_shared;
-            float m_new = fmaxf(m_prev, sink_s);
-            float a = __expf(m_prev - m_new) * l_prev;
-            float b2= __expf(sink_s - m_new);
-            float denom = a + b2; float renorm = (denom > 0.0f) ? (a / denom) : 1.0f;
-            for (int i = tid; i < head_dim; i += blockDim.x) tb_head[i] *= renorm;
-        }
-    }
-}
-
-// Chunked CTA per (head,chunk,batch) — mixed positions
-__launch_bounds__(256, 2)
-__global__ void flash_attn_decode_chunk_kernel_batched_mixed(
+__global__ void fa_decode_kernel(
     const float* __restrict__ q_batch,      // (B, H*D)
     const void*  __restrict__ k_cache_base,
     const void*  __restrict__ v_cache_base,
@@ -195,36 +62,18 @@ __global__ void flash_attn_decode_chunk_kernel_batched_mixed(
     const int gb = batch_indices[b];
     const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
     const long long batch_stride = 1ll * seq_len * kv_dim;
-
-#if USE_FP16_KV
-    const __half* k_layer = (const __half*)k_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-    const __half* v_layer = (const __half*)v_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-#else
     const float*  k_layer = (const float* )k_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
     const float*  v_layer = (const float* )v_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-#endif
 
     for (int t = t0; t < t1; ++t) {
-#if USE_FP16_KV
-        const __half* __restrict__ k_head_h = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
-        float partial = 0.0f;
-        int i = tid * 2;
-        for (; i + 1 < head_dim; i += blockDim.x * 2) {
-            __half2 kh2 = *reinterpret_cast<const __half2*>(&k_head_h[i]);
-            float2 kf = __half22float2(kh2);
-            partial += q_sh[i] * kf.x + q_sh[i + 1] * kf.y;
-        }
-        for (; i < head_dim; i += blockDim.x) partial += q_sh[i] * __half2float(k_head_h[i]);
-#else
         const float*  __restrict__ k_head_f = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
         float partial = 0.0f;
         for (int i = tid; i < head_dim; i += blockDim.x) partial += q_sh[i] * k_head_f[i];
-#endif
         partial = block_reduce_sum(partial);
 
         if (tid == 0) {
             float s = partial;
-            if (use_mask) s += mask[(long long)pos_b * seq_len + t];   // per-token pos
+            if (use_mask) s += mask[(long long)pos_b * seq_len + t];
             s_shared = s; masked_step = !isfinite(s);
         }
         __syncthreads();
@@ -244,30 +93,12 @@ __global__ void flash_attn_decode_chunk_kernel_batched_mixed(
         }
         __syncthreads();
 
-#if USE_FP16_KV
-        const __half* __restrict__ v_head_h = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
-        int j = tid * 2;
-        for (; j + 1 < head_dim; j += blockDim.x * 2) {
-            __half2 vh2 = *reinterpret_cast<const __half2*>(&v_head_h[j]);
-            float2 vf = __half22float2(vh2);
-            float o0 = O_c[j]; float o1 = O_c[j + 1];
-            o0 = scale_old_shared * o0 + scale_new_shared * vf.x;
-            o1 = scale_old_shared * o1 + scale_new_shared * vf.y;
-            O_c[j] = o0; O_c[j + 1] = o1;
-        }
-        for (; j < head_dim; j += blockDim.x) {
-            float o = O_c[j];
-            o = scale_old_shared * o + scale_new_shared * __half2float(v_head_h[j]);
-            O_c[j] = o;
-        }
-#else
         const float*  __restrict__ v_head_f = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
         for (int j = tid; j < head_dim; j += blockDim.x) {
             float o = O_c[j];
             o = scale_old_shared * o + scale_new_shared * v_head_f[j];
             O_c[j] = o;
         }
-#endif
     }
 
     if (tid == 0) {
@@ -278,7 +109,7 @@ __global__ void flash_attn_decode_chunk_kernel_batched_mixed(
 
 // Reduce across chunks per (b,h) + apply sink (unchanged)
 __launch_bounds__(256, 2)
-__global__ void flash_attn_reduce_chunks_kernel_batched(
+__global__ void fa_reduce_kernel(
     const float* __restrict__ partial_O,     // (B,H,C,D)
     const float* __restrict__ partial_m,     // (B,H,C)
     const float* __restrict__ partial_l,     // (B,H,C)
@@ -336,7 +167,6 @@ __global__ void flash_attn_reduce_chunks_kernel_batched(
     }
 }
 
-// === Replace your old host wrapper with this mixed-pos batched version ===
 static inline int fa_next_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
 static inline int choose_chunk_size_batched(int Lmax, int heads, int target_cta_per_head=8) {
     if (Lmax <= 256) return Lmax;
@@ -346,7 +176,7 @@ static inline int choose_chunk_size_batched(int Lmax, int heads, int target_cta_
     return c;
 }
 
-void flash_attn_decode_gpu_batch_mixed(
+void fa(
     const float* q_batch,      // (B, H*D)
     const void*  k_cache,      // base pointer
     const void*  v_cache,      // base pointer
@@ -372,17 +202,6 @@ void flash_attn_decode_gpu_batch_mixed(
     size_t shmem = (size_t)head_dim * sizeof(float);
     const __half* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
 
-    if (n_chunks <= 1) {
-        dim3 grid(n_attn_heads, B), block(tpb);
-        hipLaunchKernelGGL(flash_attn_decode_kernel_batched_mixed, grid, block, shmem, stream,
-                           q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
-                           seq_len, head_dim, kv_dim, kv_mul,
-                           sliding_window, layer_idx, n_attn_heads,
-                           d_pos_per_token, d_batch_indices, (long long)B_stride);
-        CHECK_HIP(hipGetLastError());
-        return;
-    }
-
     // Workspace (TODO: reuse allocator if you have one)
     float* partial_O; float* partial_m; float* partial_l;
     CHECK_HIP(hipMalloc(&partial_O, (long long)B * n_attn_heads * n_chunks * head_dim * sizeof(float)));
@@ -392,7 +211,7 @@ void flash_attn_decode_gpu_batch_mixed(
     // Kernel 1: chunks
     {
         dim3 grid1(n_attn_heads, n_chunks, B), block1(tpb);
-        hipLaunchKernelGGL(flash_attn_decode_chunk_kernel_batched_mixed, grid1, block1, shmem, stream,
+        hipLaunchKernelGGL(fa_decode_kernel, grid1, block1, shmem, stream,
                            q_batch, k_cache, v_cache, mask,
                            partial_O, partial_m, partial_l,
                            seq_len, head_dim, kv_dim, kv_mul,
@@ -403,7 +222,7 @@ void flash_attn_decode_gpu_batch_mixed(
     // Kernel 2: reduce
     {
         dim3 grid2(n_attn_heads, B), block2(tpb);
-        hipLaunchKernelGGL(flash_attn_reduce_chunks_kernel_batched, grid2, block2, 0, stream,
+        hipLaunchKernelGGL(fa_reduce_kernel, grid2, block2, 0, stream,
                            partial_O, partial_m, partial_l,
                            attn_sinks_head, tb_batch,
                            head_dim, n_chunks, n_attn_heads);
