@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${MODELBIN_ROOT:=/nfs/gpu_trainee/final-project/modelbin}"
+: "${MODELBIN_ROOT:=/gpu_trainee/final-project/modelbin}"
 export MODELBIN_ROOT
 export OMP_NUM_THREADS=96
 
@@ -216,12 +216,7 @@ find_checkpoint() {
     echo "${ckpt}"; return 0
   fi
 
-  # preferred default
-  if [[ -f "${MODELBIN_ROOT}/gpt-oss-20b.bin" ]]; then
-    echo "${MODELBIN_ROOT}/gpt-oss-20b.bin"; return 0
-  fi
-
-  echo ""  # not found, caller handles
+  echo "${MODELBIN_ROOT}/gpt-oss-20b.bin"; return 0
 }
 
 cmd_build() {
