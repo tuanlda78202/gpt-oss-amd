@@ -14,10 +14,6 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-// Forward declarations for timing functions
-extern void reset_batch_timings();
-extern void print_batch_timing_summary();
-
 OssTransformerHybrid* t_d;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
@@ -46,7 +42,6 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
     // Print timing summary before cleanup
-    printf("\n🕒 BATCH FORWARD PROFILING RESULTS:\n");
     print_batch_timing_summary();
 
     free_transformer_on_device_hybrid(t_d);
@@ -289,9 +284,8 @@ long long batched_getp_generate(Transformer* transformer, Tokenizer* tokenizer, 
         CHECK_HIP(hipEventRecord(start_forward, 0));
 
         // Forward pass for the batch with mixed positions
-        float* batch_logits =
-            forward_hybrid_batch(t_d, batch_tokens, batch_positions, valid_batch_size,
-                                 batch_indices, t_d->config.batch_size);
+        float* batch_logits = forward(t_d, batch_tokens, batch_positions, valid_batch_size,
+                                      batch_indices, t_d->config.batch_size);
 
         CHECK_HIP(hipEventRecord(end_forward, 0));
         CHECK_HIP(hipEventSynchronize(end_forward));
