@@ -30,7 +30,6 @@ __global__ void fa_decode_kernel(
     const int pos_b = pos_per_token[b];
     const int Lb = pos_b + 1;
 
-    // time chunk for this token
     const int t0 = c * chunk_size;
     int t1 = t0 + chunk_size; if (t1 > Lb) t1 = Lb;
     if (t0 >= t1) {
@@ -107,7 +106,6 @@ __global__ void fa_decode_kernel(
     }
 }
 
-// Reduce across chunks per (b,h) + apply sink (unchanged)
 __launch_bounds__(256, 2)
 __global__ void fa_reduce_kernel(
     const float* __restrict__ partial_O,     // (B,H,C,D)
@@ -167,8 +165,8 @@ __global__ void fa_reduce_kernel(
     }
 }
 
-static inline int fa_next_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
-static inline int choose_chunk_size_batched(int Lmax, int heads, int target_cta_per_head=8) {
+static inline int fa_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
+static inline int choose_chunk_size(int Lmax, int heads, int target_cta_per_head=8) {
     if (Lmax <= 256) return Lmax;
     int c = 256;
     int chunks = (Lmax + c - 1) / c;
@@ -195,10 +193,10 @@ void fa(
     if (B <= 0 || n_attn_heads <= 0 || head_dim <= 0) return;
 
     const int Lmax = max_pos_in_batch + 1;
-    int chunk_size = choose_chunk_size_batched(Lmax, n_attn_heads);
+    int chunk_size = choose_chunk_size(Lmax, n_attn_heads);
     int n_chunks   = (Lmax + chunk_size - 1) / chunk_size;
 
-    int tpb = fa_next_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
+    int tpb = fa_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
     size_t shmem = (size_t)head_dim * sizeof(float);
     const __half* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
 

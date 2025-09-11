@@ -378,11 +378,10 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
-            multi_expert_matvec_gpu(
-                d_work_queue, work_start, work_count, s->x_by_expert, s->mlp1_by_expert,
-                w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
-                w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
-                2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, max_Ne, 0);
+            moe_matvec(d_work_queue, work_start, work_count, s->x_by_expert, s->mlp1_by_expert,
+                       w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
+                       w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
+                       2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, max_Ne, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -394,9 +393,9 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
-            multi_expert_split_swiglu_gpu(d_work_queue, work_start, work_count, s->mlp1_by_expert,
-                                          s->gate_by_expert, p->intermediate_dim, alpha,
-                                          p->swiglu_limit, max_Ne, 0);
+            moe_split_swiglu(d_work_queue, work_start, work_count, s->mlp1_by_expert,
+                             s->gate_by_expert, p->intermediate_dim, alpha, p->swiglu_limit, max_Ne,
+                             0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -408,11 +407,10 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
-            multi_expert_matvec_gpu(
-                d_work_queue, work_start, work_count, s->gate_by_expert, s->y_by_expert,
-                w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
-                w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim, hidden_dim,
-                mlp2_weight_stride, mlp2_bias_stride, max_Ne, 0);
+            moe_matvec(d_work_queue, work_start, work_count, s->gate_by_expert, s->y_by_expert,
+                       w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
+                       w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim,
+                       hidden_dim, mlp2_weight_stride, mlp2_bias_stride, max_Ne, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -424,9 +422,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
-            multi_expert_scale_scatter_gpu(d_work_queue, work_start, work_count, s->y_by_expert,
-                                           s->tokens_flat, s->weights_flat, s->e_agg, hidden_dim,
-                                           batch_size, max_Ne, 0);
+            moe_scale_scatter(d_work_queue, work_start, work_count, s->y_by_expert, s->tokens_flat,
+                              s->weights_flat, s->e_agg, hidden_dim, batch_size, max_Ne, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
