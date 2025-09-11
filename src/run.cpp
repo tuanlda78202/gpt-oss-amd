@@ -1082,7 +1082,9 @@ void error_usage() {
     fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 1024 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.0\n");
+    fprintf(stderr, "  -T <float>  temperature in [0,inf], default 0.0\n");
+    fprintf(stderr, "  -t <int>    truncate input to first N lines (getp mode only), default 0 (no "
+                    "truncation)\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] "
                     "default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
@@ -1093,7 +1095,7 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat|getp, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
-    fprintf(stderr, "  -b <int>    batch size for getp mode, default 2\n");
+    fprintf(stderr, "  -b <int>    batch size for getp mode, default 32\n");
     fprintf(stderr, "  -f <0|1>    enable forward profiling (0=off, 1=on), default 0\n");
     fprintf(stderr, "  -v <string> verification/ground truth file for getp mode, default "
                     "tests/gt/output_20b.txt\n");
@@ -1113,9 +1115,10 @@ int main(int argc, char** argv) {
     char* system_prompt = NULL;      // the (optional) system prompt to use in chat mode
     char* input_filename = NULL;
     char* output_filename = NULL;
-    int batch_size = 2;           // batch size for getp mode, default 2
+    int batch_size = 32;          // batch size for getp mode, default 2
     int enable_profiling = 0;     // profiling flag, default off
     char* verify_filename = NULL; // verification file for getp mode
+    int truncate_lines = 0;       // truncate input to N lines, 0 = no truncation
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1136,8 +1139,10 @@ int main(int argc, char** argv) {
             error_usage();
         } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 't') {
+        if (argv[i][1] == 'T') {
             temperature = atof(argv[i + 1]);
+        } else if (argv[i][1] == 't') {
+            truncate_lines = atoi(argv[i + 1]);
         } else if (argv[i][1] == 'p') {
             topp = atof(argv[i + 1]);
         } else if (argv[i][1] == 's') {
@@ -1205,7 +1210,7 @@ int main(int argc, char** argv) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
         getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps, batch_size,
-             verify_filename);
+             verify_filename, truncate_lines);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

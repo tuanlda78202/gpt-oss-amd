@@ -94,7 +94,7 @@ usage() {
   echo ""
   echo -e "${RED}🏃‍♂️ RUN COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
+  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
   echo ""
   echo -e "  ${CYAN}Key Features:${NC}"
   echo -e "    • Default checkpoint: ${WHITE}${MODELBIN_ROOT}/gpt-oss-20b.bin${NC}"
@@ -118,19 +118,20 @@ usage() {
   echo -e "    ${WHITE}-o OUTPUT${NC}              Output file path"
   echo -e "    ${WHITE}-z TOKENIZER${NC}           Tokenizer path"
   echo -e "    ${WHITE}-y SYS${NC}                 System prompt"
-  echo -e "    ${WHITE}-t TEMP${NC}                Temperature (default: 0.0)"
+  echo -e "    ${WHITE}-T TEMP${NC}                Temperature (default: 0.0)"
+  echo -e "    ${WHITE}-t TRUNCATE${NC}            Truncate input to first N lines (getp mode only)"
   echo -e "    ${WHITE}-p TOP_P${NC}               Top-p sampling (default: 0.9)"
   echo -e "    ${WHITE}-n STEPS${NC}               Number of steps (default: 1024)"
   echo -e "    ${WHITE}-s SEED${NC}                Random seed"
   echo -e "    ${WHITE}-l${NC}                     Log output to log.txt"
   echo -e "    ${WHITE}-g N_GPUS${NC}              Number of GPUs to request (default: 1)"
-  echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 2)"
+  echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 32)"
   echo -e "    ${WHITE}-f${NC}                     Enable forward pass profiling (shows timing breakdown)"
   echo -e "    ${WHITE}-v VERIFY_FILE${NC}         Ground truth file for verification (default: tests/gt/output_20b.txt)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-t TEMP] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
+  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
   echo ""
   echo -e "  ${CYAN}Features:${NC}"
   echo -e "    • Combines: ${WHITE}./run.sh build && ./run.sh run${NC}"
@@ -174,6 +175,9 @@ usage() {
   echo ""
   echo -e "  ${CYAN}# Getp mode with 2 GPUs, batch size 32, and profiling${NC}"
   echo -e "  ${GREEN}./run.sh run -g 2 -b 32 -f${NC}"
+  echo ""
+  echo -e "  ${CYAN}# Truncate input to first 16 lines${NC}"
+  echo -e "  ${GREEN}./run.sh run -t 16${NC}"
   echo ""
   echo -e "  ${CYAN}# Custom checkpoint with 4 GPUs${NC}"
   echo -e "  ${GREEN}./run.sh run -c /path/to/model.bin -g 4${NC}"
@@ -265,6 +269,7 @@ cmd_run() {
   local batch_size=""
   local enable_profiling=""
   local verify_file=""
+  local truncate_lines=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -274,7 +279,7 @@ cmd_run() {
       -o) out="$2"; shift 2 ;;
       -z) tok="$2"; shift 2 ;;
       -y) sys="$2"; shift 2 ;;
-      -t) temp="$2"; shift 2 ;;
+      -T) temp="$2"; shift 2 ;;
       -p) top_p="$2"; shift 2 ;;
       -n) steps="$2"; shift 2 ;;
       -s) seed="$2"; shift 2 ;;
@@ -283,6 +288,7 @@ cmd_run() {
       -b) batch_size="$2"; shift 2 ;;
       -f) enable_profiling="1"; shift 1 ;;
       -v) verify_file="$2"; shift 2 ;;
+      -t) truncate_lines="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -340,13 +346,14 @@ cmd_run() {
   fi
   print_kv "tokenizer(-z)" "${tok:-<unset>}"
   print_kv "system(-y)"    "${sys:-<unset>}"
-  print_kv "temp(-t)"      "${temp:-0.0}"   "$([[ -z "${temp:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "temp(-T)"      "${temp:-0.0}"   "$([[ -z "${temp:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "top_p(-p)"     "${top_p:-0.9}"  "$([[ -z "${top_p:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "steps(-n)"     "${steps:-1024}" "$([[ -z "${steps:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "seed(-s)"      "${seed:-time(NULL)}" "$([[ -z "${seed:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
-  print_kv "batch_size(-b)" "${batch_size:-2}" "$([[ -z "${batch_size:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
+  print_kv "batch_size(-b)" "${batch_size:-32}" "$([[ -z "${batch_size:-}" ]] && echo "(run.cpp default)" || echo "(provided)")"
   print_kv "profiling(-f)" "${enable_profiling:+enabled}" "$([[ -n "${enable_profiling}" ]] && echo "(forward timing)" || echo "(disabled)")"
   print_kv "logging(-l)"   "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to log.txt)" || echo "(disabled)")"
+  print_kv "truncate(-t)" "${truncate_lines:-<none>}" "$([[ -n "${truncate_lines}" ]] && echo "(limit to first ${truncate_lines} lines)" || echo "(process all lines)")"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
   if [[ ! -x build/run ]]; then
@@ -360,13 +367,14 @@ cmd_run() {
   [[ -n "${out}"  ]] && args+=(-o "${out}")
   [[ -n "${tok}"  ]] && args+=(-z "${tok}")
   [[ -n "${sys}"  ]] && args+=(-y "${sys}")
-  [[ -n "${temp}" ]] && args+=(-t "${temp}")
+  [[ -n "${temp}" ]] && args+=(-T "${temp}")
   [[ -n "${top_p}" ]] && args+=(-p "${top_p}")
   [[ -n "${steps}" ]] && args+=(-n "${steps}")
   [[ -n "${seed}" ]] && args+=(-s "${seed}")
   [[ -n "${batch_size}" ]] && args+=(-b "${batch_size}")
   [[ -n "${enable_profiling}" ]] && args+=(-f "1")
   [[ -n "${verify_file}" ]] && args+=(-v "${verify_file}")
+  [[ -n "${truncate_lines}" ]] && args+=(-t "${truncate_lines}")
 
   local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
