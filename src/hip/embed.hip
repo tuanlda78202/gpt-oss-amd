@@ -14,10 +14,7 @@ void embed_kernel_vec(const __hip_bfloat16* __restrict__ emb_table,
 
     if (b >= batch_size || t0 >= hidden_dim) return;
 
-    __shared__ int tok_shared;
-    if (threadIdx.x == 0) tok_shared = tokens[b];
-    __syncthreads();
-    const int token = tok_shared;
+    const int token = tokens[b];
 
     const __hip_bfloat16* base = emb_table + (size_t)token * hidden_dim + t0;
     float* out       = x_batch   + (size_t)b      * hidden_dim + t0;
