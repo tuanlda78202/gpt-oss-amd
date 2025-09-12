@@ -72,7 +72,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
     int n_kv_heads = conf->n_kv_heads;
     int seq_len = conf->seq_len;
 
-    printf("\nConverting model to hybrid precision...\n");
+    // printf("\nConverting model to hybrid precision...\n");
 
     // ! GPU Check
     int current_device;
@@ -128,7 +128,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
 
     // ! Allocate FP32 state on GPU (with batch dimension B)
     int batch_size = conf->batch_size;
-    printf("🚒 Allocating GPU buffers for batch size %d...\n", batch_size);
+    // printf("🚒 Allocating GPU buffers for batch size %d...\n", batch_size);
 
     CHECK_HIP(hipMalloc(&t_d->state.x, (size_t)batch_size * hidden_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.t, (size_t)batch_size * hidden_dim * sizeof(float)));
@@ -187,7 +187,7 @@ void copy_transformer_to_device_hybrid(OssTransformer* t_fp32, OssTransformerHyb
         hipMalloc(&t_d->state.up_by_expert, (size_t)BK_max * intermediate_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.y_by_expert, (size_t)BK_max * hidden_dim * sizeof(float)));
 
-    printf("Converting and transferring weights...\n");
+    // printf("Converting and transferring weights...\n");
 
     // ! Stream conversion and transfer for weights (FP32 -> FP16)
     copy_large_tensor_streaming(&t_d->weights.token_embedding_table, weights->token_embedding_table,
