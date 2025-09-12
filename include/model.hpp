@@ -175,6 +175,11 @@ typedef struct {
     float* gate_by_expert; // [B*K, I] - gate values by expert
     float* up_by_expert;   // [B*K, I] - up values by expert
     float* y_by_expert;    // [B*K, H] - final output by expert
+
+    // Attention workspace buffers
+    float* fa_partial_O; // Workspace for flash attention partial outputs
+    float* fa_partial_m; // Workspace for flash attention partial max values
+    float* fa_partial_l; // Workspace for flash attention partial normalizers
 } OssRunState;
 
 // ! Main Transformer struct

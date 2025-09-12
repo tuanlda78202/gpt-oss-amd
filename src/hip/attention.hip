@@ -188,6 +188,9 @@ void fa(
     const int* d_batch_indices,      // (B)
     long long B_stride,              // elements per (B*T*kv_dim) per layer
     int max_pos_in_batch,            // max(pos[b]) in this batch
+    float* workspace_partial_O,      // Pre-allocated workspace
+    float* workspace_partial_m,      // Pre-allocated workspace
+    float* workspace_partial_l,      // Pre-allocated workspace
     hipStream_t stream)
 {
     if (B <= 0 || n_attn_heads <= 0 || head_dim <= 0) return;
@@ -200,11 +203,9 @@ void fa(
     size_t shmem = (size_t)head_dim * sizeof(float);
     const __hip_bfloat16* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
 
-    // Workspace (TODO: reuse allocator if you have one)
-    float* partial_O; float* partial_m; float* partial_l;
-    CHECK_HIP(hipMalloc(&partial_O, (long long)B * n_attn_heads * n_chunks * head_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&partial_m, (long long)B * n_attn_heads * n_chunks * sizeof(float)));
-    CHECK_HIP(hipMalloc(&partial_l, (long long)B * n_attn_heads * n_chunks * sizeof(float)));
+    float* partial_O = workspace_partial_O;
+    float* partial_m = workspace_partial_m;
+    float* partial_l = workspace_partial_l;
 
     // Kernel 1: chunks
     {
@@ -226,8 +227,5 @@ void fa(
                            head_dim, n_chunks, n_attn_heads);
     }
 
-    CHECK_HIP(hipFree(partial_O));
-    CHECK_HIP(hipFree(partial_m));
-    CHECK_HIP(hipFree(partial_l));
     CHECK_HIP(hipGetLastError());
 }

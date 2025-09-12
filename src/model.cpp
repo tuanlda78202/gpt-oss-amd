@@ -193,6 +193,14 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         hipMalloc(&t_d->state.up_by_expert, (size_t)BK_max * intermediate_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.y_by_expert, (size_t)BK_max * hidden_dim * sizeof(float)));
 
+    int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
+    size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
+    size_t fa_ml_size = (size_t)batch_size * n_attn_heads * max_chunks * sizeof(float);
+
+    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_O, fa_O_size));
+    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_m, fa_ml_size));
+    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_l, fa_ml_size));
+
     printf("Converting and transferring weights...\n");
 
     // ! Stream conversion and transfer for weights (FP32 -> FP16)
@@ -366,6 +374,9 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.gate_by_expert));
     CHECK_HIP(hipFree(t_d->state.up_by_expert));
     CHECK_HIP(hipFree(t_d->state.y_by_expert));
+    CHECK_HIP(hipFree(t_d->state.fa_partial_O));
+    CHECK_HIP(hipFree(t_d->state.fa_partial_m));
+    CHECK_HIP(hipFree(t_d->state.fa_partial_l));
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));

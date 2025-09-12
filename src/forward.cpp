@@ -158,7 +158,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         fa(s->q, (const void*)s->key_cache, (const void*)s->value_cache, s->mask, w->attn_sinks,
            s->tb, batch_size, p->seq_len, head_dim, kv_dim, kv_mul, p->sliding_window, (int)l,
            p->n_attn_heads, s->d_pos_per_token, s->d_batch_indices, (long long)B_stride,
-           max_pos_in_batch, 0);
+           max_pos_in_batch, s->fa_partial_O, s->fa_partial_m, s->fa_partial_l, 0);
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
