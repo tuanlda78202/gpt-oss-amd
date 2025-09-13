@@ -14,50 +14,87 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-static OssTransformerHybrid** g_models = nullptr; // store all the models
-thread_local OssTransformerHybrid* t_d = nullptr; // local model
+thread_local int dev_id = 0;
+thread_local OssTransformerHybrid* t_d = nullptr;
 
-#define DP 8
-static int num_gpus = 1;
+#define DP 2
+#define PP 4
+
+static int g_num_devices = 1;
+static int g_pp_stages = PP;
+
+static int g_dp_groups = 1;         // how many independent copies (DP world)
+static int g_devices_per_group = 1; // = g_pp_stages
+
+static OssTransformerHybrid** g_models = nullptr;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
 
     // Discover GPUs
-    CHECK_HIP(hipGetDeviceCount(&num_gpus));
-    if (num_gpus <= 0) {
+    CHECK_HIP(hipGetDeviceCount(&g_num_devices));
+    if (g_num_devices <= 0) {
         fprintf(stderr, "No HIP devices found.\n");
         exit(EXIT_FAILURE);
     }
 
-    num_gpus = std::max(1, std::min(num_gpus, DP));
-    printf("\n[DP] devices=%d, batch_size=%d\n", num_gpus, batch_size);
-    omp_set_num_threads(num_gpus);
+    // Decide DP layout
+    // If PP is enabled, we treat each PP island as a "device group".
+    // Otherwise, each device is one DP group.
+    if (g_pp_stages <= 1) {
+        g_devices_per_group = 1;
+        g_dp_groups = DP;
+        if (g_dp_groups > g_num_devices)
+            g_dp_groups = g_num_devices;
+    } else {
+        if (g_num_devices % g_pp_stages != 0) {
+            fprintf(stderr, "GPU count (%d) is not divisible by PP (%d).\n", g_num_devices,
+                    g_pp_stages);
+            exit(EXIT_FAILURE);
+        }
+        g_devices_per_group = g_pp_stages;
+        g_dp_groups = DP;
+        if (g_dp_groups > (g_num_devices / g_pp_stages))
+            g_dp_groups = (g_num_devices / g_pp_stages);
+    }
 
-    g_models = (OssTransformerHybrid**)malloc(sizeof(OssTransformerHybrid*) * num_gpus);
+    printf("\n[DP] devices=%d, pp_stages=%d, dp_groups=%d, devices_per_group=%d\n", g_num_devices,
+           g_pp_stages, g_dp_groups, g_devices_per_group);
+    omp_set_num_threads(g_dp_groups);
+
+    // Allocate one model replica per DP group (each replica will select its
+    // first device as "home" for warmup copy; PP code, if used, will fan-out).
+    g_models = (OssTransformerHybrid**)malloc(sizeof(OssTransformerHybrid*) * g_dp_groups);
     if (!g_models) {
         fprintf(stderr, "malloc g_models failed\n");
         exit(EXIT_FAILURE);
     }
 
-#pragma omp parallel for num_threads(num_gpus) schedule(static)
-    for (int g = 0; g < num_gpus; ++g) {
-        CHECK_HIP(hipSetDevice(g));
+    // Build/transfer one replica per DP group
+    // Note: we pick a representative device for each group to call
+    // copy_transformer_to_device_hybrid. If you have internal PP that spreads within the group,
+    // that code will take over later.
+#pragma omp parallel for num_threads(g_dp_groups) schedule(static)
+    for (int g = 0; g < g_dp_groups; ++g) {
+        int device_base = g * g_devices_per_group; // first device of this DP group
+        CHECK_HIP(hipSetDevice(device_base));
 
         g_models[g] = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
         if (!g_models[g]) {
-            fprintf(stderr, "malloc model for device %d failed\n", g);
+            fprintf(stderr, "malloc model for group %d failed\n", g);
             exit(EXIT_FAILURE);
         }
 
-        copy_transformer_to_device_hybrid(transformer_oss, g_models[g]);
+        // Use the new grouped loader so PP shards land on device_base..device_base+PP-1
+        copy_transformer_to_device_hybrid_grouped(transformer_oss, g_models[g], device_base,
+                                                  g_devices_per_group);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
 #pragma omp critical
         {
-            printf("\n--- HYBRID WARM-UP COMPLETE (device %d) ---\n", g);
+            printf("\n--- HYBRID WARM-UP COMPLETE (group %d on device %d) ---\n", g, device_base);
             printf("GPU Memory Status: Total %.2f GB, Used %.2f GB, Free %.2f GB\n",
                    total_mem / (1024.0 * 1024.0 * 1024.0),
                    (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0),
@@ -65,17 +102,14 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
             printf("-----------------------------------------------\n");
         }
     }
-
-    reset_batch_timings();
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
-    print_batch_timing_summary();
-
     if (g_models) {
-#pragma omp parallel for num_threads(num_gpus) schedule(static)
-        for (int g = 0; g < num_gpus; ++g) {
-            CHECK_HIP(hipSetDevice(g));
+#pragma omp parallel for schedule(static) num_threads(g_dp_groups)
+        for (int g = 0; g < g_dp_groups; ++g) {
+            int home_device = g * g_devices_per_group;
+            CHECK_HIP(hipSetDevice(home_device));
             if (g_models[g]) {
                 free_transformer_on_device_hybrid(g_models[g]);
                 free(g_models[g]);
@@ -95,7 +129,6 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
     printf("-------------------------------\n");
 }
-
 void clear_lines(int num_lines) {
     for (int i = 0; i < num_lines; i++) {
         printf("\033[A\033[K");
@@ -228,6 +261,7 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         }
 
         // Forward pass for the batch with mixed positions
+
         float* batch_logits = forward(t_d, batch_tokens, batch_positions, valid_batch_size,
                                       batch_indices, t_d->config.batch_size);
 
@@ -299,22 +333,25 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 #pragma omp parallel reduction(+ : total_tokens)
     {
         const int tid = omp_get_thread_num();
-        const int device = tid; // one OMP thread per device
+        const int group = tid; // one OMP thread per DP group
+        const int home = group * g_devices_per_group;
 
-        CHECK_HIP(hipSetDevice(device));
-        t_d = g_models[device];
+        // Bind to group's home device and replica
+        CHECK_HIP(hipSetDevice(home));
+        dev_id = group;
+        t_d = g_models[group];
 
         // Per-thread sampler clone
         OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
         memcpy(sampler_copy, sampler, sizeof(OssSampler));
 
-        // Build the list of request indices owned by this DP device
+        // Build the list of request indices owned by this DP group: i % g_dp_groups == group
         int my_count = 0;
-        for (int i = device; i < N; i += num_gpus)
+        for (int i = group; i < N; i += g_dp_groups)
             my_count++;
         int* my_idx = (int*)malloc(sizeof(int) * (my_count > 0 ? my_count : 1));
         int w = 0;
-        for (int i = device; i < N; i += num_gpus)
+        for (int i = group; i < N; i += g_dp_groups)
             my_idx[w++] = i;
 
         const int batch_size = t_d->config.batch_size;
@@ -322,7 +359,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
         // Batched on this replica
 #pragma omp critical
         {
-            printf("🚀 [DP device %d] Batched inference with batch_size = %d (%d reqs)\n", device,
+            printf("🚀 [DP group %d] Batched inference with batch_size = %d (%d reqs)\n", group,
                    batch_size, my_count);
             fflush(stdout);
         }
@@ -342,7 +379,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
 #pragma omp critical
             {
-                printf("[DP device %d] 📦 Batch %d/%d (req #%d → #%d)\n", device,
+                printf("[DP group %d] 📦 Batch %d/%d (req #%d → #%d)\n", group,
                        (start / batch_size) + 1, (my_count + batch_size - 1) / batch_size,
                        my_idx[start] + 1, my_idx[start + cur_bs - 1] + 1);
                 fflush(stdout);

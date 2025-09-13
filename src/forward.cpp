@@ -19,8 +19,58 @@
 #include <cstring>
 #include <omp.h>
 
-float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_per_token_h,
-               int batch_size, const int* batch_indices_h, int B_stride) {
+#include "../include/pp_manager.hpp"
+
+float* forward_stage(OssTransformerHybrid* shard, bool has_embed, bool has_out, int* tokens,
+                     const int* pos_per_token_h, int batch_size, const int* batch_indices_h,
+                     int B_stride);
+
+// Single hidden vector hop between devices
+static void pp_pass_x_between(PPManager* mgr, int from_idx, int to_idx) {
+    auto& A = mgr->shards[from_idx];
+    auto& B = mgr->shards[to_idx];
+    size_t bytes = (size_t)mgr->hidden_dim * (size_t)mgr->batch_size * sizeof(float);
+
+    CHECK_HIP(hipSetDevice(A.device_id));
+    CHECK_HIP(hipStreamSynchronize(0));
+
+    if (mgr->peer_ok[A.device_id][B.device_id]) {
+        CHECK_HIP(hipSetDevice(B.device_id));
+        CHECK_HIP(hipMemcpyPeerAsync(B.shard->state.x, B.device_id, A.shard->state.x, A.device_id,
+                                     bytes, 0));
+        CHECK_HIP(hipStreamSynchronize(0));
+    } else {
+        if (!mgr->host_bounce)
+            CHECK_HIP(hipHostMalloc((void**)&mgr->host_bounce, bytes));
+        CHECK_HIP(hipSetDevice(A.device_id));
+        CHECK_HIP(hipMemcpy(mgr->host_bounce, A.shard->state.x, bytes, hipMemcpyDeviceToHost));
+        CHECK_HIP(hipSetDevice(B.device_id));
+        CHECK_HIP(hipMemcpy(B.shard->state.x, mgr->host_bounce, bytes, hipMemcpyHostToDevice));
+    }
+}
+
+static float* forward_token_pipeline(OssTransformerHybrid* root, int* tokens,
+                                     const int* pos_per_token_h, int batch_size,
+                                     const int* batch_indices_h, int B_stride) {
+    PPManager* mgr = root->pp;
+    // Stage 0
+    CHECK_HIP(hipSetDevice(mgr->shards[0].device_id));
+    float* ret =
+        forward_stage(mgr->shards[0].shard, mgr->shards[0].has_embed, mgr->shards[0].has_out,
+                      tokens, pos_per_token_h, batch_size, batch_indices_h, B_stride);
+    // Middle stages
+    for (int p = 1; p < mgr->pp; ++p) {
+        pp_pass_x_between(mgr, p - 1, p);
+        CHECK_HIP(hipSetDevice(mgr->shards[p].device_id));
+        ret = forward_stage(mgr->shards[p].shard, mgr->shards[p].has_embed, mgr->shards[p].has_out,
+                            tokens, pos_per_token_h, batch_size, batch_indices_h, B_stride);
+    }
+    return ret; // logits on last stage
+}
+
+float* forward_stage(OssTransformerHybrid* shard, bool has_embed, bool has_out, int* tokens,
+                     const int* pos_per_token_h, int batch_size, const int* batch_indices_h,
+                     int B_stride) {
     hipEvent_t start_total, end_total;
     hipEvent_t start_section, end_section;
     hipEvent_t start_moe_sub, end_moe_sub;
@@ -36,9 +86,9 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         CHECK_HIP(hipEventRecord(start_section, 0));
     }
 
-    OssConfig* p = &transformer->config;
-    OssTransformerWeightsHalf* w = &transformer->weights;
-    OssRunState* s = &transformer->state;
+    OssConfig* p = &shard->config;
+    OssTransformerWeightsHalf* w = &shard->weights;
+    OssRunState* s = &shard->state;
 
     float* x = s->x;
     int head_dim = p->head_dim;
@@ -72,7 +122,9 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(start_section, 0));
     }
-    embed(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
+    if (has_embed) {
+        embed(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim);
+    }
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(end_section, 0));
         CHECK_HIP(hipEventSynchronize(end_section));
@@ -439,20 +491,22 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         vecadd(x, s->e_agg, 1.0f, batch_size, hidden_dim);
     }
 
-    // ! RMSNorm
-    if (g_enable_profiling) {
-        CHECK_HIP(hipEventRecord(start_section, 0));
-    }
-    rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim);
+    if (has_out) {
+        // ! RMSNorm
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(start_section, 0));
+        }
+        rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim);
 
-    // ! Linear logits
-    matvec(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
-    if (g_enable_profiling) {
-        CHECK_HIP(hipEventRecord(end_section, 0));
-        CHECK_HIP(hipEventSynchronize(end_section));
-        float final_ops_ms;
-        CHECK_HIP(hipEventElapsedTime(&final_ops_ms, start_section, end_section));
-        g_batch_timings.final_ops_time += final_ops_ms;
+        // ! Linear logits
+        matvec(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
+        if (g_enable_profiling) {
+            CHECK_HIP(hipEventRecord(end_section, 0));
+            CHECK_HIP(hipEventSynchronize(end_section));
+            float final_ops_ms;
+            CHECK_HIP(hipEventElapsedTime(&final_ops_ms, start_section, end_section));
+            g_batch_timings.final_ops_time += final_ops_ms;
+        }
     }
 
     if (g_enable_profiling) {
@@ -472,5 +526,15 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         CHECK_HIP(hipEventDestroy(end_moe_sub));
     }
 
-    return s->logits;
+    return has_out ? s->logits : s->x;
+}
+
+float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_per_token_h,
+               int batch_size, const int* batch_indices_h, int B_stride) {
+    if (transformer->pp != nullptr) {
+        return forward_token_pipeline(transformer, tokens, pos_per_token_h, batch_size,
+                                      batch_indices_h, B_stride);
+    }
+    return forward_stage(transformer, true, true, tokens, pos_per_token_h, batch_size,
+                         batch_indices_h, B_stride);
 }
