@@ -3,7 +3,6 @@
 #include "hip/attention.hip"
 #include "hip/embed.hip"
 #include "hip/gemm.hip"
-#include "hip/gemm_moe.hip"
 #include "hip/moe.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
