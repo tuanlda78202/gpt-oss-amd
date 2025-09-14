@@ -2,7 +2,7 @@
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
 #include "hip/embed.hip"
-#include "hip/matvec.hip"
+#include "hip/gemm.hip"
 #include "hip/moe.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
@@ -18,6 +18,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <omp.h>
+
+static int kGridCap = [] {
+    hipDeviceProp_t prop{};
+    int dev = 0;
+    CHECK_HIP(hipGetDevice(&dev));
+    CHECK_HIP(hipGetDeviceProperties(&prop, dev));
+    return prop.multiProcessorCount * 2;
+}();
 
 float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_per_token_h,
                int batch_size, const int* batch_indices_h, int B_stride) {
@@ -105,8 +113,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        matvec(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
-               (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        gemm(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
+             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -175,7 +183,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        matvec(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads, hidden_dim);
+        gemm(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads, hidden_dim);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -217,7 +225,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        matvec(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim, n_experts);
+        gemm(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim, n_experts);
 
         // ! TopK and Softmax
         topk(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts, p->experts_per_token);
@@ -235,7 +243,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
 
-        // ! MoE Setup - Zero aggregation
+        // ! MoE Setup
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
@@ -267,12 +275,14 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_assignment_time += moe_assignment_ms;
         }
 
-        // ! Exclusive scan on device -> expert_offsets[0..E]
+        // ! Exclusive scan
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
         hipLaunchKernelGGL(exclusive_scan_small_kernel, dim3(1), dim3(1), 0, 0, s->expert_counts,
                            s->expert_offsets, n_experts);
+        const int sumNe = BKE;
+
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_moe_sub, 0));
             CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -281,7 +291,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_scan_time += moe_scan_ms;
         }
 
-        // ! Compact by expert
+        // ! Compact
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
@@ -297,7 +307,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_compact_time += moe_compact_ms;
         }
 
-        // ! Gather inputs X -> x_by_expert
+        // ! Gather
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
@@ -307,13 +317,13 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                                (hidden_dim % 4 == 0);
             if (vecOK) {
                 const int H4 = hidden_dim >> 2;
-                dim3 blk(256, 1, 1), grd((H4 + 255) / 256, BKE);
+                dim3 blk(256, 1, 1), grd((H4 + 255) / 256, sumNe);
                 hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
-                                   s->x_by_expert, BKE, H4);
+                                   s->x_by_expert, sumNe, H4);
             } else {
-                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, BKE);
+                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, sumNe);
                 hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
-                                   s->x_by_expert, BKE, hidden_dim);
+                                   s->x_by_expert, sumNe, hidden_dim);
             }
         }
         if (g_enable_profiling) {
@@ -350,6 +360,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         CHECK_HIP(hipMemcpy(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost));
         const int active_experts = h_meta.x;
         const int max_Ne = h_meta.y;
+        const int rows_hint = max(1, min(max_Ne, (BKE + active_experts - 1) / active_experts));
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_moe_sub, 0));
@@ -362,8 +373,6 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (active_experts == 0) {
             vecadd(x, s->e_agg, 1.0f, batch_size, hidden_dim);
         } else {
-            CHECK_HIP(hipMemset(s->e_agg, 0, batch_size * hidden_dim * sizeof(float)));
-
             const long long mlp1_weight_stride = (2LL * p->intermediate_dim) * hidden_dim;
             const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
             const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
@@ -382,7 +391,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             moe_matvec(d_work_queue, work_start, work_count, s->x_by_expert, s->mlp1_by_expert,
                        w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
                        w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
-                       2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, max_Ne, 0);
+                       2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, rows_hint,
+                       kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -395,8 +405,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
             moe_split_swiglu(d_work_queue, work_start, work_count, s->mlp1_by_expert,
-                             s->gate_by_expert, p->intermediate_dim, alpha, p->swiglu_limit, max_Ne,
-                             0);
+                             s->gate_by_expert, p->intermediate_dim, alpha, p->swiglu_limit,
+                             rows_hint, kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -411,7 +421,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             moe_matvec(d_work_queue, work_start, work_count, s->gate_by_expert, s->y_by_expert,
                        w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
                        w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim,
-                       hidden_dim, mlp2_weight_stride, mlp2_bias_stride, max_Ne, 0);
+                       hidden_dim, mlp2_weight_stride, mlp2_bias_stride, rows_hint, kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -424,7 +434,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
             moe_scale_scatter(d_work_queue, work_start, work_count, s->y_by_expert, s->tokens_flat,
-                              s->weights_flat, s->e_agg, hidden_dim, batch_size, max_Ne, 0);
+                              s->weights_flat, s->e_agg, hidden_dim, batch_size, rows_hint,
+                              kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -447,7 +458,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
     rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim);
 
     // ! Linear logits
-    matvec(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
+    gemm(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
     if (g_enable_profiling) {
         CHECK_HIP(hipEventRecord(end_section, 0));
         CHECK_HIP(hipEventSynchronize(end_section));

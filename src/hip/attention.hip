@@ -45,11 +45,17 @@ __global__ void fa_decode_kernel(
     const float* q_head = q_b + (long long)h * head_dim;
     float* O_c = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + c ) * (long long)head_dim;
 
-    extern __shared__ float q_sh[];
+    // ---- On-chip buffers: q_sh and O_sh ----
+    extern __shared__ float smem[];
+    float* q_sh = smem;                    // [head_dim]
+    float* O_sh = q_sh + head_dim;         // [head_dim]
+
     const float inv_sqrt_d = rsqrtf((float)head_dim);
-    for (int i = tid; i < head_dim; i += blockDim.x) q_sh[i] = q_head[i] * inv_sqrt_d;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        q_sh[i] = q_head[i] * inv_sqrt_d;
+        O_sh[i] = 0.0f;                    // keep O on-chip across the whole chunk
+    }
     __syncthreads();
-    for (int i = tid; i < head_dim; i += blockDim.x) O_c[i] = 0.0f;
 
     __shared__ float m_shared, l_shared, scale_old_shared, scale_new_shared, s_shared;
     __shared__ int masked_step;
@@ -65,15 +71,19 @@ __global__ void fa_decode_kernel(
     const float*  v_layer = (const float* )v_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
 
     for (int t = t0; t < t1; ++t) {
-        const float*  __restrict__ k_head_f = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
+        const float* __restrict__ k_head_f = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
+
+        // dot(q, k_t)
         float partial = 0.0f;
-        for (int i = tid; i < head_dim; i += blockDim.x) partial += q_sh[i] * k_head_f[i];
+        for (int i = tid; i < head_dim; i += blockDim.x)
+            partial += q_sh[i] * k_head_f[i];
         partial = block_reduce_sum(partial);
 
         if (tid == 0) {
             float s = partial;
             if (use_mask) s += mask[(long long)pos_b * seq_len + t];
-            s_shared = s; masked_step = !isfinite(s);
+            s_shared = s;
+            masked_step = !isfinite(s);
         }
         __syncthreads();
         if (masked_step) continue;
@@ -86,19 +96,27 @@ __global__ void fa_decode_kernel(
             const float alpha  = __expf(m_prev - m_new);
             const float p      = __expf(s - m_new);
             const float l_new  = alpha * l_prev + p;
+
             scale_old_shared = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
             scale_new_shared = (l_new > 0.0f) ? p / l_new : 0.0f;
-            m_shared = m_new; l_shared = l_new;
+
+            m_shared = m_new;
+            l_shared = l_new;
         }
         __syncthreads();
 
-        const float*  __restrict__ v_head_f = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
+        // O <- α·O + β·v_t  (kept in shared memory)
+        const float* __restrict__ v_head_f = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
         for (int j = tid; j < head_dim; j += blockDim.x) {
-            float o = O_c[j];
+            float o = O_sh[j];
             o = scale_old_shared * o + scale_new_shared * v_head_f[j];
-            O_c[j] = o;
+            O_sh[j] = o;                   // stay on-chip
         }
+        __syncthreads();
     }
+
+    for (int j = tid; j < head_dim; j += blockDim.x)
+        O_c[j] = O_sh[j];
 
     if (tid == 0) {
         partial_m[((long long)b*n_attn_heads + h)*n_chunks + c] = m_shared;
@@ -199,15 +217,20 @@ void fa(
     int chunk_size = choose_chunk_size(Lmax, n_attn_heads);
     int n_chunks   = (Lmax + chunk_size - 1) / chunk_size;
 
-    int tpb = fa_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
-    size_t shmem = (size_t)head_dim * sizeof(float);
-    const __hip_bfloat16* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
+    int tpb = fa_pow2(head_dim);
+    if (tpb < 64) tpb = 64;
+    else if (tpb > 256) tpb = 256;
 
-    float* partial_O = workspace_partial_O;
-    float* partial_m = workspace_partial_m;
-    float* partial_l = workspace_partial_l;
+    size_t shmem = (size_t)head_dim * 2 * sizeof(float);
 
-    // Kernel 1: chunks
+    const __hip_bfloat16* attn_sinks_head =
+        (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
+
+    float* partial_O = workspace_partial_O; // (B,H,C,D)
+    float* partial_m = workspace_partial_m; // (B,H,C)
+    float* partial_l = workspace_partial_l; // (B,H,C)
+
+    // Kernel 1: per-chunk decode with on-chip O
     {
         dim3 grid1(n_attn_heads, n_chunks, B), block1(tpb);
         hipLaunchKernelGGL(fa_decode_kernel, grid1, block1, shmem, stream,
@@ -218,7 +241,7 @@ void fa(
                            chunk_size, n_chunks,
                            d_pos_per_token, d_batch_indices, (long long)B_stride);
     }
-    // Kernel 2: reduce
+    // Kernel 2: reduction across chunks
     {
         dim3 grid2(n_attn_heads, B), block2(tpb);
         hipLaunchKernelGGL(fa_reduce_kernel, grid2, block2, 0, stream,
