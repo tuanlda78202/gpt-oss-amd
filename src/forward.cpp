@@ -379,21 +379,19 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
             const long long mlp2_bias_stride = hidden_dim;
             const float alpha = 1.702f;
-
             const int work_start = 0;
             const int work_count = active_experts;
-
             float mlp1_ms = 0.0f, swiglu_ms = 0.0f, mlp2_ms = 0.0f, scatter_ms = 0.0f;
 
-            // ! MLP1: [Ne,H] x [H,2I] -> [Ne,2I]
+            // ! MLP1 + SwiGLU: [Ne,H] x [H,2I] -> [Ne,I]
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
-            moe_matvec(d_work_queue, work_start, work_count, s->x_by_expert, s->mlp1_by_expert,
-                       w->w_mlp1 + 1ll * l * n_experts * mlp1_weight_stride,
-                       w->b_mlp1 + 1ll * l * n_experts * mlp1_bias_stride, hidden_dim,
-                       2 * p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, rows_hint,
-                       kGridCap, 0);
+            moe_mlp1_swiglu(d_work_queue, work_start, work_count, s->x_by_expert, s->gate_by_expert,
+                            w->w_mlp1 + 1ll * l * p->n_experts * mlp1_weight_stride,
+                            w->b_mlp1 + 1ll * l * p->n_experts * mlp1_bias_stride, hidden_dim,
+                            p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, alpha,
+                            p->swiglu_limit, rows_hint, kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -401,50 +399,21 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                 g_batch_timings.moe_mlp1_time += mlp1_ms;
             }
 
-            // ! SwiGLU split + activation: [Ne,2I] -> [Ne,I]
+            // ! MLP2 + Scatter: [Ne,I] x [I,H] -> e_agg
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             }
-            moe_split_swiglu(d_work_queue, work_start, work_count, s->mlp1_by_expert,
-                             s->gate_by_expert, p->intermediate_dim, alpha, p->swiglu_limit,
-                             rows_hint, kGridCap, 0);
-            if (g_enable_profiling) {
-                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
-                CHECK_HIP(hipEventSynchronize(end_moe_sub));
-                CHECK_HIP(hipEventElapsedTime(&swiglu_ms, start_moe_sub, end_moe_sub));
-                g_batch_timings.moe_swiglu_time += swiglu_ms;
-            }
-
-            // ! MLP2: [Ne,I] x [I,H] -> [Ne,H]
-            if (g_enable_profiling) {
-                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
-            }
-            moe_matvec(d_work_queue, work_start, work_count, s->gate_by_expert, s->y_by_expert,
-                       w->w_mlp2 + 1ll * l * n_experts * mlp2_weight_stride,
-                       w->b_mlp2 + 1ll * l * n_experts * mlp2_bias_stride, p->intermediate_dim,
-                       hidden_dim, mlp2_weight_stride, mlp2_bias_stride, rows_hint, kGridCap, 0);
+            moe_mlp2_scatter(
+                d_work_queue, work_start, work_count, s->gate_by_expert, s->tokens_flat,
+                s->weights_flat, s->e_agg, w->w_mlp2 + 1ll * l * p->n_experts * mlp2_weight_stride,
+                w->b_mlp2 + 1ll * l * p->n_experts * mlp2_bias_stride, p->intermediate_dim,
+                hidden_dim, mlp2_weight_stride, mlp2_bias_stride, rows_hint, kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
                 CHECK_HIP(hipEventElapsedTime(&mlp2_ms, start_moe_sub, end_moe_sub));
                 g_batch_timings.moe_mlp2_time += mlp2_ms;
-            }
-
-            // ! Scale & scatter into e_agg
-            if (g_enable_profiling) {
-                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
-            }
-            moe_scale_scatter(d_work_queue, work_start, work_count, s->y_by_expert, s->tokens_flat,
-                              s->weights_flat, s->e_agg, hidden_dim, batch_size, rows_hint,
-                              kGridCap, 0);
-            if (g_enable_profiling) {
-                CHECK_HIP(hipEventRecord(end_moe_sub, 0));
-                CHECK_HIP(hipEventSynchronize(end_moe_sub));
-                CHECK_HIP(hipEventElapsedTime(&scatter_ms, start_moe_sub, end_moe_sub));
-                g_batch_timings.moe_scatter_time += scatter_ms;
-
-                g_batch_timings.expert_processing_time +=
-                    (mlp1_ms + swiglu_ms + mlp2_ms + scatter_ms);
+                g_batch_timings.expert_processing_time += (mlp1_ms + mlp2_ms);
             }
         }
 
