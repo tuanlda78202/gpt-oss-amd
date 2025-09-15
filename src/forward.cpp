@@ -243,7 +243,6 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
 
-        // ! MoE Setup
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
@@ -259,14 +258,16 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         const int BKE = batch_size * p->experts_per_token;
         dim3 blk1(256), grd1((BKE + blk1.x - 1) / blk1.x);
 
-        // ! Build assignments + counts
+        // ! Count & Compact
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
+
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
-        hipLaunchKernelGGL(build_assignments_and_count_kernel, grd1, blk1, 0, 0, s->topk_i,
-                           s->topk_v, batch_size, p->experts_per_token, s->assign_expert,
-                           s->assign_token, s->assign_weight, s->expert_counts, n_experts);
+        hipLaunchKernelGGL(count_tokens_per_expert, grd1, blk1, 0, 0, s->topk_i, s->topk_v,
+                           batch_size, p->experts_per_token, s->assign_expert, s->assign_token,
+                           s->assign_weight, s->expert_counts, n_experts);
+
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_moe_sub, 0));
             CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -275,11 +276,11 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_assignment_time += moe_assignment_ms;
         }
 
-        // ! Exclusive scan
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
-        hipLaunchKernelGGL(exclusive_scan_small_kernel, dim3(1), dim3(1), 0, 0, s->expert_counts,
+
+        hipLaunchKernelGGL(exclusive_scan_expert_offsets, dim3(1), dim3(1), 0, 0, s->expert_counts,
                            s->expert_offsets, n_experts);
         const int sumNe = BKE;
 
@@ -291,14 +292,15 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_scan_time += moe_scan_ms;
         }
 
-        // ! Compact
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
+
         CHECK_HIP(hipMemset(s->expert_counts, 0, n_experts * sizeof(int)));
         hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, 0, s->assign_expert,
                            s->assign_token, s->assign_weight, BKE, s->expert_offsets,
                            s->expert_counts, s->tokens_flat, s->weights_flat);
+
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_moe_sub, 0));
             CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -307,24 +309,22 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_compact_time += moe_compact_ms;
         }
 
-        // ! Gather
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
-        {
-            const bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
-                               ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
-                               (hidden_dim % 4 == 0);
-            if (vecOK) {
-                const int H4 = hidden_dim >> 2;
-                dim3 blk(256, 1, 1), grd((H4 + 255) / 256, sumNe);
-                hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
-                                   s->x_by_expert, sumNe, H4);
-            } else {
-                dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, sumNe);
-                hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
-                                   s->x_by_expert, sumNe, hidden_dim);
-            }
+
+        const bool vecOK = ((reinterpret_cast<uintptr_t>(s->t) & 0xF) == 0) &&
+                           ((reinterpret_cast<uintptr_t>(s->x_by_expert) & 0xF) == 0) &&
+                           (hidden_dim % 4 == 0);
+        if (vecOK) {
+            const int H4 = hidden_dim >> 2;
+            dim3 blk(256, 1, 1), grd((H4 + 255) / 256, sumNe);
+            hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                               s->x_by_expert, sumNe, H4);
+        } else {
+            dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, sumNe);
+            hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, 0, s->t, s->tokens_flat,
+                               s->x_by_expert, sumNe, hidden_dim);
         }
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_moe_sub, 0));
@@ -334,7 +334,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             g_batch_timings.moe_gather_time += moe_gather_ms;
         }
 
-        // ! === Build work queue and read back {active_experts, max_Ne} ===
+        // ! Build per-expert work queue
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
@@ -353,8 +353,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (!d_meta)
             CHECK_HIP(hipMalloc(&d_meta, sizeof(Int2)));
 
-        hipLaunchKernelGGL(build_expert_work_queue_kernel, dim3(1), dim3(1), 0, 0,
-                           s->expert_offsets, d_work_queue, d_meta, n_experts);
+        hipLaunchKernelGGL(build_expert_work_queue, dim3(1), dim3(1), 0, 0, s->expert_offsets,
+                           d_work_queue, d_meta, n_experts);
 
         Int2 h_meta;
         CHECK_HIP(hipMemcpy(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost));
