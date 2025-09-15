@@ -168,7 +168,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
         // Compare token sequences
         bool line_matches = true;
         if (gt_tokens.size() != gen_tokens.size()) {
-            printf("❌ Request #%d: Length mismatch (GT: %zu tokens, Generated: %zu tokens)\n",
+            printf("⚠️ Request #%d: Length mismatch (GT: %zu tokens, Generated: %zu tokens)\n",
                    line_num, gt_tokens.size(), gen_tokens.size());
             line_matches = false;
         } else {
