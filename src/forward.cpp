@@ -526,7 +526,7 @@ float* forward_stage(OssTransformerHybrid* shard, bool has_embed, bool has_out, 
         CHECK_HIP(hipEventDestroy(end_moe_sub));
     }
 
-    return has_out ? s->logits : s->x;
+    return has_out ? s->logits : x;
 }
 
 float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_per_token_h,

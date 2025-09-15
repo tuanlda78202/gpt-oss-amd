@@ -17,8 +17,10 @@
 thread_local int dev_id = 0;
 thread_local OssTransformerHybrid* t_d = nullptr;
 
-#define DP 2
-#define PP 4
+// #define DP 1
+// #define PP 1
+int DP = atoi(getenv("DP"));
+int PP = atoi(getenv("PP"));
 
 static int g_num_devices = 1;
 static int g_pp_stages = PP;
@@ -31,6 +33,8 @@ static OssTransformerHybrid** g_models = nullptr;
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
+
+    omp_set_max_active_levels(2);
 
     // Discover GPUs
     CHECK_HIP(hipGetDeviceCount(&g_num_devices));
@@ -75,7 +79,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     // Note: we pick a representative device for each group to call
     // copy_transformer_to_device_hybrid. If you have internal PP that spreads within the group,
     // that code will take over later.
-#pragma omp parallel for num_threads(g_dp_groups) schedule(static)
+#pragma omp parallel for num_threads(DP* PP) schedule(static)
     for (int g = 0; g < g_dp_groups; ++g) {
         int device_base = g * g_devices_per_group; // first device of this DP group
         CHECK_HIP(hipSetDevice(device_base));
