@@ -360,7 +360,10 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         CHECK_HIP(hipMemcpy(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost));
         const int active_experts = h_meta.x;
         const int max_Ne = h_meta.y;
-        const int rows_hint = max(1, min(max_Ne, (BKE + active_experts - 1) / active_experts));
+
+        // ! WARNING: check it carefully
+        const int rows_hint =
+            max(1, min(max_Ne / 2, (BKE + active_experts - 1) / active_experts / 2));
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_moe_sub, 0));
