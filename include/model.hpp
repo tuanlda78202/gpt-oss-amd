@@ -192,14 +192,17 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } OssTransformer;
 
+struct PPManager;
+
 // ! Hybrid Precision Transformer
 typedef struct {
     OssConfig config;
     OssTransformerWeightsBFloat16 weights; // BF16 weights for memory efficiency
-    OssRunState state;                     // FP32 activations for numerical stability
-    int fd;                                // file descriptor for memory mapping
-    float* data;                           // memory mapped data pointer
-    ssize_t file_size;                     // size of the checkpoint file in bytes
+    OssRunState state;                 // FP32 activations for numerical stability
+    int fd;                            // file descriptor for memory mapping
+    float* data;                       // memory mapped data pointer
+    ssize_t file_size;                 // size of the checkpoint file in bytes
+    PPManager* pp;
 } OssTransformerHybrid;
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,

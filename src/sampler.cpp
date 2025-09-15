@@ -107,7 +107,7 @@ int sample_oss(OssSampler* sampler, float* logits) {
 }
 
 int sample_oss_gpu(OssSampler* sampler, float* logits_d) {
-    static int* result_d = nullptr;
+    thread_local int* result_d = nullptr;
     if (result_d == nullptr) {
         CHECK_HIP(hipMalloc(&result_d, sizeof(int)));
     }
