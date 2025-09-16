@@ -105,7 +105,7 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
 }
 
 // ! -----------------------------Eval Functions---------------------------------------
-void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size);
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16);
 void finish(Transformer* transformer, Tokenizer* tokenizer);
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sample,
                     Requests* requests);
@@ -217,7 +217,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
 
 void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* input_filename,
           char* output_filename, int steps, int batch_size, char* verify_filename,
-          int truncate_lines) {
+          int truncate_lines, int use_kv16) {
     // ! I/O
     Requests requests;
     int num_reqs;
@@ -239,7 +239,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     printf("\033[1;91m==================================================================\033["
            "0m\n\033[1;91m🔥 WARMING UP...\033[0m");
     fflush(stdout);
-    warm_up(transformer, tokenizer, batch_size);
+    warm_up(transformer, tokenizer, batch_size, use_kv16);
     end = time_in_ms();
     printf("⌛️ Warm up (s): %f\n", (double)(end - start) / 1000);
     fflush(stdout);

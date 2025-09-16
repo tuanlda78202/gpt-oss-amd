@@ -152,9 +152,10 @@ typedef struct {
     float* logits;       // output logits (B, vocab_size)
 
     // ! kv cache
-    float* key_cache;   // (layer, B, seq_len, kv_dim)
-    float* value_cache; // (layer, B, seq_len, kv_dim)
-    float* mask;        // (seq_len, seq_len) - shared across batch
+    void* key_cache;      // (layer, B, seq_len, kv_dim)
+    void* value_cache;    // (layer, B, seq_len, kv_dim)
+    int kv_cache_is_fp16; // flag: 1 if using bfloat16, 0 if using float32
+    float* mask;          // (seq_len, seq_len) - shared across batch
 
     int* d_batch_indices; // (max_batch_size) - persistent GPU batch indices
     int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
@@ -204,5 +205,5 @@ typedef struct {
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name);
-void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d);
+void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d, int use_kv16);
 void free_transformer_on_device(OssTransformerHybrid* t_d);

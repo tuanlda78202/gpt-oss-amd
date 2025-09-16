@@ -54,7 +54,7 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
 }
 
 // ! Hybrid precision (BF16 weights + FP32 activations)
-void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d) {
+void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int use_kv16) {
     memcpy(&t_d->config, &t_fp32->config, sizeof(OssConfig));
 
     OssConfig* conf = &t_fp32->config;
@@ -161,12 +161,23 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipMalloc(&t_d->state.logits, (size_t)batch_size * vocab_size * sizeof(float)));
 
     // KV cache with batch dimension: (n_layers, batch_size, seq_len, kv_dim)
-    size_t key_cache_size =
-        1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
-    size_t value_cache_size =
-        1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
+    size_t key_cache_size, value_cache_size;
+    if (use_kv16) {
+        key_cache_size =
+            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(__hip_bfloat16);
+        value_cache_size =
+            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(__hip_bfloat16);
+        printf("Using 16-bit KV cache (bfloat16)\n");
+    } else {
+        key_cache_size =
+            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
+        value_cache_size =
+            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
+        printf("Using 32-bit KV cache (float32)\n");
+    }
     CHECK_HIP(hipMalloc(&t_d->state.key_cache, key_cache_size));
     CHECK_HIP(hipMalloc(&t_d->state.value_cache, value_cache_size));
+    t_d->state.kv_cache_is_fp16 = use_kv16;
     CHECK_HIP(hipMalloc(&t_d->state.mask, (size_t)seq_len * seq_len * sizeof(float)));
 
     CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));

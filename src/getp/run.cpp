@@ -16,14 +16,14 @@
 
 OssTransformerHybrid* t_d;
 
-void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
     t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
 
     transformer_oss->config.batch_size = batch_size;
 
-    copy_transformer_to_device(transformer_oss, t_d);
+    copy_transformer_to_device(transformer_oss, t_d, use_kv16);
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));

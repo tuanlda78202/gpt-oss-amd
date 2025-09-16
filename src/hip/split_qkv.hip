@@ -5,12 +5,13 @@ template<int VEC>
 __global__ void split_qkv_kernel(
     const float* __restrict__ qkv,     // [B, (Hq+2Hkv)*D]
     float* __restrict__ q_out,         // [B, Hq*D]
-    float* __restrict__ key_cache,     // global cache
-    float* __restrict__ value_cache,   // global cache
+    void* __restrict__ key_cache,     // global cache
+    void* __restrict__ value_cache,   // global cache
     int B, int head_dim, int n_q_heads, int n_kv_heads,
     int layer, const int* __restrict__ pos_per_token, int seq_len,
     const int* __restrict__ batch_indices, long long B_stride,
-    int kv_dim)                         // = head_dim * n_kv_heads
+    int kv_dim,                         // = head_dim * n_kv_heads
+    int kv_cache_is_fp16)
 {
     const int t = blockIdx.y;
     const int colv = blockIdx.x * blockDim.x + threadIdx.x;
@@ -46,21 +47,28 @@ __global__ void split_qkv_kernel(
     }
 
     // 2) Scatter K and V to the cache at (layer, slot, pos)
-    float* __restrict__ kv_dst = key_cache   + loff + (long long)slot * (long long)seq_len * kv_dim + (long long)pos * kv_dim;
-    float* __restrict__ vv_dst = value_cache + loff + (long long)slot * (long long)seq_len * kv_dim + (long long)pos * kv_dim;
+    const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
+    void* kv_dst_base = (void*)((char*)key_cache +
+                               (loff + (long long)slot * (long long)seq_len * kv_dim + (long long)pos * kv_dim) * element_size);
+    void* vv_dst_base = (void*)((char*)value_cache +
+                               (loff + (long long)slot * (long long)seq_len * kv_dim + (long long)pos * kv_dim) * element_size);
 
     const float* __restrict__ k_src = qkv_t + q_row;
     const float* __restrict__ v_src = k_src + kv_dim;
 
     if (kv_col < kv_dim) {
-        if constexpr (V == 4) {
-            reinterpret_cast<float4*>(kv_dst)[colv] = reinterpret_cast<const float4*>(k_src)[colv];
-            reinterpret_cast<float4*>(vv_dst)[colv] = reinterpret_cast<const float4*>(v_src)[colv];
-        } else {
-            #pragma unroll
-            for (int i = 0; i < V; ++i) {
-                int c = kv_col + i;
-                if (c < kv_dim) {
+        #pragma unroll
+        for (int i = 0; i < V; ++i) {
+            int c = kv_col + i;
+            if (c < kv_dim) {
+                if (kv_cache_is_fp16) {
+                    __hip_bfloat16* kv_dst = (__hip_bfloat16*)kv_dst_base;
+                    __hip_bfloat16* vv_dst = (__hip_bfloat16*)vv_dst_base;
+                    kv_dst[c] = __float2bfloat16(k_src[c]);
+                    vv_dst[c] = __float2bfloat16(v_src[c]);
+                } else {
+                    float* kv_dst = (float*)kv_dst_base;
+                    float* vv_dst = (float*)vv_dst_base;
                     kv_dst[c] = k_src[c];
                     vv_dst[c] = v_src[c];
                 }
@@ -70,14 +78,14 @@ __global__ void split_qkv_kernel(
 }
 
 inline void split_qkv(
-    float* qkv, float* q_out, float* key_cache, float* value_cache,
+    float* qkv, float* q_out, void* key_cache, void* value_cache,
     int B, int head_dim, int n_q_heads, int n_kv_heads,
     int layer, const int* d_pos_per_token, int seq_len,
     const int* d_batch_indices, long long B_stride,
-    hipStream_t stream, int kv_dim)
+    hipStream_t stream, int kv_dim, int kv_cache_is_fp16)
 {
     const int q_row = n_q_heads * head_dim;
-    const int vec = ( (q_row % 4 == 0) && (kv_dim % 4 == 0) ) ? 4 : 1;
+    const int vec = (q_row % 4 == 0) ? 4 : 1;  // Q can use vec=4, KV always uses scalar
 
     dim3 block(256);
     dim3 grid( ((max(q_row, kv_dim) + (vec-1)) / vec + block.x - 1) / block.x, B );
@@ -85,11 +93,11 @@ inline void split_qkv(
     if (vec == 4) {
         hipLaunchKernelGGL(split_qkv_kernel<4>, grid, block, 0, stream,
             qkv, q_out, key_cache, value_cache, B, head_dim, n_q_heads, n_kv_heads,
-            layer, d_pos_per_token, seq_len, d_batch_indices, B_stride, kv_dim);
+            layer, d_pos_per_token, seq_len, d_batch_indices, B_stride, kv_dim, kv_cache_is_fp16);
     } else {
         hipLaunchKernelGGL(split_qkv_kernel<1>, grid, block, 0, stream,
             qkv, q_out, key_cache, value_cache, B, head_dim, n_q_heads, n_kv_heads,
-            layer, d_pos_per_token, seq_len, d_batch_indices, B_stride, kv_dim);
+            layer, d_pos_per_token, seq_len, d_batch_indices, B_stride, kv_dim, kv_cache_is_fp16);
     }
     CHECK_HIP(hipGetLastError());
 }

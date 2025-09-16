@@ -18,7 +18,8 @@ __global__ void fa_decode_kernel(
     int chunk_size, int n_chunks,
     const int* __restrict__ pos_per_token,  // (B)
     const int* __restrict__ batch_indices,  // (B)
-    long long B_stride
+    long long B_stride,
+    int kv_cache_is_fp16
 ) {
     const int h = blockIdx.x;
     const int c = blockIdx.y;
@@ -67,16 +68,26 @@ __global__ void fa_decode_kernel(
     const int gb = batch_indices[b];
     const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
     const long long batch_stride = 1ll * seq_len * kv_dim;
-    const float*  k_layer = (const float* )k_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
-    const float*  v_layer = (const float* )v_cache_base + (long long)layer_idx * layer_stride + (long long)gb * batch_stride;
+    // Handle both float32 and bfloat16 KV cache types
+    const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
+    const void*  k_layer_base = (const void*)((const char*)k_cache_base +
+                                             ((long long)layer_idx * layer_stride + (long long)gb * batch_stride) * element_size);
+    const void*  v_layer_base = (const void*)((const char*)v_cache_base +
+                                             ((long long)layer_idx * layer_stride + (long long)gb * batch_stride) * element_size);
 
     for (int t = t0; t < t1; ++t) {
-        const float* __restrict__ k_head_f = k_layer + (long long)t * kv_dim + (long long)g * head_dim;
-
-        // dot(q, k_t)
         float partial = 0.0f;
-        for (int i = tid; i < head_dim; i += blockDim.x)
-            partial += q_sh[i] * k_head_f[i];
+        if (kv_cache_is_fp16) {
+            const __hip_bfloat16* k_head_bf16 = (const __hip_bfloat16*)k_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+            for (int i = tid; i < head_dim; i += blockDim.x) {
+                partial += q_sh[i] * __bfloat162float(k_head_bf16[i]);
+            }
+        } else {
+            const float* k_head_f32 = (const float*)k_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+            for (int i = tid; i < head_dim; i += blockDim.x) {
+                partial += q_sh[i] * k_head_f32[i];
+            }
+        }
         partial = block_reduce_sum(partial);
 
         if (tid == 0) {
@@ -105,12 +116,18 @@ __global__ void fa_decode_kernel(
         }
         __syncthreads();
 
-        // O <- α·O + β·v_t  (kept in shared memory)
-        const float* __restrict__ v_head_f = v_layer + (long long)t * kv_dim + (long long)g * head_dim;
         for (int j = tid; j < head_dim; j += blockDim.x) {
             float o = O_sh[j];
-            o = scale_old_shared * o + scale_new_shared * v_head_f[j];
-            O_sh[j] = o;                   // stay on-chip
+            float v_val;
+            if (kv_cache_is_fp16) {
+                const __hip_bfloat16* v_head_bf16 = (const __hip_bfloat16*)v_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+                v_val = __bfloat162float(v_head_bf16[j]);
+            } else {
+                const float* v_head_f32 = (const float*)v_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+                v_val = v_head_f32[j];
+            }
+            o = scale_old_shared * o + scale_new_shared * v_val;
+            O_sh[j] = o;
         }
         __syncthreads();
     }
@@ -202,6 +219,7 @@ void fa(
     int B,
     int seq_len, int head_dim, int kv_dim, int kv_mul,
     int sliding_window, int layer_idx, int n_attn_heads,
+    int kv_cache_is_fp16,
     const int* d_pos_per_token,      // (B)
     const int* d_batch_indices,      // (B)
     long long B_stride,              // elements per (B*T*kv_dim) per layer
@@ -217,14 +235,9 @@ void fa(
     int chunk_size = choose_chunk_size(Lmax, n_attn_heads);
     int n_chunks   = (Lmax + chunk_size - 1) / chunk_size;
 
-    int tpb = fa_pow2(head_dim);
-    if (tpb < 64) tpb = 64;
-    else if (tpb > 256) tpb = 256;
-
-    size_t shmem = (size_t)head_dim * 2 * sizeof(float);
-
-    const __hip_bfloat16* attn_sinks_head =
-        (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
+    int tpb = fa_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
+    size_t shmem = 2ull * (size_t)head_dim * sizeof(float);
+    const __hip_bfloat16* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
 
     float* partial_O = workspace_partial_O; // (B,H,C,D)
     float* partial_m = workspace_partial_m; // (B,H,C)
@@ -239,7 +252,8 @@ void fa(
                            seq_len, head_dim, kv_dim, kv_mul,
                            sliding_window, layer_idx, n_attn_heads,
                            chunk_size, n_chunks,
-                           d_pos_per_token, d_batch_indices, (long long)B_stride);
+                           d_pos_per_token, d_batch_indices, (long long)B_stride,
+                           kv_cache_is_fp16);
     }
     // Kernel 2: reduction across chunks
     {

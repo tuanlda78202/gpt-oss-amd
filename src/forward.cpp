@@ -129,7 +129,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
         split_qkv(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim, p->n_attn_heads,
                   p->n_kv_heads, l, s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
-                  /*stream=*/0, kv_dim);
+                  /*stream=*/0, kv_dim, s->kv_cache_is_fp16);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -146,9 +146,9 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             const float ntk_beta = 32.0f;
             const float ntk_alpha = 1.0f;
             rope_qk(s->q, s->key_cache, batch_size, p->n_attn_heads, p->n_kv_heads, head_dim,
-                    p->seq_len, kv_dim, l, s->d_pos_per_token, s->d_batch_indices, B_stride,
-                    p->rope_theta, p->rope_scaling_factor, p->initial_context_length, ntk_beta,
-                    ntk_alpha,
+                    p->seq_len, kv_dim, l, s->d_pos_per_token, s->d_batch_indices,
+                    s->kv_cache_is_fp16, B_stride, p->rope_theta, p->rope_scaling_factor,
+                    p->initial_context_length, ntk_beta, ntk_alpha,
                     /*stream=*/0);
         }
         if (g_enable_profiling) {
@@ -165,8 +165,9 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
         fa(s->q, (const void*)s->key_cache, (const void*)s->value_cache, s->mask, w->attn_sinks,
            s->tb, batch_size, p->seq_len, head_dim, kv_dim, kv_mul, p->sliding_window, (int)l,
-           p->n_attn_heads, s->d_pos_per_token, s->d_batch_indices, (long long)B_stride,
-           max_pos_in_batch, s->fa_partial_O, s->fa_partial_m, s->fa_partial_l, 0);
+           p->n_attn_heads, s->kv_cache_is_fp16, s->d_pos_per_token, s->d_batch_indices,
+           (long long)B_stride, max_pos_in_batch, s->fa_partial_O, s->fa_partial_m, s->fa_partial_l,
+           0);
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
