@@ -1,117 +1,63 @@
 #define GETP_SKIP_TYPEDEFS
 #include "../../include/tokenizer.hpp"
-#include "../forward.cpp"
-#include "../model.cpp"
+#include "../forward_20b.cpp"
+#include "../model_20b.cpp"
 #include "../sampler.cpp"
 #include "eval.cpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <omp.h>
 #include <stdbool.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
 
-static OssTransformerHybrid** g_all_models = nullptr;   // per-GPU transformer instances
-static OssExpertShard* g_expert_shards = nullptr;       // expert shards shared across DP
-static OssExpertParallelGroup* g_dp_groups = nullptr;   // data-parallel groups
-thread_local OssExpertParallelGroup* t_group = nullptr; // thread-local group handle
-thread_local OssTransformerHybrid* t_d = nullptr;       // primary shard for this thread
+static OssTransformerHybrid** g_models = nullptr; // store all the models
+thread_local OssTransformerHybrid* t_d = nullptr; // local model
 
-static int g_dp_world_size = 1;
-static int g_ep_size = 1;
-static int g_active_devices = 0;
+#define DP 8
+static int num_gpus = 1;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
 
-    int available_devices = 0;
-    CHECK_HIP(hipGetDeviceCount(&available_devices));
-    if (available_devices <= 0) {
+    // Discover GPUs
+    CHECK_HIP(hipGetDeviceCount(&num_gpus));
+    if (num_gpus <= 0) {
         fprintf(stderr, "No HIP devices found.\n");
         exit(EXIT_FAILURE);
     }
 
-    const char* dp_env = getenv("GETP_DP");
-    const char* ep_env = getenv("GETP_EP");
-    int requested_dp = dp_env ? atoi(dp_env) : 1;
-    int requested_ep = ep_env ? atoi(ep_env) : 1;
-    if (requested_dp <= 0)
-        requested_dp = 1;
-    if (requested_ep <= 0)
-        requested_ep = 1;
+    num_gpus = std::max(1, std::min(num_gpus, DP));
+    printf("\n[DP] devices=%d, batch_size=%d\n", num_gpus, batch_size);
+    omp_set_num_threads(num_gpus);
 
-    if (requested_ep > available_devices)
-        requested_ep = available_devices;
-    g_ep_size = requested_ep;
-    g_dp_world_size = (requested_dp > available_devices) ? available_devices : requested_dp;
-    int required_devices = std::max(g_dp_world_size, g_ep_size);
-    if (required_devices > available_devices) {
-        fprintf(stderr, "Requested DP=%d/EP=%d requires %d GPUs but only %d available\n",
-                g_dp_world_size, g_ep_size, required_devices, available_devices);
+    g_models = (OssTransformerHybrid**)malloc(sizeof(OssTransformerHybrid*) * num_gpus);
+    if (!g_models) {
+        fprintf(stderr, "malloc g_models failed\n");
         exit(EXIT_FAILURE);
     }
 
-    printf("\n[Parallel Config] dp=%d, ep=%d, devices=%d (available=%d), batch_size=%d\n",
-           g_dp_world_size, g_ep_size, required_devices, available_devices, batch_size);
+#pragma omp parallel for num_threads(num_gpus) schedule(static)
+    for (int g = 0; g < num_gpus; ++g) {
+        CHECK_HIP(hipSetDevice(g));
 
-    g_all_models = (OssTransformerHybrid**)malloc(sizeof(OssTransformerHybrid*) * required_devices);
-    if (!g_all_models) {
-        fprintf(stderr, "malloc g_all_models failed\n");
-        exit(EXIT_FAILURE);
-    }
-    g_dp_groups = (OssExpertParallelGroup*)malloc(sizeof(OssExpertParallelGroup) * g_dp_world_size);
-    if (!g_dp_groups) {
-        fprintf(stderr, "malloc g_dp_groups failed\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Enable peer access between all participating devices when possible
-    for (int src = 0; src < required_devices; ++src) {
-        CHECK_HIP(hipSetDevice(src));
-        for (int dst = 0; dst < required_devices; ++dst) {
-            if (src == dst)
-                continue;
-            int can_access = 0;
-            CHECK_HIP(hipDeviceCanAccessPeer(&can_access, src, dst));
-            if (can_access) {
-                hipError_t perr = hipDeviceEnablePeerAccess(dst, 0);
-                if (perr != hipSuccess && perr != hipErrorPeerAccessAlreadyEnabled) {
-                    fprintf(stderr, "hipDeviceEnablePeerAccess(%d,%d) failed: %s\n", src, dst,
-                            hipGetErrorString(perr));
-                    exit(EXIT_FAILURE);
-                }
-            }
-        }
-    }
-
-#pragma omp parallel for num_threads(required_devices) schedule(static)
-    for (int idx = 0; idx < required_devices; ++idx) {
-        int device_id = idx;
-        int dp_rank = (idx < g_dp_world_size) ? idx : -1;
-        int ep_rank = (idx < g_ep_size) ? idx : -1;
-
-        CHECK_HIP(hipSetDevice(device_id));
-
-        g_all_models[idx] = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
-        if (!g_all_models[idx]) {
-            fprintf(stderr, "malloc model for device %d failed\n", device_id);
+        g_models[g] = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
+        if (!g_models[g]) {
+            fprintf(stderr, "malloc model for device %d failed\n", g);
             exit(EXIT_FAILURE);
         }
 
-        copy_transformer_to_device_hybrid(transformer_oss, g_all_models[idx], device_id, dp_rank,
-                                          g_ep_size, ep_rank);
+        copy_transformer_to_device_hybrid(transformer_oss, g_models[g]);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
 #pragma omp critical
         {
-            printf("\n--- HYBRID WARM-UP COMPLETE (device %d | dp=%d ep=%d) ---\n", device_id,
-                   dp_rank, ep_rank);
+            printf("\n--- HYBRID WARM-UP COMPLETE (device %d) ---\n", g);
             printf("GPU Memory Status: Total %.2f GB, Used %.2f GB, Free %.2f GB\n",
                    total_mem / (1024.0 * 1024.0 * 1024.0),
                    (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0),
@@ -120,96 +66,24 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
         }
     }
 
-    g_active_devices = required_devices;
-
-    if (g_ep_size > 0) {
-        g_expert_shards = (OssExpertShard*)malloc(sizeof(OssExpertShard) * g_ep_size);
-        if (!g_expert_shards) {
-            fprintf(stderr, "malloc expert shards failed\n");
-            exit(EXIT_FAILURE);
-        }
-        for (int ep = 0; ep < g_ep_size; ++ep) {
-            g_expert_shards[ep].model = g_all_models[ep];
-            g_expert_shards[ep].device_id = ep;
-            g_expert_shards[ep].workspace.x_by_expert = nullptr;
-            g_expert_shards[ep].workspace.mlp1_by_expert = nullptr;
-            g_expert_shards[ep].workspace.gate_by_expert = nullptr;
-            g_expert_shards[ep].workspace.y_by_expert = nullptr;
-            g_expert_shards[ep].workspace.capacity_tokens = 0;
-            g_expert_shards[ep].mutex_handle = new std::mutex();
-        }
-    }
-
-    for (int dp = 0; dp < g_dp_world_size; ++dp) {
-        g_dp_groups[dp].dp_rank = dp;
-        g_dp_groups[dp].ep_size = g_ep_size;
-        g_dp_groups[dp].primary_shard_index = (dp < g_ep_size) ? dp : -1;
-        if (g_ep_size > 0) {
-            g_dp_groups[dp].shards = (OssExpertShard**)malloc(sizeof(OssExpertShard*) * g_ep_size);
-            if (!g_dp_groups[dp].shards) {
-                fprintf(stderr, "malloc shards pointers for dp=%d failed\n", dp);
-                exit(EXIT_FAILURE);
-            }
-            for (int ep = 0; ep < g_ep_size; ++ep) {
-                g_dp_groups[dp].shards[ep] = &g_expert_shards[ep];
-            }
-        } else {
-            g_dp_groups[dp].shards = nullptr;
-        }
-    }
-
-    omp_set_num_threads(g_dp_world_size);
-
     reset_batch_timings();
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
     print_batch_timing_summary();
 
-    if (g_dp_groups) {
-        for (int dp = 0; dp < g_dp_world_size; ++dp) {
-            if (g_dp_groups[dp].shards) {
-                free(g_dp_groups[dp].shards);
-                g_dp_groups[dp].shards = nullptr;
+    if (g_models) {
+#pragma omp parallel for num_threads(num_gpus) schedule(static)
+        for (int g = 0; g < num_gpus; ++g) {
+            CHECK_HIP(hipSetDevice(g));
+            if (g_models[g]) {
+                free_transformer_on_device_hybrid(g_models[g]);
+                free(g_models[g]);
             }
         }
-        free(g_dp_groups);
-        g_dp_groups = nullptr;
+        free(g_models);
+        g_models = nullptr;
     }
-
-    if (g_expert_shards) {
-        for (int ep = 0; ep < g_ep_size; ++ep) {
-            OssExpertShard* shard = &g_expert_shards[ep];
-            CHECK_HIP(hipSetDevice(shard->device_id));
-            if (shard->workspace.x_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.x_by_expert));
-            if (shard->workspace.mlp1_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.mlp1_by_expert));
-            if (shard->workspace.gate_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.gate_by_expert));
-            if (shard->workspace.y_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.y_by_expert));
-            delete reinterpret_cast<std::mutex*>(shard->mutex_handle);
-            shard->mutex_handle = nullptr;
-        }
-        free(g_expert_shards);
-        g_expert_shards = nullptr;
-    }
-
-    if (g_all_models) {
-#pragma omp parallel for schedule(static)
-        for (int idx = 0; idx < g_active_devices; ++idx) {
-            CHECK_HIP(hipSetDevice(idx));
-            if (g_all_models[idx]) {
-                free_transformer_on_device_hybrid(g_all_models[idx]);
-                free(g_all_models[idx]);
-            }
-        }
-        free(g_all_models);
-        g_all_models = nullptr;
-    }
-
-    g_active_devices = 0;
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
@@ -275,11 +149,6 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
                    const char** input_seqs, int** output_tokens_batch, int batch_size, int steps) {
     OssSampler* sampler_oss = (OssSampler*)sampler;
     long long total_tokens_out = 0;
-
-    if (!t_group || !t_d) {
-        fprintf(stderr, "Thread-local expert parallel context not initialized\n");
-        exit(EXIT_FAILURE);
-    }
 
     // Encode all prompts in the batch
     int** prompt_tokens = (int**)malloc(batch_size * sizeof(int*));
@@ -359,7 +228,7 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         }
 
         // Forward pass for the batch with mixed positions
-        float* batch_logits = forward(t_d, t_group, batch_tokens, batch_positions, valid_batch_size,
+        float* batch_logits = forward(t_d, batch_tokens, batch_positions, valid_batch_size,
                                       batch_indices, t_d->config.batch_size);
 
         // Process results for each sequence in the batch
@@ -429,17 +298,11 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
 #pragma omp parallel reduction(+ : total_tokens)
     {
-        const int dp_rank = omp_get_thread_num();
-        if (dp_rank >= g_dp_world_size) {
-            fprintf(stderr, "OMP thread %d exceeds dp_world_size %d\n", dp_rank, g_dp_world_size);
-            exit(EXIT_FAILURE);
-        }
+        const int tid = omp_get_thread_num();
+        const int device = tid; // one OMP thread per device
 
-        OssExpertParallelGroup* group = &g_dp_groups[dp_rank];
-        t_group = group;
-        t_d = g_all_models[dp_rank];
-
-        CHECK_HIP(hipSetDevice(dp_rank));
+        CHECK_HIP(hipSetDevice(device));
+        t_d = g_models[device];
 
         // Per-thread sampler clone
         OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
@@ -447,11 +310,11 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
         // Build the list of request indices owned by this DP device
         int my_count = 0;
-        for (int i = dp_rank; i < N; i += g_dp_world_size)
+        for (int i = device; i < N; i += num_gpus)
             my_count++;
         int* my_idx = (int*)malloc(sizeof(int) * (my_count > 0 ? my_count : 1));
         int w = 0;
-        for (int i = dp_rank; i < N; i += g_dp_world_size)
+        for (int i = device; i < N; i += num_gpus)
             my_idx[w++] = i;
 
         const int batch_size = t_d->config.batch_size;
@@ -459,7 +322,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
         // Batched on this replica
 #pragma omp critical
         {
-            printf("🚀 [DP device %d] Batched inference with batch_size = %d (%d reqs)\n", dp_rank,
+            printf("🚀 [DP device %d] Batched inference with batch_size = %d (%d reqs)\n", device,
                    batch_size, my_count);
             fflush(stdout);
         }
@@ -479,7 +342,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
 #pragma omp critical
             {
-                printf("[DP device %d] 📦 Batch %d/%d (req #%d → #%d)\n", dp_rank,
+                printf("[DP device %d] 📦 Batch %d/%d (req #%d → #%d)\n", device,
                        (start / batch_size) + 1, (my_count + batch_size - 1) / batch_size,
                        my_idx[start] + 1, my_idx[start + cur_bs - 1] + 1);
                 fflush(stdout);
