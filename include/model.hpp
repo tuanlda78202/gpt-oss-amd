@@ -201,9 +201,43 @@ typedef struct {
     int fd;                            // file descriptor for memory mapping
     float* data;                       // memory mapped data pointer
     ssize_t file_size;                 // size of the checkpoint file in bytes
+
+    // Expert-parallel metadata
+    int device_id;        // HIP device hosting this shard
+    int ep_size;          // number of shards in the expert-parallel group
+    int ep_rank;          // shard rank within the group
+    int ep_local_experts; // number of experts owned by this shard
+    int ep_expert_offset; // global expert offset for this shard
+    int dp_rank;          // data-parallel replica rank owning this shard
+
+    int* ep_work_queue; // temporary work queue buffer (device memory)
+    int ep_work_queue_capacity;
 } OssTransformerHybrid;
+
+typedef struct {
+    float* x_by_expert;
+    float* mlp1_by_expert;
+    float* gate_by_expert;
+    float* y_by_expert;
+    int capacity_tokens;
+} OssExpertWorkspace;
+
+typedef struct {
+    OssTransformerHybrid* model; // shard-local transformer instance
+    int device_id;               // HIP device for this shard
+    OssExpertWorkspace workspace;
+    void* mutex_handle; // opaque pointer to std::mutex
+} OssExpertShard;
+
+typedef struct {
+    OssExpertShard** shards; // array of shard descriptors (shared across groups)
+    int dp_rank;             // owning data-parallel replica rank
+    int ep_size;             // number of shards in this group
+    int primary_shard_index; // index within shards corresponding to primary device (-1 if none)
+} OssExpertParallelGroup;
 
 void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name);
-void copy_transformer_to_device_hybrid(OssTransformer* t_h, OssTransformerHybrid* t_d);
+void copy_transformer_to_device_hybrid(OssTransformer* t_h, OssTransformerHybrid* t_d,
+                                       int device_id, int dp_rank, int ep_size, int ep_rank);
 void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d);
