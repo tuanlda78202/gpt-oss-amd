@@ -46,7 +46,10 @@ __global__ void rope_qk_kernel(
     const int* __restrict__ batch_indices,
     long long B_stride,
     float base, float scaling_factor,
-    float initial_ctx_len, float ntk_beta, float ntk_alpha)
+    float initial_ctx_len, float ntk_beta, float ntk_alpha,
+    const long long* __restrict__ d_layer_kv_off,
+    const int* __restrict__ d_layer_kv_cap,
+    const int* __restrict__ d_layer_is_local)
 {
     const int half = head_dim >> 1;
     const int t    = blockIdx.y;  // token
@@ -71,11 +74,15 @@ __global__ void rope_qk_kernel(
         qh[half + i0] = fmaf( x1, s, x2 * c);
     }
 
-    // rotate all K heads at (layer, slot, pos)
-    const long long loff  = (long long)layer * (long long)B_stride * (long long)seq_len * (long long)kv_dim;
+    // rotate all K heads at ring position
+    const long long kv_base = d_layer_kv_off[layer];
+    const int       cap     = d_layer_kv_cap[layer];
+    const int       local   = d_layer_is_local[layer];
+    const int       pos_wrapped = local ? (pos % cap) : pos;
+
     const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
     void* k_base = (void*)((char*)key_cache +
-                          (loff + (long long)slot * (long long)seq_len * kv_dim + (long long)pos * kv_dim) * element_size);
+       (kv_base + (long long)slot * (long long)cap * kv_dim + (long long)pos_wrapped * kv_dim) * element_size);
 
     #pragma unroll 1
     for (int h = 0; h < n_kv_heads; ++h) {
@@ -105,7 +112,8 @@ inline void rope_qk(
     int kv_cache_is_fp16,
     long long B_stride,
     float base, float scaling_factor, float initial_ctx_len, float ntk_beta, float ntk_alpha,
-    hipStream_t stream)
+    hipStream_t stream,
+    const long long* d_layer_kv_off, const int* d_layer_kv_cap, const int* d_layer_is_local)
 {
     const int half = head_dim >> 1;
     const dim3 block(256);
@@ -115,6 +123,7 @@ inline void rope_qk(
         B, n_q_heads, n_kv_heads, head_dim,
         seq_len, kv_dim, layer,
         d_pos_per_token, kv_cache_is_fp16, d_batch_indices, B_stride,
-        base, scaling_factor, initial_ctx_len, ntk_beta, ntk_alpha);
+        base, scaling_factor, initial_ctx_len, ntk_beta, ntk_alpha,
+        d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
     CHECK_HIP(hipGetLastError());
 }

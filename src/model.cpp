@@ -1,4 +1,6 @@
 #include "../include/model.hpp"
+#include <algorithm>
+#include <vector>
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
@@ -160,24 +162,52 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         hipMalloc(&t_d->state.att, (size_t)batch_size * n_attn_heads * seq_len * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.logits, (size_t)batch_size * vocab_size * sizeof(float)));
 
-    // KV cache with batch dimension: (n_layers, batch_size, seq_len, kv_dim)
-    size_t key_cache_size, value_cache_size;
-    if (use_kv16) {
-        key_cache_size =
-            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(__hip_bfloat16);
-        value_cache_size =
-            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(__hip_bfloat16);
-        printf("Using 16-bit KV cache (bfloat16)\n");
-    } else {
-        key_cache_size =
-            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
-        value_cache_size =
-            1ll * n_layers * batch_size * seq_len * n_kv_heads * head_dim * sizeof(float);
-        printf("Using 32-bit KV cache (float32)\n");
+    // Compact KV allocation with per-layer capacities for cyclic cache
+    const int kv_dim = n_kv_heads * head_dim;
+    const int W = conf->sliding_window;
+    const size_t elem_sz = use_kv16 ? sizeof(__hip_bfloat16) : sizeof(float);
+
+    // Host arrays for layout computation
+    std::vector<int> h_cap(n_layers);
+    std::vector<int> h_is_local(n_layers);
+    std::vector<long long> h_off(n_layers + 1, 0);
+
+    // Parity rule: mirror the existing mask parity (local on even layers when sliding_window > 0)
+    auto is_local_layer = [&](int l) { return (conf->sliding_window > 0) && ((l % 2) == 0); };
+
+    for (int l = 0; l < n_layers; ++l) {
+        h_is_local[l] = is_local_layer(l) ? 1 : 0;      // keep behavior identical to mask
+        h_cap[l] = h_is_local[l] ? std::min(W, seq_len) // local: window
+                                 : seq_len;             // dense: full
+        // pack (B, T_cap, kv_dim)
+        h_off[l + 1] = h_off[l] + (long long)batch_size * h_cap[l] * kv_dim;
     }
-    CHECK_HIP(hipMalloc(&t_d->state.key_cache, key_cache_size));
-    CHECK_HIP(hipMalloc(&t_d->state.value_cache, value_cache_size));
+    const size_t kv_elems_total = (size_t)h_off.back();
+    const size_t kv_bytes_total = kv_elems_total * elem_sz;
+
+    // Allocate packed KV with per-layer sizes
+    CHECK_HIP(hipMalloc(&t_d->state.key_cache, kv_bytes_total));
+    CHECK_HIP(hipMalloc(&t_d->state.value_cache, kv_bytes_total));
     t_d->state.kv_cache_is_fp16 = use_kv16;
+
+    // Device copies of layout
+    CHECK_HIP(hipMalloc(&t_d->state.d_layer_kv_off, (size_t)n_layers * sizeof(long long)));
+    CHECK_HIP(hipMalloc(&t_d->state.d_layer_kv_cap, (size_t)n_layers * sizeof(int)));
+    CHECK_HIP(hipMalloc(&t_d->state.d_layer_is_local, (size_t)n_layers * sizeof(int)));
+    CHECK_HIP(hipMemcpy(t_d->state.d_layer_kv_off, h_off.data(), n_layers * sizeof(long long),
+                        hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(t_d->state.d_layer_kv_cap, h_cap.data(), n_layers * sizeof(int),
+                        hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(t_d->state.d_layer_is_local, h_is_local.data(), n_layers * sizeof(int),
+                        hipMemcpyHostToDevice));
+
+    // Device arrays are passed as kernel parameters directly
+
+    if (use_kv16) {
+        printf("Using 16-bit KV cache (bfloat16) with cyclic buffers\n");
+    } else {
+        printf("Using 32-bit KV cache (float32) with cyclic buffers\n");
+    }
     CHECK_HIP(hipMalloc(&t_d->state.mask, (size_t)seq_len * seq_len * sizeof(float)));
 
     CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));
@@ -300,8 +330,8 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipMemset(t_d->state.q, 0, batch_size * n_attn_heads * head_dim * sizeof(float)));
     CHECK_HIP(hipMemset(t_d->state.att, 0, batch_size * n_attn_heads * seq_len * sizeof(float)));
     CHECK_HIP(hipMemset(t_d->state.logits, 0, batch_size * vocab_size * sizeof(float)));
-    CHECK_HIP(hipMemset(t_d->state.key_cache, 0, key_cache_size));
-    CHECK_HIP(hipMemset(t_d->state.value_cache, 0, value_cache_size));
+    CHECK_HIP(hipMemset(t_d->state.key_cache, 0, kv_bytes_total));
+    CHECK_HIP(hipMemset(t_d->state.value_cache, 0, kv_bytes_total));
     if (conf->sliding_window > 0) {
         float* mask_host = (float*)calloc(seq_len * seq_len, sizeof(float));
         for (int i = 0; i < seq_len; i++) {

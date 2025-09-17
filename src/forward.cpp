@@ -12,6 +12,7 @@
 #include "hip/topk.hip"
 #include "hip/vecadd.hip"
 #include "profiler.cpp"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -129,7 +130,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         }
         split_qkv(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim, p->n_attn_heads,
                   p->n_kv_heads, l, s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
-                  /*stream=*/0, kv_dim, s->kv_cache_is_fp16);
+                  /*stream=*/0, kv_dim, s->kv_cache_is_fp16, s->d_layer_kv_off, s->d_layer_kv_cap,
+                  s->d_layer_is_local);
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
             CHECK_HIP(hipEventSynchronize(end_section));
@@ -149,7 +151,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                     p->seq_len, kv_dim, l, s->d_pos_per_token, s->d_batch_indices,
                     s->kv_cache_is_fp16, B_stride, p->rope_theta, p->rope_scaling_factor,
                     p->initial_context_length, ntk_beta, ntk_alpha,
-                    /*stream=*/0);
+                    /*stream=*/0, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
         }
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));
@@ -163,11 +165,15 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(start_section, 0));
         }
-        fa(s->q, (const void*)s->key_cache, (const void*)s->value_cache, s->mask, w->attn_sinks,
-           s->tb, batch_size, p->seq_len, head_dim, kv_dim, kv_mul, p->sliding_window, (int)l,
-           p->n_attn_heads, s->kv_cache_is_fp16, s->d_pos_per_token, s->d_batch_indices,
+        const int is_local = ((p->sliding_window > 0) && ((l % 2) == 0));
+        const int L_full = max_pos_in_batch + 1;
+        const float* mask_ptr = is_local ? nullptr : s->mask;
+
+        fa(s->q, (const void*)s->key_cache, (const void*)s->value_cache, mask_ptr, w->attn_sinks,
+           s->tb, batch_size, /*seq_len*/ L_full, head_dim, kv_dim, kv_mul, p->sliding_window,
+           (int)l, p->n_attn_heads, s->kv_cache_is_fp16, s->d_pos_per_token, s->d_batch_indices,
            (long long)B_stride, max_pos_in_batch, s->fa_partial_O, s->fa_partial_m, s->fa_partial_l,
-           0);
+           0, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
 
         if (g_enable_profiling) {
             CHECK_HIP(hipEventRecord(end_section, 0));

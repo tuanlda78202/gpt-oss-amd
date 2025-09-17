@@ -157,6 +157,11 @@ typedef struct {
     int kv_cache_is_fp16; // flag: 1 if using bfloat16, 0 if using float32
     float* mask;          // (seq_len, seq_len) - shared across batch
 
+    // ! cyclic kv cache metadata
+    long long* d_layer_kv_off; // base offset (in elements) per layer
+    int* d_layer_kv_cap;       // time-capacity per layer
+    int* d_layer_is_local;     // 1 if sliding-window layer, else 0
+
     int* d_batch_indices; // (max_batch_size) - persistent GPU batch indices
     int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
     int* d_pos_per_token; // (max_batch_size) - persistent GPU positions per token

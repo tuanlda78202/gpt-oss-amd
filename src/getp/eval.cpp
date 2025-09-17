@@ -56,7 +56,7 @@ int read_inputfile(const char* input_filename, int max_token_len, int max_seq_le
 
         // Apply truncation if requested
         if (truncate_lines > 0 && truncate_lines < num_reqs) {
-            printf("Truncating input from %d to %d lines\n", num_reqs, truncate_lines);
+            printf("truncating input from %d to %d lines\n", num_reqs, truncate_lines);
             num_reqs = truncate_lines;
         }
 

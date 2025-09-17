@@ -18,7 +18,10 @@ __global__ void fa_decode_kernel(
     const int* __restrict__ pos_per_token,  // (B)
     const int* __restrict__ batch_indices,  // (B)
     long long B_stride,
-    int kv_cache_is_fp16
+    int kv_cache_is_fp16,
+    const long long* __restrict__ d_layer_kv_off,
+    const int* __restrict__ d_layer_kv_cap,
+    const int* __restrict__ d_layer_is_local
 ) {
     const int h = blockIdx.x;
     const int c = blockIdx.y;
@@ -62,27 +65,36 @@ __global__ void fa_decode_kernel(
     if (tid == 0) { m_shared = -3.402823466e+38f; l_shared = 0.0f; }
     __syncthreads();
 
-    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0);
+    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
+
+    // Ring indexing
+    const long long kv_base = d_layer_kv_off[layer_idx];
+    const int       cap     = d_layer_kv_cap[layer_idx];
+    const int       local   = d_layer_is_local[layer_idx];
 
     const int gb = batch_indices[b];
-    const long long layer_stride = 1ll * B_stride * seq_len * kv_dim;
-    const long long batch_stride = 1ll * seq_len * kv_dim;
     // Handle both float32 and bfloat16 KV cache types
     const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
-    const void*  k_layer_base = (const void*)((const char*)k_cache_base +
-                                             ((long long)layer_idx * layer_stride + (long long)gb * batch_stride) * element_size);
-    const void*  v_layer_base = (const void*)((const char*)v_cache_base +
-                                             ((long long)layer_idx * layer_stride + (long long)gb * batch_stride) * element_size);
+    const long long batch_offset = kv_base + (long long)gb * (long long)cap * kv_dim;
+    const void*  k_layer_base = (const void*)((const char*)k_cache_base + batch_offset * element_size);
+    const void*  v_layer_base = (const void*)((const char*)v_cache_base + batch_offset * element_size);
 
-    for (int t = t0; t < t1; ++t) {
+    const bool local_no_mask = (local != 0) && (mask == nullptr);
+    const int t_window_start = local_no_mask ? max(0, pos_b - sliding_window + 1) : 0;
+
+    const int t_start = local_no_mask ? max(t0, t_window_start) : t0;
+
+    for (int t = t_start; t < t1; ++t) {
         float partial = 0.0f;
+        const int ring_t = local ? (t % cap) : t;
+
         if (kv_cache_is_fp16) {
-            const __hip_bfloat16* k_head_bf16 = (const __hip_bfloat16*)k_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+            const __hip_bfloat16* k_head_bf16 = (const __hip_bfloat16*)k_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
             for (int i = tid; i < head_dim; i += blockDim.x) {
                 partial += q_sh[i] * __bfloat162float(k_head_bf16[i]);
             }
         } else {
-            const float* k_head_f32 = (const float*)k_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+            const float* k_head_f32 = (const float*)k_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
             for (int i = tid; i < head_dim; i += blockDim.x) {
                 partial += q_sh[i] * k_head_f32[i];
             }
@@ -119,10 +131,10 @@ __global__ void fa_decode_kernel(
             float o = O_sh[j];
             float v_val;
             if (kv_cache_is_fp16) {
-                const __hip_bfloat16* v_head_bf16 = (const __hip_bfloat16*)v_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+                const __hip_bfloat16* v_head_bf16 = (const __hip_bfloat16*)v_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
                 v_val = __bfloat162float(v_head_bf16[j]);
             } else {
-                const float* v_head_f32 = (const float*)v_layer_base + (long long)t * kv_dim + (long long)g * head_dim;
+                const float* v_head_f32 = (const float*)v_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
                 v_val = v_head_f32[j];
             }
             o = scale_old_shared * o + scale_new_shared * v_val;
@@ -225,11 +237,14 @@ void fa(
     float* workspace_partial_O,      // Pre-allocated workspace
     float* workspace_partial_m,      // Pre-allocated workspace
     float* workspace_partial_l,      // Pre-allocated workspace
-    hipStream_t stream)
+    hipStream_t stream,
+    const long long* d_layer_kv_off,
+    const int* d_layer_kv_cap,
+    const int* d_layer_is_local)
 {
     if (B <= 0 || n_attn_heads <= 0 || head_dim <= 0) return;
 
-    const int Lmax = max_pos_in_batch + 1;
+    const int Lmax = seq_len;
     int chunk_size = choose_chunk_size(Lmax, n_attn_heads);
     int n_chunks   = (Lmax + chunk_size - 1) / chunk_size;
 
@@ -251,7 +266,8 @@ void fa(
                            sliding_window, layer_idx, n_attn_heads,
                            chunk_size, n_chunks,
                            d_pos_per_token, d_batch_indices, (long long)B_stride,
-                           kv_cache_is_fp16);
+                           kv_cache_is_fp16,
+                           d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
     }
     // Kernel 2: reduction across chunks
     {
