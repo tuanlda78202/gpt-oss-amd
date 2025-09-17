@@ -340,9 +340,9 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             CHECK_HIP(hipEventRecord(start_moe_sub, 0));
         }
 
-        static int* d_work_queue = nullptr;
-        static int d_work_queue_capacity = 0;
-        static Int2* d_meta = nullptr;
+        thread_local static int* d_work_queue = nullptr;
+        thread_local static int d_work_queue_capacity = 0;
+        thread_local static Int2* d_meta = nullptr;
 
         const int required_ints = 3 * n_experts;
         if (required_ints > d_work_queue_capacity) {

@@ -72,7 +72,7 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     int n_kv_heads = conf->n_kv_heads;
     int seq_len = conf->seq_len;
 
-    printf("\nConverting model to hybrid precision...\n");
+    // printf("\nConverting model to hybrid precision...\n");
 
     // ! GPU Check
     int current_device;
@@ -134,7 +134,7 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     // ! Allocate FP32 state on GPU (with batch dimension B)
     int batch_size = conf->batch_size;
-    printf("🚒 Allocating GPU buffers for batch size %d...\n", batch_size);
+    // printf("🚒 Allocating GPU buffers for batch size %d...\n", batch_size);
 
     CHECK_HIP(hipMalloc(&t_d->state.x, (size_t)batch_size * hidden_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.t, (size_t)batch_size * hidden_dim * sizeof(float)));

@@ -14,26 +14,57 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-OssTransformerHybrid* t_d;
+static OssTransformerHybrid** g_models = nullptr; // store all the models
+thread_local OssTransformerHybrid* t_d = nullptr; // local model
+
+#define DP 8
+static int num_gpus = 1;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
-
-    t_d = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
-
     transformer_oss->config.batch_size = batch_size;
 
-    copy_transformer_to_device(transformer_oss, t_d, use_kv16);
+    // Discover GPUs
+    CHECK_HIP(hipGetDeviceCount(&num_gpus));
+    if (num_gpus <= 0) {
+        fprintf(stderr, "No HIP devices found.\n");
+        exit(EXIT_FAILURE);
+    }
 
-    size_t free_mem, total_mem;
-    CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
-    size_t used_mem = total_mem - free_mem;
-    printf("\n--- HYBRID WARM-UP COMPLETE ---\n");
-    printf("GPU Memory Status:\n");
-    printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
-    printf("-------------------------------\n");
+    num_gpus = std::max(1, std::min(num_gpus, DP));
+    printf("\n[DP] devices=%d, batch_size=%d\n", num_gpus, batch_size);
+    omp_set_num_threads(num_gpus);
+
+    g_models = (OssTransformerHybrid**)malloc(sizeof(OssTransformerHybrid*) * num_gpus);
+    if (!g_models) {
+        fprintf(stderr, "malloc g_models failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+#pragma omp parallel for num_threads(num_gpus) schedule(static)
+    for (int g = 0; g < num_gpus; ++g) {
+        CHECK_HIP(hipSetDevice(g));
+
+        g_models[g] = (OssTransformerHybrid*)malloc(sizeof(OssTransformerHybrid));
+        if (!g_models[g]) {
+            fprintf(stderr, "malloc model for device %d failed\n", g);
+            exit(EXIT_FAILURE);
+        }
+
+        copy_transformer_to_device(transformer_oss, g_models[g], use_kv16);
+
+        size_t free_mem, total_mem;
+        CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
+#pragma omp critical
+        {
+            printf("\n--- HYBRID WARM-UP COMPLETE (device %d) ---\n", g);
+            printf("GPU Memory Status: Total %.2f GB, Used %.2f GB, Free %.2f GB\n",
+                   total_mem / (1024.0 * 1024.0 * 1024.0),
+                   (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0),
+                   free_mem / (1024.0 * 1024.0 * 1024.0));
+            printf("-----------------------------------------------\n");
+        }
+    }
 
     reset_batch_timings();
 }
@@ -41,8 +72,18 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
     print_batch_timing_summary();
 
-    free_transformer_on_device(t_d);
-    free(t_d);
+    if (g_models) {
+#pragma omp parallel for num_threads(num_gpus) schedule(static)
+        for (int g = 0; g < num_gpus; ++g) {
+            CHECK_HIP(hipSetDevice(g));
+            if (g_models[g]) {
+                free_transformer_on_device(g_models[g]);
+                free(g_models[g]);
+            }
+        }
+        free(g_models);
+        g_models = nullptr;
+    }
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
@@ -252,42 +293,73 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
 
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
-    long long num_token_out = 0;
-    int batch_size = t_d->config.batch_size;
+    const int N = requests->num_reqs;
+    long long total_tokens = 0;
 
-    for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += batch_size) {
-        int current_batch_size = ((requests->num_reqs - start_idx) < batch_size)
-                                     ? (requests->num_reqs - start_idx)
-                                     : batch_size;
+#pragma omp parallel reduction(+ : total_tokens)
+    {
+        const int tid = omp_get_thread_num();
+        const int device = tid; // one OMP thread per device
 
-        printf("\n📦 Batch %d/%d (#%d->%d):\n", (start_idx / batch_size) + 1,
-               (requests->num_reqs + batch_size - 1) / batch_size, start_idx + 1,
-               start_idx + current_batch_size);
+        CHECK_HIP(hipSetDevice(device));
+        t_d = g_models[device];
 
-        const char** input_seqs = (const char**)malloc(batch_size * sizeof(const char*));
-        int** output_tokens_batch = (int**)malloc(batch_size * sizeof(int*));
+        // Per-thread sampler clone
+        OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
+        memcpy(sampler_copy, sampler, sizeof(OssSampler));
 
-        for (int i = 0; i < current_batch_size; i++) {
-            int req_idx = start_idx + i;
-            input_seqs[i] = get_str_req_ptr(requests, req_idx);
-            output_tokens_batch[i] = get_tok_gen_ptr(requests, req_idx);
+        // Build the list of request indices owned by this DP device
+        int my_count = 0;
+        for (int i = device; i < N; i += num_gpus)
+            my_count++;
+        int* my_idx = (int*)malloc(sizeof(int) * (my_count > 0 ? my_count : 1));
+        int w = 0;
+        for (int i = device; i < N; i += num_gpus)
+            my_idx[w++] = i;
+
+        const int batch_size = t_d->config.batch_size;
+
+        // Batched on this replica
+#pragma omp critical
+        {
+            printf("🚀 [DP device %d] Batched inference with batch_size = %d (%d reqs)\n", device,
+                   batch_size, my_count);
+            fflush(stdout);
         }
 
-        // Fill remaining slots with nulls if needed
-        for (int i = current_batch_size; i < batch_size; i++) {
-            input_seqs[i] = "";
-            output_tokens_batch[i] = nullptr;
+        for (int start = 0; start < my_count; start += batch_size) {
+            const int cur_bs = ((my_count - start) < batch_size) ? (my_count - start) : batch_size;
+
+            // Allocate batch views
+            const char** input_seqs = (const char**)malloc(sizeof(char*) * cur_bs);
+            int** out_tok_ptrs = (int**)malloc(sizeof(int*) * cur_bs);
+
+            for (int i = 0; i < cur_bs; ++i) {
+                const int req_idx = my_idx[start + i];
+                input_seqs[i] = get_str_req_ptr(requests, req_idx);
+                out_tok_ptrs[i] = get_tok_gen_ptr(requests, req_idx);
+            }
+
+#pragma omp critical
+            {
+                printf("[DP device %d] 📦 Batch %d/%d (req #%d → #%d)\n", device,
+                       (start / batch_size) + 1, (my_count + batch_size - 1) / batch_size,
+                       my_idx[start] + 1, my_idx[start + cur_bs - 1] + 1);
+                fflush(stdout);
+            }
+
+            total_tokens += generate(transformer, tokenizer, (Sampler*)sampler_copy, input_seqs,
+                                     out_tok_ptrs, cur_bs, requests->max_seq_len);
+
+            free(input_seqs);
+            free(out_tok_ptrs);
         }
 
-        // Process batch
-        num_token_out += generate(transformer, tokenizer, sampler, input_seqs, output_tokens_batch,
-                                  current_batch_size, requests->max_seq_len);
+        free(my_idx);
+        free(sampler_copy);
+    } // omp parallel
 
-        free(input_seqs);
-        free(output_tokens_batch);
-    }
-
-    return num_token_out;
+    return total_tokens;
 }
 
 #endif // GETP_RUN
