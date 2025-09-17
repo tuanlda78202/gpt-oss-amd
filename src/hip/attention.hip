@@ -4,7 +4,6 @@
 #include <vector>
 #include <cmath>
 
-__launch_bounds__(256, 2)
 __global__ void fa_decode_kernel(
     const float* __restrict__ q_batch,      // (B, H*D)
     const void*  __restrict__ k_cache_base,
@@ -141,7 +140,6 @@ __global__ void fa_decode_kernel(
     }
 }
 
-__launch_bounds__(256, 2)
 __global__ void fa_reduce_kernel(
     const float* __restrict__ partial_O,     // (B,H,C,D)
     const float* __restrict__ partial_m,     // (B,H,C)

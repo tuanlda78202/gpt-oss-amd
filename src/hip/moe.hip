@@ -2,6 +2,26 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 
+__device__ __forceinline__ float4 bf16x4_to_float4(const __hip_bfloat16* ptr) {
+    float4 result;
+    const __hip_bfloat162 lo = *reinterpret_cast<const __hip_bfloat162*>(ptr + 0);
+    const __hip_bfloat162 hi = *reinterpret_cast<const __hip_bfloat162*>(ptr + 2);
+    const float2 flo = __bfloat1622float2(lo);
+    const float2 fhi = __bfloat1622float2(hi);
+    result.x = flo.x;
+    result.y = flo.y;
+    result.z = fhi.x;
+    result.w = fhi.y;
+    return result;
+}
+
+__device__ __forceinline__ float fma_dot4(const float4& a, const float4& b, float acc) {
+    acc = fmaf(a.x, b.x, acc);
+    acc = fmaf(a.y, b.y, acc);
+    acc = fmaf(a.z, b.z, acc);
+    return fmaf(a.w, b.w, acc);
+}
+
 // MLP1 (GEMV) + SwiGLU: [Ne,H] x [H,2I] -> [Ne,I]
 template <int RB, int KTILE>
 __global__ void moe_mlp1_swiglu_kernel(
@@ -64,48 +84,42 @@ __global__ void moe_mlp1_swiglu_kernel(
             const int Ktile = (rem < KTILE) ? rem : KTILE;
 
             // stage B tile -> sB
+            const float* __restrict__ B_tile = B + k0;
             const int vecN = Ktile >> 2;
+            float4* __restrict__ sB_vec = reinterpret_cast<float4*>(sB);
             for (int j4 = tid; j4 < vecN; j4 += threads) {
-                reinterpret_cast<float4*>(sB)[j4] =
-                    *reinterpret_cast<const float4*>(&B[k0 + (j4 << 2)]);
+                const int offset = j4 << 2;
+                sB_vec[j4] = *reinterpret_cast<const float4*>(&B_tile[offset]);
             }
             for (int j = (vecN << 2) + tid; j < Ktile; j += threads) {
-                sB[j] = B[k0 + j];
+                sB[j] = B_tile[j];
             }
             __syncthreads();
 
             if (valid_row) {
                 // vectorized over columns
                 const int vecRow = Ktile >> 2;
-                for (int j4 = lane; j4 < vecRow; j4 += 64) {
-                    const int j = j4 << 2;
+                const int warp_width = 64;
+                const int vec_stride = warp_width << 2;
 
-                    __hip_bfloat162 g0 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base_gate + k0 + j + 0]);
-                    __hip_bfloat162 g1 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base_gate + k0 + j + 2]);
-                    __hip_bfloat162 u0 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base_up   + k0 + j + 0]);
-                    __hip_bfloat162 u1 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base_up   + k0 + j + 2]);
+                const __hip_bfloat16* __restrict__ gate_tile = A_half + a_base_gate + k0;
+                const __hip_bfloat16* __restrict__ up_tile   = A_half + a_base_up   + k0;
+                const float4* __restrict__ sB_vec_const = reinterpret_cast<const float4*>(sB);
 
-                    float2 gf0 = __bfloat1622float2(g0);
-                    float2 gf1 = __bfloat1622float2(g1);
-                    float2 uf0 = __bfloat1622float2(u0);
-                    float2 uf1 = __bfloat1622float2(u1);
+                for (int j4 = lane, offset = (lane << 2); j4 < vecRow; j4 += warp_width, offset += vec_stride) {
+                    const float4 b4 = sB_vec_const[j4];
+                    const float4 g4 = bf16x4_to_float4(gate_tile + offset);
+                    const float4 u4 = bf16x4_to_float4(up_tile   + offset);
 
-                    float4 bv = *reinterpret_cast<const float4*>(&sB[j]);
-
-                    acc_gate = fmaf(gf0.x, bv.x, acc_gate);
-                    acc_gate = fmaf(gf0.y, bv.y, acc_gate);
-                    acc_gate = fmaf(gf1.x, bv.z, acc_gate);
-                    acc_gate = fmaf(gf1.y, bv.w, acc_gate);
-
-                    acc_up   = fmaf(uf0.x, bv.x, acc_up);
-                    acc_up   = fmaf(uf0.y, bv.y, acc_up);
-                    acc_up   = fmaf(uf1.x, bv.z, acc_up);
-                    acc_up   = fmaf(uf1.y, bv.w, acc_up);
+                    acc_gate = fma_dot4(g4, b4, acc_gate);
+                    acc_up   = fma_dot4(u4, b4, acc_up);
                 }
-                for (int j = ((Ktile >> 2) << 2) + lane; j < Ktile; j += 64) {
-                    const float b = sB[j];
-                    const float ag = __bfloat162float(A_half[a_base_gate + k0 + j]);
-                    const float au = __bfloat162float(A_half[a_base_up   + k0 + j]);
+
+                const int scalar_start = (vecRow << 2) + lane;
+                for (int j = scalar_start; j < Ktile; j += warp_width) {
+                    const float b  = sB[j];
+                    const float ag = __bfloat162float(gate_tile[j]);
+                    const float au = __bfloat162float(up_tile[j]);
                     acc_gate = fmaf(ag, b, acc_gate);
                     acc_up   = fmaf(au, b, acc_up);
                 }
@@ -125,7 +139,7 @@ __global__ void moe_mlp1_swiglu_kernel(
             up   = fminf(up,    swiglu_limit);
             up   = fmaxf(up,   -swiglu_limit);
 
-            gate *= (1.0f / (1.0f + expf(-alpha * gate))); // gate * sigmoid(alpha*gate)
+            gate *= (1.0f / (1.0f + __expf(-alpha * gate))); // gate * sigmoid(alpha*gate)
             gate *= (up + 1.0f);
 
             O[irow] = gate;
@@ -207,35 +221,36 @@ __global__ void moe_mlp2_scatter_kernel(
             const int rem   = I - k0;
             const int Ktile = (rem < KTILE) ? rem : KTILE;
 
+            const float* __restrict__ B_tile = B + k0;
             const int vecN = Ktile >> 2;
+            float4* __restrict__ sB_vec = reinterpret_cast<float4*>(sB);
             for (int j4 = tid; j4 < vecN; j4 += threads) {
-                reinterpret_cast<float4*>(sB)[j4] =
-                    *reinterpret_cast<const float4*>(&B[k0 + (j4 << 2)]);
+                const int offset = j4 << 2;
+                sB_vec[j4] = *reinterpret_cast<const float4*>(&B_tile[offset]);
             }
             for (int j = (vecN << 2) + tid; j < Ktile; j += threads) {
-                sB[j] = B[k0 + j];
+                sB[j] = B_tile[j];
             }
             __syncthreads();
 
             if (valid_row) {
                 const int vecRow = Ktile >> 2;
-                for (int j4 = lane; j4 < vecRow; j4 += 64) {
-                    const int j = j4 << 2;
+                const int warp_width = 64;
+                const int vec_stride = warp_width << 2;
 
-                    __hip_bfloat162 a0 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base + k0 + j + 0]);
-                    __hip_bfloat162 a1 = *reinterpret_cast<const __hip_bfloat162*>(&A_half[a_base + k0 + j + 2]);
-                    float2 af0 = __bfloat1622float2(a0);
-                    float2 af1 = __bfloat1622float2(a1);
+                const __hip_bfloat16* __restrict__ row_tile = A_half + a_base + k0;
+                const float4* __restrict__ sB_vec_const = reinterpret_cast<const float4*>(sB);
 
-                    float4 bv = *reinterpret_cast<const float4*>(&sB[j]);
-                    acc = fmaf(af0.x, bv.x, acc);
-                    acc = fmaf(af0.y, bv.y, acc);
-                    acc = fmaf(af1.x, bv.z, acc);
-                    acc = fmaf(af1.y, bv.w, acc);
+                for (int j4 = lane, offset = (lane << 2); j4 < vecRow; j4 += warp_width, offset += vec_stride) {
+                    const float4 b4 = sB_vec_const[j4];
+                    const float4 a4 = bf16x4_to_float4(row_tile + offset);
+                    acc = fma_dot4(a4, b4, acc);
                 }
-                for (int j = ((Ktile >> 2) << 2) + lane; j < Ktile; j += 64) {
+
+                const int scalar_start = (vecRow << 2) + lane;
+                for (int j = scalar_start; j < Ktile; j += warp_width) {
                     const float b = sB[j];
-                    const float a = __bfloat162float(A_half[a_base + k0 + j]);
+                    const float a = __bfloat162float(row_tile[j]);
                     acc = fmaf(a, b, acc);
                 }
             }

@@ -6,7 +6,6 @@ static inline int ceil_div1(int a, int b) { return (a + b - 1) / b; }
 static inline __device__ int imin(int a, int b) { return a < b ? a : b; }
 
 template<int BM, int BN, int BK, int TM, int TN>
-__launch_bounds__(256, 2)
 __global__ void gemm_kernel( // Compute C^T = A (M×K) * B^T (K×N)
     const __hip_bfloat16* __restrict__ A_half, // [M,K] row-major
     const float*          __restrict__ B_batch, // [N,K] row-major (N = batch_size)
