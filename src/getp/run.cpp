@@ -20,7 +20,7 @@ thread_local OssTransformerHybrid* t_d = nullptr; // local model
 #define DP 8
 static int num_gpus = 1;
 
-void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
 
@@ -51,7 +51,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
             exit(EXIT_FAILURE);
         }
 
-        copy_transformer_to_device_hybrid(transformer_oss, g_models[g]);
+        copy_transformer_to_device(transformer_oss, g_models[g], use_kv16);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
@@ -77,7 +77,7 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
         for (int g = 0; g < num_gpus; ++g) {
             CHECK_HIP(hipSetDevice(g));
             if (g_models[g]) {
-                free_transformer_on_device_hybrid(g_models[g]);
+                free_transformer_on_device(g_models[g]);
                 free(g_models[g]);
             }
         }

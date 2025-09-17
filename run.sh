@@ -128,10 +128,11 @@ usage() {
   echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 32)"
   echo -e "    ${WHITE}-f${NC}                     Enable forward pass profiling (shows timing breakdown)"
   echo -e "    ${WHITE}-v VERIFY_FILE${NC}         Ground truth file for verification (default: tests/gt/output_20b.txt)"
+  echo -e "    ${WHITE}--kv16${NC}                 Enable 16-bit KV cache (bfloat16, default: off)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
+  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE] [--kv16]${NC}"
   echo ""
   echo -e "  ${CYAN}Features:${NC}"
   echo -e "    • Combines: ${WHITE}./run.sh build && ./run.sh run${NC}"
@@ -270,6 +271,7 @@ cmd_run() {
   local enable_profiling=""
   local verify_file=""
   local truncate_lines=""
+  local kv16_flag=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -289,6 +291,7 @@ cmd_run() {
       -f) enable_profiling="1"; shift 1 ;;
       -v) verify_file="$2"; shift 2 ;;
       -t) truncate_lines="$2"; shift 2 ;;
+      --kv16) kv16_flag="1"; shift 1 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -375,6 +378,7 @@ cmd_run() {
   [[ -n "${enable_profiling}" ]] && args+=(-f "1")
   [[ -n "${verify_file}" ]] && args+=(-v "${verify_file}")
   [[ -n "${truncate_lines}" ]] && args+=(-t "${truncate_lines}")
+  [[ -n "${kv16_flag}" ]] && args+=(--kv16)
 
   local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
