@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 
@@ -92,23 +93,85 @@ __launch_bounds__(64 * WR * WC, 2) __global__ void moe_mlp1_swiglu_mfma_kernel(
         return;
 
     const int num_k_tiles = (K + BK - 1) / BK;
+    const bool full_m_tile = (m0 + MT_M) <= M;
 
     for (int tile_x = blockIdx.x; tile_x < total_tiles_n; tile_x += gridDim.x) {
         const int n0 = tile_x * MT_N;
         const int n_base = n0 + subtile_c * 16;
+        const bool full_n_tile = (n0 + MT_N) <= N;
 
         f4 d = {0.f, 0.f, 0.f, 0.f};
 
-        for (int p = tid; p < elemsA; p += TPB) {
-            const int mi = p / BK;
-            const int kk = p % BK;
-            sA0[mi * (BK + 1) + kk] = ldA(m0 + mi, kk);
-        }
-        for (int p = tid; p < elemsB; p += TPB) {
-            const int ki = p % BK;
-            const int nj = p / BK;
-            sB0[ki * (MT_N + 1) + nj] = ldB(n0 + nj, ki);
-        }
+        auto copy_tile_A = [&](int k0, __hip_bfloat16* dst) {
+            const bool full_k_tile = (k0 + BK) <= K;
+            const bool vectorizable = full_m_tile && full_k_tile && (K % 8 == 0) &&
+                                      is_aligned_16(A + (size_t)m0 * (size_t)K + (size_t)k0);
+            if constexpr ((BK % 8) == 0) {
+                if (vectorizable) {
+                    const int vec_per_row = BK / 8;
+                    const int total_vec = MT_M * vec_per_row;
+                    for (int idx = tid; idx < total_vec; idx += TPB) {
+                        int mi = idx / vec_per_row;
+                        int vec = idx % vec_per_row;
+                        const __hip_bfloat16* g_row =
+                            A + (size_t)(m0 + mi) * (size_t)K + (size_t)(k0 + vec * 8);
+                        __hip_bfloat16* s_row = dst + mi * (BK + 1) + vec * 8;
+                        uint4 packed = reinterpret_cast<const uint4*>(g_row)[0];
+                        uint16_t* s16 = reinterpret_cast<uint16_t*>(s_row);
+                        s16[0] = static_cast<uint16_t>(packed.x & 0xFFFF);
+                        s16[1] = static_cast<uint16_t>(packed.x >> 16);
+                        s16[2] = static_cast<uint16_t>(packed.y & 0xFFFF);
+                        s16[3] = static_cast<uint16_t>(packed.y >> 16);
+                        s16[4] = static_cast<uint16_t>(packed.z & 0xFFFF);
+                        s16[5] = static_cast<uint16_t>(packed.z >> 16);
+                        s16[6] = static_cast<uint16_t>(packed.w & 0xFFFF);
+                        s16[7] = static_cast<uint16_t>(packed.w >> 16);
+                    }
+                    return;
+                }
+            }
+
+            for (int p = tid; p < elemsA; p += TPB) {
+                const int mi = p / BK;
+                const int kk = p % BK;
+                dst[mi * (BK + 1) + kk] = ldA(m0 + mi, k0 + kk);
+            }
+        };
+
+        auto copy_tile_B = [&](int k0, float* dst) {
+            const bool full_k_tile = (k0 + BK) <= K;
+            const bool vectorizable = full_n_tile && full_k_tile && (K % 4 == 0) &&
+                                      is_aligned_16(B_batch + (size_t)n0 * (size_t)K +
+                                                    (size_t)k0);
+            if constexpr ((BK % 4) == 0) {
+                if (vectorizable) {
+                    const int vec_per_row = BK / 4;
+                    const int total_vec = MT_N * vec_per_row;
+                    for (int idx = tid; idx < total_vec; idx += TPB) {
+                        int nj = idx / vec_per_row;
+                        int vec = idx % vec_per_row;
+                        const float* g_row = B_batch + (size_t)(n0 + nj) * (size_t)K +
+                                            (size_t)(k0 + vec * 4);
+                        float4 packed = reinterpret_cast<const float4*>(g_row)[0];
+                        float* s_col = dst + (vec * 4) * (MT_N + 1) + nj;
+                        s_col[0] = packed.x;
+                        s_col[(MT_N + 1)] = packed.y;
+                        s_col[2 * (MT_N + 1)] = packed.z;
+                        s_col[3 * (MT_N + 1)] = packed.w;
+                    }
+                    return;
+                }
+            }
+
+            for (int p = tid; p < elemsB; p += TPB) {
+                const int ki = p % BK;
+                const int nj = p / BK;
+                dst[ki * (MT_N + 1) + nj] = ldB(n0 + nj, k0 + ki);
+            }
+        };
+
+        copy_tile_A(0, sA0);
+        copy_tile_B(0, sB0);
         __syncthreads();
 
         int ping = 0;
@@ -122,16 +185,8 @@ __launch_bounds__(64 * WR * WC, 2) __global__ void moe_mlp1_swiglu_mfma_kernel(
                 __hip_bfloat16* sA_next = (ping == 0) ? sA1 : sA0;
                 float* sB_next = (ping == 0) ? sB1 : sB0;
 
-                for (int p = tid; p < elemsA; p += TPB) {
-                    const int mi = p / BK;
-                    const int kk = p % BK;
-                    sA_next[mi * (BK + 1) + kk] = ldA(m0 + mi, next_k0 + kk);
-                }
-                for (int p = tid; p < elemsB; p += TPB) {
-                    const int ki = p % BK;
-                    const int nj = p / BK;
-                    sB_next[ki * (MT_N + 1) + nj] = ldB(n0 + nj, next_k0 + ki);
-                }
+                copy_tile_A(next_k0, sA_next);
+                copy_tile_B(next_k0, sB_next);
             }
 
 #pragma unroll
@@ -326,23 +381,85 @@ __launch_bounds__(64 * WR * WC, 2) __global__ void moe_mlp2_scatter_mfma_kernel(
         return;
 
     const int num_k_tiles = (K + BK - 1) / BK;
+    const bool full_m_tile = (m0 + MT_M) <= M;
 
     for (int tile_x = blockIdx.x; tile_x < total_tiles_n; tile_x += gridDim.x) {
         const int n0 = tile_x * MT_N;
         const int n_base = n0 + subtile_c * 16;
+        const bool full_n_tile = (n0 + MT_N) <= N;
 
         f4 d = {0.f, 0.f, 0.f, 0.f};
 
-        for (int p = tid; p < elemsA; p += TPB) {
-            const int mi = p / BK;
-            const int kk = p % BK;
-            sA0[mi * (BK + 1) + kk] = ldA(m0 + mi, kk);
-        }
-        for (int p = tid; p < elemsB; p += TPB) {
-            const int ki = p % BK;
-            const int nj = p / BK;
-            sB0[ki * (MT_N + 1) + nj] = ldB(n0 + nj, ki);
-        }
+        auto copy_tile_A = [&](int k0, __hip_bfloat16* dst) {
+            const bool full_k_tile = (k0 + BK) <= K;
+            const bool vectorizable = full_m_tile && full_k_tile && (K % 8 == 0) &&
+                                      is_aligned_16(A + (size_t)m0 * (size_t)K + (size_t)k0);
+            if constexpr ((BK % 8) == 0) {
+                if (vectorizable) {
+                    const int vec_per_row = BK / 8;
+                    const int total_vec = MT_M * vec_per_row;
+                    for (int idx = tid; idx < total_vec; idx += TPB) {
+                        int mi = idx / vec_per_row;
+                        int vec = idx % vec_per_row;
+                        const __hip_bfloat16* g_row =
+                            A + (size_t)(m0 + mi) * (size_t)K + (size_t)(k0 + vec * 8);
+                        __hip_bfloat16* s_row = dst + mi * (BK + 1) + vec * 8;
+                        uint4 packed = reinterpret_cast<const uint4*>(g_row)[0];
+                        uint16_t* s16 = reinterpret_cast<uint16_t*>(s_row);
+                        s16[0] = static_cast<uint16_t>(packed.x & 0xFFFF);
+                        s16[1] = static_cast<uint16_t>(packed.x >> 16);
+                        s16[2] = static_cast<uint16_t>(packed.y & 0xFFFF);
+                        s16[3] = static_cast<uint16_t>(packed.y >> 16);
+                        s16[4] = static_cast<uint16_t>(packed.z & 0xFFFF);
+                        s16[5] = static_cast<uint16_t>(packed.z >> 16);
+                        s16[6] = static_cast<uint16_t>(packed.w & 0xFFFF);
+                        s16[7] = static_cast<uint16_t>(packed.w >> 16);
+                    }
+                    return;
+                }
+            }
+
+            for (int p = tid; p < elemsA; p += TPB) {
+                const int mi = p / BK;
+                const int kk = p % BK;
+                dst[mi * (BK + 1) + kk] = ldA(m0 + mi, k0 + kk);
+            }
+        };
+
+        auto copy_tile_B = [&](int k0, float* dst) {
+            const bool full_k_tile = (k0 + BK) <= K;
+            const bool vectorizable = full_n_tile && full_k_tile && (K % 4 == 0) &&
+                                      is_aligned_16(B_batch + (size_t)n0 * (size_t)K +
+                                                    (size_t)k0);
+            if constexpr ((BK % 4) == 0) {
+                if (vectorizable) {
+                    const int vec_per_row = BK / 4;
+                    const int total_vec = MT_N * vec_per_row;
+                    for (int idx = tid; idx < total_vec; idx += TPB) {
+                        int nj = idx / vec_per_row;
+                        int vec = idx % vec_per_row;
+                        const float* g_row = B_batch + (size_t)(n0 + nj) * (size_t)K +
+                                            (size_t)(k0 + vec * 4);
+                        float4 packed = reinterpret_cast<const float4*>(g_row)[0];
+                        float* s_col = dst + (vec * 4) * (MT_N + 1) + nj;
+                        s_col[0] = packed.x;
+                        s_col[(MT_N + 1)] = packed.y;
+                        s_col[2 * (MT_N + 1)] = packed.z;
+                        s_col[3 * (MT_N + 1)] = packed.w;
+                    }
+                    return;
+                }
+            }
+
+            for (int p = tid; p < elemsB; p += TPB) {
+                const int ki = p % BK;
+                const int nj = p / BK;
+                dst[ki * (MT_N + 1) + nj] = ldB(n0 + nj, k0 + ki);
+            }
+        };
+
+        copy_tile_A(0, sA0);
+        copy_tile_B(0, sB0);
         __syncthreads();
 
         int ping = 0;
@@ -356,16 +473,8 @@ __launch_bounds__(64 * WR * WC, 2) __global__ void moe_mlp2_scatter_mfma_kernel(
                 __hip_bfloat16* sA_next = (ping == 0) ? sA1 : sA0;
                 float* sB_next = (ping == 0) ? sB1 : sB0;
 
-                for (int p = tid; p < elemsA; p += TPB) {
-                    const int mi = p / BK;
-                    const int kk = p % BK;
-                    sA_next[mi * (BK + 1) + kk] = ldA(m0 + mi, next_k0 + kk);
-                }
-                for (int p = tid; p < elemsB; p += TPB) {
-                    const int ki = p % BK;
-                    const int nj = p / BK;
-                    sB_next[ki * (MT_N + 1) + nj] = ldB(n0 + nj, next_k0 + ki);
-                }
+                copy_tile_A(next_k0, sA_next);
+                copy_tile_B(next_k0, sB_next);
             }
 
 #pragma unroll

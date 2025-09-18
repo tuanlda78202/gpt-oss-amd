@@ -1,4 +1,5 @@
 #include "BLAS.hip"
+#include <cstdint>
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
@@ -74,32 +75,84 @@ __launch_bounds__(64 * WAVES_R * WAVES_C, 2) __global__
         return (n >= 0 && n < N && k >= 0 && k < K) ? B[(size_t)n * (size_t)K + (size_t)k] : 0.0f;
     };
 
-    // Cooperative preload stage 0
-    // Total elems: MT_M*(BK) for A, BK*(MT_N) for B
-    {
-        // A tile  : rows m0..m0+MT_M-1, cols k0..k0+BK-1
-        // B tile  : rows k0..k0+BK-1,   cols n0..n0+MT_N-1
-        const int elemsA = MT_M * BK;
-        const int elemsB = BK * MT_N;
+    const int elemsA = MT_M * BK;
+    const int elemsB = BK * MT_N;
+    const int num_k_tiles = (K + BK - 1) / BK;
+    const bool full_m_tile = (m0 + MT_M) <= M;
 
-        // A tile: unchanged
+    auto copy_tile_A = [&](int k0, __hip_bfloat16* dst) {
+        const bool full_k_tile = (k0 + BK) <= K;
+        const bool vectorizable = full_m_tile && full_k_tile && (K % 8 == 0) &&
+                                  is_aligned_16(A + (size_t)m0 * (size_t)K + (size_t)k0);
+        if constexpr ((BK % 8) == 0) {
+            if (vectorizable) {
+                const int vec_per_row = BK / 8;
+                const int total_vec = MT_M * vec_per_row;
+                for (int idx = tid; idx < total_vec; idx += TPB) {
+                    int mi = idx / vec_per_row;
+                    int vec = idx % vec_per_row;
+                    const __hip_bfloat16* g_row =
+                        A + (size_t)(m0 + mi) * (size_t)K + (size_t)(k0 + vec * 8);
+                    __hip_bfloat16* s_row = dst + mi * (BK + 1) + vec * 8;
+                    uint4 packed = reinterpret_cast<const uint4*>(g_row)[0];
+                    uint16_t* s16 = reinterpret_cast<uint16_t*>(s_row);
+                    s16[0] = static_cast<uint16_t>(packed.x & 0xFFFF);
+                    s16[1] = static_cast<uint16_t>(packed.x >> 16);
+                    s16[2] = static_cast<uint16_t>(packed.y & 0xFFFF);
+                    s16[3] = static_cast<uint16_t>(packed.y >> 16);
+                    s16[4] = static_cast<uint16_t>(packed.z & 0xFFFF);
+                    s16[5] = static_cast<uint16_t>(packed.z >> 16);
+                    s16[6] = static_cast<uint16_t>(packed.w & 0xFFFF);
+                    s16[7] = static_cast<uint16_t>(packed.w >> 16);
+                }
+                return;
+            }
+        }
+
         for (int p = tid; p < elemsA; p += TPB) {
             int mi = p / BK;
             int kk = p % BK;
-            sA0[mi * (BK + 1) + kk] = ldA(m0 + mi, /*k0=*/0 + kk);
+            dst[mi * (BK + 1) + kk] = ldA(m0 + mi, k0 + kk);
+        }
+    };
+
+    auto copy_tile_B = [&](int k0, float* dst, int n0_local, bool full_n_tile) {
+        const bool full_k_tile = (k0 + BK) <= K;
+        const bool vectorizable = full_n_tile && full_k_tile && (K % 4 == 0) &&
+                                  is_aligned_16(B + (size_t)n0_local * (size_t)K + (size_t)k0);
+        if constexpr ((BK % 4) == 0) {
+            if (vectorizable) {
+                const int vec_per_row = BK / 4;
+                const int total_vec = MT_N * vec_per_row;
+                for (int idx = tid; idx < total_vec; idx += TPB) {
+                    int nj = idx / vec_per_row;
+                    int vec = idx % vec_per_row;
+                    const float* g_row =
+                        B + (size_t)(n0_local + nj) * (size_t)K + (size_t)(k0 + vec * 4);
+                    float4 packed = reinterpret_cast<const float4*>(g_row)[0];
+                    float* s_col = dst + (vec * 4) * (MT_N + 1) + nj;
+                    s_col[0] = packed.x;
+                    s_col[(MT_N + 1)] = packed.y;
+                    s_col[2 * (MT_N + 1)] = packed.z;
+                    s_col[3 * (MT_N + 1)] = packed.w;
+                }
+                return;
+            }
         }
 
-        // B tile: make K the fast index -> ki = p % BK, nj = p / BK
-        // This reads B[n*K + (k0+ki)] with adjacent p hitting adjacent K (contiguous)
         for (int p = tid; p < elemsB; p += TPB) {
             int ki = p % BK; // 0..BK-1  (fast)
             int nj = p / BK; // 0..MT_N-1
-            sB0[ki * (MT_N + 1) + nj] = ldB(n0 + nj, /*k0=*/0 + ki);
+            dst[ki * (MT_N + 1) + nj] = ldB(n0_local + nj, k0 + ki);
         }
-    }
+    };
+
+    // Cooperative preload stage 0
+    const bool full_n_tile0 = (n0 + MT_N) <= N;
+    copy_tile_A(0, sA0);
+    copy_tile_B(0, sB0, n0, full_n_tile0);
     __syncthreads();
 
-    const int num_k_tiles = (K + BK - 1) / BK;
     int ping = 0;
 
     for (int tile = 0; tile < num_k_tiles; ++tile) {
@@ -112,22 +165,8 @@ __launch_bounds__(64 * WAVES_R * WAVES_C, 2) __global__
             __hip_bfloat16* sA_next = (ping == 0) ? sA1 : sA0;
             float* sB_next = (ping == 0) ? sB1 : sB0;
 
-            const int elemsA = MT_M * BK;
-            const int elemsB = BK * MT_N;
-
-            // A next: unchanged
-            for (int p = tid; p < elemsA; p += TPB) {
-                int mi = p / BK;
-                int kk = p % BK;
-                sA_next[mi * (BK + 1) + kk] = ldA(m0 + mi, next_k0 + kk);
-            }
-
-            // B next: K-contiguous scalar path (correctness-first)
-            for (int p = tid; p < elemsB; p += TPB) {
-                int ki = p % BK; // 0..BK-1  (fast)
-                int nj = p / BK; // 0..MT_N-1
-                sB_next[ki * (MT_N + 1) + nj] = ldB(n0 + nj, next_k0 + ki);
-            }
+            copy_tile_A(next_k0, sA_next);
+            copy_tile_B(next_k0, sB_next, n0, full_n_tile0);
         }
 
 // Compute this stage: BK processed in 4-wide MFMA slices
