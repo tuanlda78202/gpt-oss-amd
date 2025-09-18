@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
-NC='\033[0m'              # No Color
+NC='\033[0m'              # No Color.
 
 FOREST1='\033[38;5;22m'   # Dark forest green
 FOREST2='\033[38;5;28m'   # Medium forest green
