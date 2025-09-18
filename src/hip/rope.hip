@@ -38,14 +38,18 @@ void cosin_kernel(int i, int head_dim,
 
 __global__ void rope_qk_kernel(
     float* __restrict__ q_batch,
-    float* __restrict__ key_cache,
+    void* __restrict__ key_cache,
     int B, int n_q_heads, int n_kv_heads, int head_dim,
     int seq_len, int kv_dim, int layer,
     const int* __restrict__ pos_per_token,
+    int kv_cache_is_fp16,
     const int* __restrict__ batch_indices,
     long long B_stride,
     float base, float scaling_factor,
-    float initial_ctx_len, float ntk_beta, float ntk_alpha)
+    float initial_ctx_len, float ntk_beta, float ntk_alpha,
+    const long long* __restrict__ d_layer_kv_off,
+    const int* __restrict__ d_layer_kv_cap,
+    const int* __restrict__ d_layer_is_local)
 {
     const int half = head_dim >> 1;
     const int t    = blockIdx.y;  // token
@@ -70,28 +74,46 @@ __global__ void rope_qk_kernel(
         qh[half + i0] = fmaf( x1, s, x2 * c);
     }
 
-    // rotate all K heads at (layer, slot, pos)
-    const long long loff  = (long long)layer * (long long)B_stride * (long long)seq_len * (long long)kv_dim;
-    float* k_base = key_cache + loff + (long long)slot * (long long)seq_len * kv_dim + (long long)pos * kv_dim;
+    // rotate all K heads at ring position
+    const long long kv_base = d_layer_kv_off[layer];
+    const int       cap     = d_layer_kv_cap[layer];
+    const int       local   = d_layer_is_local[layer];
+    const int       pos_wrapped = local ? (pos % cap) : pos;
+
+    const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
+    void* k_base = (void*)((char*)key_cache +
+       (kv_base + (long long)slot * (long long)cap * kv_dim + (long long)pos_wrapped * kv_dim) * element_size);
 
     #pragma unroll 1
     for (int h = 0; h < n_kv_heads; ++h) {
-        float* kh = k_base + (long long)h*head_dim;
-        float x1 = kh[i0];
-        float x2 = kh[half + i0];
-        kh[i0]        = fmaf(-x2, s, x1 * c);
-        kh[half + i0] = fmaf( x1, s, x2 * c);
+        if (kv_cache_is_fp16) {
+            __hip_bfloat16* kh = (__hip_bfloat16*)k_base + (long long)h*head_dim;
+            float x1 = __bfloat162float(kh[i0]);
+            float x2 = __bfloat162float(kh[half + i0]);
+            float y1 = fmaf(-x2, s, x1 * c);
+            float y2 = fmaf( x1, s, x2 * c);
+            kh[i0]        = __float2bfloat16(y1);
+            kh[half + i0] = __float2bfloat16(y2);
+        } else {
+            float* kh = (float*)k_base + (long long)h*head_dim;
+            float x1 = kh[i0];
+            float x2 = kh[half + i0];
+            kh[i0]        = fmaf(-x2, s, x1 * c);
+            kh[half + i0] = fmaf( x1, s, x2 * c);
+        }
     }
 }
 
 inline void rope_qk(
-    float* q_batch, float* key_cache,
+    float* q_batch, void* key_cache,
     int B, int n_q_heads, int n_kv_heads, int head_dim,
     int seq_len, int kv_dim, int layer,
     const int* d_pos_per_token, const int* d_batch_indices,
+    int kv_cache_is_fp16,
     long long B_stride,
     float base, float scaling_factor, float initial_ctx_len, float ntk_beta, float ntk_alpha,
-    hipStream_t stream)
+    hipStream_t stream,
+    const long long* d_layer_kv_off, const int* d_layer_kv_cap, const int* d_layer_is_local)
 {
     const int half = head_dim >> 1;
     const dim3 block(256);
@@ -100,7 +122,8 @@ inline void rope_qk(
         q_batch, key_cache,
         B, n_q_heads, n_kv_heads, head_dim,
         seq_len, kv_dim, layer,
-        d_pos_per_token, d_batch_indices, B_stride,
-        base, scaling_factor, initial_ctx_len, ntk_beta, ntk_alpha);
+        d_pos_per_token, kv_cache_is_fp16, d_batch_indices, B_stride,
+        base, scaling_factor, initial_ctx_len, ntk_beta, ntk_alpha,
+        d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
     CHECK_HIP(hipGetLastError());
 }

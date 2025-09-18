@@ -1,6 +1,6 @@
 #include "BLAS.hip"
 
-__global__ void rmsnorm_kernel(float* o_batch, float* x_batch, __half* weight_half,
+__global__ void rmsnorm_kernel(float* o_batch, float* x_batch, __hip_bfloat16* weight_half,
                                      int batch_size, int size) {
     int b = blockIdx.x;
     int lx = threadIdx.x;
@@ -32,11 +32,11 @@ __global__ void rmsnorm_kernel(float* o_batch, float* x_batch, __half* weight_ha
 
     ss_float = total_sum;
     for (int i = lx; i < size; i += blockDim.x) {
-        o[i] = __half2float(weight_half[i]) * ss_float * x[i];
+        o[i] = __bfloat162float(weight_half[i]) * ss_float * x[i];
     }
 }
 
-void rmsnorm(float* o_batch, float* x_batch, __half* weight, int batch_size, int size) {
+void rmsnorm(float* o_batch, float* x_batch, __hip_bfloat16* weight, int batch_size, int size) {
     dim3 blockDim(1024);
     dim3 gridDim(batch_size);
     hipLaunchKernelGGL(rmsnorm_kernel, gridDim, blockDim, 0, 0, o_batch, x_batch, weight, batch_size, size);

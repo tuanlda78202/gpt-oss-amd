@@ -1120,6 +1120,7 @@ int main(int argc, char** argv) {
     int enable_profiling = 0;     // profiling flag, default off
     char* verify_filename = NULL; // verification file for getp mode
     int truncate_lines = 0;       // truncate input to N lines, 0 = no truncation
+    int use_kv16 = 0;             // use 16-bit KV cache (bfloat16), default: off
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1128,8 +1129,15 @@ int main(int argc, char** argv) {
     } else {
         error_usage();
     }
-    for (int i = 2; i < argc; i += 2) {
-        // do some basic validation
+    for (int i = 2; i < argc;) {
+        // Special case for --kv16 flag (no argument needed)
+        if (strcmp(argv[i], "--kv16") == 0) {
+            use_kv16 = 1;
+            i += 1; // Only skip one argument (the flag itself)
+            continue;
+        }
+
+        // do some basic validation for regular flags
         if (i + 1 >= argc) {
             error_usage();
         } // must have arg after flag
@@ -1170,6 +1178,9 @@ int main(int argc, char** argv) {
         } else {
             error_usage();
         }
+
+        // Move to next flag (skip flag + its argument)
+        i += 2;
     }
 
     // parameter validation/overrides
@@ -1211,7 +1222,7 @@ int main(int argc, char** argv) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
         getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps, batch_size,
-             verify_filename, truncate_lines);
+             verify_filename, truncate_lines, use_kv16);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

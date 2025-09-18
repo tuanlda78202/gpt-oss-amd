@@ -25,7 +25,7 @@ static int g_dp_world_size = 1;
 static int g_ep_size = 1;
 static int g_active_devices = 0;
 
-void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
 
@@ -101,8 +101,8 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size) {
             exit(EXIT_FAILURE);
         }
 
-        copy_transformer_to_device_hybrid(transformer_oss, g_all_models[idx], device_id, dp_rank,
-                                          g_ep_size, ep_rank);
+        copy_transformer_to_device(transformer_oss, g_all_models[idx], device_id, dp_rank,
+                                          g_ep_size, ep_rank, use_kv16);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));

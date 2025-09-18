@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
 #define CHECK_HIP(cmd)                                                                             \
@@ -94,50 +94,44 @@ typedef struct {
 
 typedef struct {
     // token_embedding_table (2D (vocab_size, hidden_dim) -> flat to 1D) - embedding.weight
-    __half* token_embedding_table; // (vocab_size, hidden_dim) (in, out)
+    __hip_bfloat16* token_embedding_table; // (vocab_size, hidden_dim) (in, out)
 
     // weights for rmsnorms
-    __half* rms_attn_w; // (n_layers, hidden_dim) [attn.norm.scale]
-    __half* rms_ffn_w;  // (n_layers, hidden_dim) [mlp.norm.scale]
+    __hip_bfloat16* rms_attn_w; // (n_layers, hidden_dim) [attn.norm.scale]
+    __hip_bfloat16* rms_ffn_w;  // (n_layers, hidden_dim) [mlp.norm.scale]
 
     // weights for attention [attn.qkv.weight & attn.qkv.bias]
-    __half* w_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
-                        // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
-                        // (out_features, in_features) w_k (head_dim * n_kv_heads,
-                        // hidden_dim)  (out_features, in_features) w_v (head_dim *
-                        // n_kv_heads, hidden_dim)  (out_features, in_features)
-    __half* w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
-    __half* b_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
-                        // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
-                        // (head_dim * n_kv_heads)
-    __half* b_o;        // (n_layers, hidden_dim)
-    __half* attn_sinks; // (n_layers, n_attn_heads)
+    __hip_bfloat16* w_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
+                                // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
+                                // (out_features, in_features) w_k (head_dim * n_kv_heads,
+                                // hidden_dim)  (out_features, in_features) w_v (head_dim *
+                                // n_kv_heads, hidden_dim)  (out_features, in_features)
+    __hip_bfloat16* w_o;        // (n_layers, hidden_dim, head_dim * n_attn_heads)
+    __hip_bfloat16* b_qkv;      // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
+                                // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
+                                // (head_dim * n_kv_heads)
+    __hip_bfloat16* b_o;        // (n_layers, hidden_dim)
+    __hip_bfloat16* attn_sinks; // (n_layers, n_attn_heads)
 
     // weights for router [mlp.gate.weight & mlp.gate.bias]
-    __half* w_router; // (n_layers, hidden_dim, n_experts)
-    __half* b_router; // (n_layers, n_experts)
+    __hip_bfloat16* w_router; // (n_layers, hidden_dim, n_experts)
+    __hip_bfloat16* b_router; // (n_layers, n_experts)
 
-    // weights for MoE [mlp.mlp1_weight & mlp.mlp1_bias & mlp.mlp2_weight &
-    // mlp.mlp2_bias] NOTE: gate_up projects from hidden_dim to intermediate_dim,
-    // the shape is kinda reverted because the original code use einsum to reduce
-    // over hidden_dim
-
-    __half* w_mlp1; // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
-                    // hidden_dim)
-    __half* w_mlp2; // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
-    __half* b_mlp1; // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
-    __half* b_mlp2; // down_proj (n_layers, n_experts, hidden_dim)
+    __hip_bfloat16* w_mlp1; // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
+                            // hidden_dim)
+    __hip_bfloat16* w_mlp2; // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
+    __hip_bfloat16* b_mlp1; // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
+    __hip_bfloat16* b_mlp2; // down_proj (n_layers, n_experts, hidden_dim)
 
     // final norm [norm.scale]
-    __half* rms_out_w; // (hidden_dim, )
+    __hip_bfloat16* rms_out_w; // (hidden_dim, )
 
     // classifier weights for the logits [unembedding.weight]
-    __half* out; // (vocab_size, hidden_dim) (out, in)
-} OssTransformerWeightsHalf;
+    __hip_bfloat16* out; // (vocab_size, hidden_dim) (out, in)
+} OssTransformerWeightsBFloat16;
 
 // ! Scratch buffers for forward pass computation
 typedef struct {
-    // current wave of activations (now with batch dimension B)
     float* x;            // activation at current time stamp (B, hidden_dim)
     float* t;            // same, but inside a residual branch (B, hidden_dim)
     float* tb;           // (B, head_dim * n_attn_heads)
@@ -157,10 +151,16 @@ typedef struct {
     float* att;          // buffer for scores/attention values (B, n_heads, seq_len)
     float* logits;       // output logits (B, vocab_size)
 
-    // ! kv cache (largest memory consumer) - now with batch dimension
-    float* key_cache;   // (layer, B, seq_len, kv_dim)
-    float* value_cache; // (layer, B, seq_len, kv_dim)
-    float* mask;        // (seq_len, seq_len) - shared across batch
+    // ! kv cache
+    void* key_cache;      // (layer, B, seq_len, kv_dim)
+    void* value_cache;    // (layer, B, seq_len, kv_dim)
+    int kv_cache_is_fp16; // flag: 1 if using bfloat16, 0 if using float32
+    float* mask;          // (seq_len, seq_len) - shared across batch
+
+    // ! cyclic kv cache metadata
+    long long* d_layer_kv_off; // base offset (in elements) per layer
+    int* d_layer_kv_cap;       // time-capacity per layer
+    int* d_layer_is_local;     // 1 if sliding-window layer, else 0
 
     int* d_batch_indices; // (max_batch_size) - persistent GPU batch indices
     int* d_tokens;        // (max_batch_size) - persistent GPU tokens buffer
@@ -181,6 +181,11 @@ typedef struct {
     float* gate_by_expert; // [B*K, I] - gate values by expert
     float* up_by_expert;   // [B*K, I] - up values by expert
     float* y_by_expert;    // [B*K, H] - final output by expert
+
+    // Attention workspace buffers
+    float* fa_partial_O; // Workspace for flash attention partial outputs
+    float* fa_partial_m; // Workspace for flash attention partial max values
+    float* fa_partial_l; // Workspace for flash attention partial normalizers
 } OssRunState;
 
 // ! Main Transformer struct
@@ -196,7 +201,7 @@ typedef struct {
 // ! Hybrid Precision Transformer
 typedef struct {
     OssConfig config;
-    OssTransformerWeightsHalf weights; // FP16 weights for memory efficiency
+    OssTransformerWeightsBFloat16 weights; // FP16 weights for memory efficiency
     OssRunState state;                 // FP32 activations for numerical stability
     int fd;                            // file descriptor for memory mapping
     float* data;                       // memory mapped data pointer
@@ -236,8 +241,7 @@ typedef struct {
     int primary_shard_index; // index within shards corresponding to primary device (-1 if none)
 } OssExpertParallelGroup;
 
-void copy_large_tensor_streaming(__half** d_ptr, float* h_ptr, size_t total_size,
+void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name);
-void copy_transformer_to_device_hybrid(OssTransformer* t_h, OssTransformerHybrid* t_d,
-                                       int device_id, int dp_rank, int ep_size, int ep_rank);
-void free_transformer_on_device_hybrid(OssTransformerHybrid* t_d);
+void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d, int use_kv16);
+void free_transformer_on_device(OssTransformerHybrid* t_d);
