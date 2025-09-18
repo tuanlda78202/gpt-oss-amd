@@ -1,156 +1,248 @@
 #include "BLAS.hip"
-#include <hip/hip_runtime.h>
+#include <cstdint>
 #include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
 
-static inline int ceil_div1(int a, int b) { return (a + b - 1) / b; }
-static inline __device__ int imin(int a, int b) { return a < b ? a : b; }
+static inline __host__ __device__ int ceil_div1(int a, int b) { return (a + b - 1) / b; }
 
-template<int BM, int BN, int BK, int TM, int TN>
-__global__ void gemm_kernel( // Compute C^T = A (M×K) * B^T (K×N)
-    const __hip_bfloat16* __restrict__ A_half, // [M,K] row-major
-    const float*          __restrict__ B_batch, // [N,K] row-major (N = batch_size)
-    float*                __restrict__ C_batch, // [N,M] row-major (matches your layout)
-    const __hip_bfloat16* __restrict__ bias,    // [M] (optional, BF16)
-    int N, int M, int K)                        // N=batch_size
-{
-    // Block tile origin
-    const int n0 = blockIdx.x * BN; // along batch (N)
-    const int m0 = blockIdx.y * BM; // along rows of A/C
+template <typename T>
+__device__ inline bool is_aligned_16(const T* p) {
+    return ((reinterpret_cast<uintptr_t>(p) & 0xF) == 0);
+}
 
-    // Thread coordinates inside the block
-    const int tx = threadIdx.x; // [0..TBX)
-    const int ty = threadIdx.y; // [0..TBY)
 
-    constexpr int TBX = 16; // 16x16=256 threads
-    constexpr int TBY = 16;
+template <int MT_M, int MT_N, int BK, int WAVES_R, int WAVES_C>
+__launch_bounds__(64 * WAVES_R * WAVES_C, 2) __global__
+    void gemm_mfma_core(const __hip_bfloat16* __restrict__ A,    // [M,K] BF16
+                        const float* __restrict__ B,             // [N,K] F32
+                        float* __restrict__ C,                   // [N,M] F32
+                        const __hip_bfloat16* __restrict__ bias, // [M] (optional)
+                        int N, int M, int K // note: N is "batch"
+    ) {
+    constexpr int WAVES = WAVES_R * WAVES_C;
+    constexpr int TPB = 64 * WAVES;
+    static_assert((MT_M % 16) == 0 && (MT_N % 16) == 0, "Tiles must be multiples of 16");
+    static_assert(WAVES >= 1 && WAVES <= 16, "WAVES in [1,16]");
+    static_assert((MT_M / 16) * (MT_N / 16) == WAVES, "WAVES must cover subtiles");
 
-    // Each thread computes a TM×TN register tile
-    float acc[TM][TN];
-    #pragma unroll
-    for (int tm = 0; tm < TM; ++tm)
-    #pragma unroll
-    for (int tn = 0; tn < TN; ++tn)
-        acc[tm][tn] = 0.0f;
+    const int tid =
+        threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+    const int wave = tid >> 6;
+    const int lane = tid & 63;
 
-    // Shared memory: store A as BF16 (2B) and B as FP32 (4B)
-    __shared__ __hip_bfloat16 sA[BM * BK]; // (BM×BK) * 2B
-    __shared__ float          sB[BK * BN]; // (BK×BN) * 4B
+    const int subtile_r = wave / WAVES_C;
+    const int subtile_c = wave % WAVES_C;
 
-    // Per-thread starting element in output tile
-    const int m_thread_base = ty * TM; // 0..BM-1
-    const int n_thread_base = tx * TN; // 0..BN-1
+    const int n0 = blockIdx.x * MT_N;
+    const int m0 = blockIdx.y * MT_M;
 
-    // Loop across K in tiles
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        const int kTile = imin(BK, K - k0);
+    const int n_base = n0 + subtile_c * 16;
+    const int m_base = m0 + subtile_r * 16;
 
-        // --- Cooperative load of A tile: [BM, kTile] from A_half ---
-        {
-            const int tid = ty * TBX + tx;
-            const int num_threads = TBX * TBY;
-            const int elements = BM * kTile; // only the valid part
-            for (int p = tid; p < elements; p += num_threads) {
-                const int i = p / kTile; // 0..BM-1
-                const int j = p % kTile; // 0..BK-1 (valid part)
-                const int m = m0 + i;
-                const int k = k0 + j;
-                sA[i * BK + j] = (m < M && k < K)
-                    ? A_half[m * K + k]
-                    : __float2bfloat16(0.0f);
-            }
-            // Zero-pad the remainder of the A tile if kTile < BK
-            for (int p = tid + elements; p < BM * BK; p += num_threads) {
-                sA[p] = __float2bfloat16(0.0f);
-            }
-        }
+    extern __shared__ char smem_gemm[];
+    __hip_bfloat16* sA0 = reinterpret_cast<__hip_bfloat16*>(smem_gemm);
+    __hip_bfloat16* sA1 = sA0 + MT_M * (BK + 1);
+    float* sB0 = reinterpret_cast<float*>(sA1 + MT_M * (BK + 1));
+    float* sB1 = sB0 + BK * (MT_N + 1);
 
-        // --- Cooperative load of B tile: [kTile, BN] from B_batch (note B is [N,K] row-major) ---
-        {
-            const int tid = ty * TBX + tx;
-            const int num_threads = TBX * TBY;
-            const int elements = kTile * BN;
-            for (int p = tid; p < elements; p += num_threads) {
-                const int i = p / BN; // 0..kTile-1 (k within the tile)
-                const int j = p % BN; // 0..BN-1 (n within the tile)
-                const int k = k0 + i;
-                const int n = n0 + j;
-                sB[i * BN + j] = (k < K && n < N)
-                    ? B_batch[n * K + k] // row-major per batch row
-                    : 0.0f;
-            }
-            // Zero-pad if kTile < BK
-            for (int p = tid + elements; p < BK * BN; p += num_threads) {
-                sB[p] = 0.0f;
-            }
-        }
+    using f4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    f4 d = {0.f, 0.f, 0.f, 0.f};
 
-        __syncthreads();
+    const int lane_x = lane & 15;
+    const int lane_y = lane >> 4;
 
-        // --- Compute on the loaded tiles ---
-        #pragma unroll
-        for (int kk = 0; kk < BK; ++kk) {
-            // Guard: for the last k tile, kk >= kTile is zero-padded
-            // Load a strip of A for our TM rows
-            float a_frag[TM];
-            #pragma unroll
-            for (int tm = 0; tm < TM; ++tm) {
-                const int mi = m_thread_base + tm;
-                a_frag[tm] = __bfloat162float(sA[mi * BK + kk]);
-            }
-            // Multiply-accumulate against TN columns from B
-            #pragma unroll
-            for (int tn = 0; tn < TN; ++tn) {
-                const int nj = n_thread_base + tn;
-                const float b = sB[kk * BN + nj];
-                #pragma unroll
-                for (int tm = 0; tm < TM; ++tm) {
-                    acc[tm][tn] = fmaf(a_frag[tm], b, acc[tm][tn]);
+    auto ldA = [&](int m, int k) -> __hip_bfloat16 {
+        return (m >= 0 && m < M && k >= 0 && k < K) ? A[(size_t)m * (size_t)K + (size_t)k]
+                                                    : __float2bfloat16(0.0f);
+    };
+    auto ldB = [&](int n, int k) -> float {
+        return (n >= 0 && n < N && k >= 0 && k < K) ? B[(size_t)n * (size_t)K + (size_t)k] : 0.0f;
+    };
+
+    const int elemsA = MT_M * BK;
+    const int elemsB = BK * MT_N;
+    const int num_k_tiles = (K + BK - 1) / BK;
+    const bool full_m_tile = (m0 + MT_M) <= M;
+
+    auto copy_tile_A = [&](int k0, __hip_bfloat16* dst) {
+        const bool full_k_tile = (k0 + BK) <= K;
+        const bool vectorizable = full_m_tile && full_k_tile && (K % 8 == 0) &&
+                                  is_aligned_16(A + (size_t)m0 * (size_t)K + (size_t)k0);
+        if constexpr ((BK % 8) == 0) {
+            if (vectorizable) {
+                const int vec_per_row = BK / 8;
+                const int total_vec = MT_M * vec_per_row;
+                for (int idx = tid; idx < total_vec; idx += TPB) {
+                    int mi = idx / vec_per_row;
+                    int vec = idx % vec_per_row;
+                    const __hip_bfloat16* g_row =
+                        A + (size_t)(m0 + mi) * (size_t)K + (size_t)(k0 + vec * 8);
+                    __hip_bfloat16* s_row = dst + mi * (BK + 1) + vec * 8;
+                    uint4 packed = reinterpret_cast<const uint4*>(g_row)[0];
+                    uint16_t* s16 = reinterpret_cast<uint16_t*>(s_row);
+                    s16[0] = static_cast<uint16_t>(packed.x & 0xFFFF);
+                    s16[1] = static_cast<uint16_t>(packed.x >> 16);
+                    s16[2] = static_cast<uint16_t>(packed.y & 0xFFFF);
+                    s16[3] = static_cast<uint16_t>(packed.y >> 16);
+                    s16[4] = static_cast<uint16_t>(packed.z & 0xFFFF);
+                    s16[5] = static_cast<uint16_t>(packed.z >> 16);
+                    s16[6] = static_cast<uint16_t>(packed.w & 0xFFFF);
+                    s16[7] = static_cast<uint16_t>(packed.w >> 16);
                 }
+                return;
             }
         }
 
+        for (int p = tid; p < elemsA; p += TPB) {
+            int mi = p / BK;
+            int kk = p % BK;
+            dst[mi * (BK + 1) + kk] = ldA(m0 + mi, k0 + kk);
+        }
+    };
+
+    auto copy_tile_B = [&](int k0, float* dst, int n0_local, bool full_n_tile) {
+        const bool full_k_tile = (k0 + BK) <= K;
+        const bool vectorizable = full_n_tile && full_k_tile && (K % 4 == 0) &&
+                                  is_aligned_16(B + (size_t)n0_local * (size_t)K + (size_t)k0);
+        if constexpr ((BK % 4) == 0) {
+            if (vectorizable) {
+                const int vec_per_row = BK / 4;
+                const int total_vec = MT_N * vec_per_row;
+                for (int idx = tid; idx < total_vec; idx += TPB) {
+                    int nj = idx / vec_per_row;
+                    int vec = idx % vec_per_row;
+                    const float* g_row =
+                        B + (size_t)(n0_local + nj) * (size_t)K + (size_t)(k0 + vec * 4);
+                    float4 packed = reinterpret_cast<const float4*>(g_row)[0];
+                    float* s_col = dst + (vec * 4) * (MT_N + 1) + nj;
+                    s_col[0] = packed.x;
+                    s_col[(MT_N + 1)] = packed.y;
+                    s_col[2 * (MT_N + 1)] = packed.z;
+                    s_col[3 * (MT_N + 1)] = packed.w;
+                }
+                return;
+            }
+        }
+
+        for (int p = tid; p < elemsB; p += TPB) {
+            int ki = p % BK;
+            int nj = p / BK;
+            dst[ki * (MT_N + 1) + nj] = ldB(n0_local + nj, k0 + ki);
+        }
+    };
+
+    const bool full_n_tile0 = (n0 + MT_N) <= N;
+    copy_tile_A(0, sA0);
+    copy_tile_B(0, sB0, n0, full_n_tile0);
+    __syncthreads();
+
+    int ping = 0;
+
+    for (int tile = 0; tile < num_k_tiles; ++tile) {
+        __hip_bfloat16* sA = (ping == 0) ? sA0 : sA1;
+        float* sB = (ping == 0) ? sB0 : sB1;
+
+        const int next_k0 = (tile + 1) * BK;
+        if (tile + 1 < num_k_tiles) {
+            __hip_bfloat16* sA_next = (ping == 0) ? sA1 : sA0;
+            float* sB_next = (ping == 0) ? sB1 : sB0;
+
+            copy_tile_A(next_k0, sA_next);
+            copy_tile_B(next_k0, sB_next, n0, full_n_tile0);
+        }
+
+#pragma unroll
+        for (int kk4 = 0; kk4 < BK; kk4 += 4) {
+            const int k_cur = kk4 + lane_y;
+
+            const int a_row = (m_base - m0) + lane_x;
+            const int b_col = (n_base - n0) + lane_x;
+
+            float amk = 0.f, bkn = 0.f;
+            if ((unsigned)a_row < (unsigned)MT_M && (unsigned)k_cur < (unsigned)BK)
+                amk = __bfloat162float(sA[a_row * (BK + 1) + k_cur]);
+            if ((unsigned)k_cur < (unsigned)BK && (unsigned)b_col < (unsigned)MT_N)
+                bkn = sB[k_cur * (MT_N + 1) + b_col];
+
+            d = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, d, 0, 0, 0);
+        }
+
         __syncthreads();
+        ping ^= 1;
     }
 
-    // --- Write back with bias (bias is per-row m) ---
-    #pragma unroll
-    for (int tm = 0; tm < TM; ++tm) {
-        const int m = m0 + m_thread_base + tm;
-        if (m >= M) break;
-
-        const float badd = (bias != nullptr) ? __bfloat162float(bias[m]) : 0.0f;
-
-        #pragma unroll
-        for (int tn = 0; tn < TN; ++tn) {
-            const int n = n0 + n_thread_base + tn;
-            if (n < N) {
-                // C layout is [N, M] row-major (same as your current code: per-batch row contiguous)
-                C_batch[n * M + m] = acc[tm][tn] + badd;
-            }
+    const int n_out = n_base + (lane & 15);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m_out = m_base + (lane >> 4) * 4 + i;
+        if (n_out < N && m_out < M) {
+            float out = d[i];
+            if (bias)
+                out += __bfloat162float(bias[m_out]);
+            C[(size_t)n_out * (size_t)M + (size_t)m_out] = out;
         }
     }
 }
 
-void gemm(
-    float* xout,
-    const float* x_batch,
-    const __hip_bfloat16* w,
-    const __hip_bfloat16* bias,
-    int batch_size, // N
-    int K,          // K
-    int M)          // M
-{
-    // Tile config: 128×64×64 with 8×4 per-thread micro-tile, 256 threads/block
-    constexpr int BM = 128, BN = 64, BK = 64, TM = 8, TN = 4;
 
-    dim3 block(16, 16, 1); // TBX, TBY
-    dim3 grid(ceil_div1(batch_size, BN), ceil_div1(M, BM), 1);
+template <int MT_M, int MT_N, int BK, int WR, int WC>
+inline void launch_core(float* xout, const float* x_batch, const __hip_bfloat16* w,
+                        const __hip_bfloat16* bias, int N, int K, int M) {
+    constexpr int WAVES = WR * WC;
+    dim3 block(64 * WAVES, 1, 1);
+    dim3 grid(ceil_div1(N, MT_N), ceil_div1(M, MT_M), 1);
+    size_t shmem_bytes =
+        2 * (MT_M * (BK + 1) * sizeof(__hip_bfloat16)) + 2 * (BK * (MT_N + 1) * sizeof(float));
 
-    hipLaunchKernelGGL(
-        (gemm_kernel<BM, BN, BK, TM, TN>),
-        grid, block, 0, 0,
-        w, x_batch, xout, bias,
-        batch_size, M, K
-    );
+    hipLaunchKernelGGL((gemm_mfma_core<MT_M, MT_N, BK, WR, WC>), grid, block, shmem_bytes, 0, w,
+                       x_batch, xout, bias, N, M, K);
     CHECK_HIP(hipGetLastError());
+}
+
+
+void gemm_case_M5120_K2880_N128(float* xout, const float* x_batch, const __hip_bfloat16* w,
+                                const __hip_bfloat16* bias, int N, int K, int M) {
+    launch_core<64, 32, 32, 4, 2>(xout, x_batch, w, bias, N, K, M);
+}
+
+
+void gemm_case_M2880_K4096_N128(float* xout, const float* x_batch, const __hip_bfloat16* w,
+                                const __hip_bfloat16* bias, int N, int K, int M) {
+    launch_core<64, 32, 32, 4, 2>(xout, x_batch, w, bias, N, K, M);
+}
+
+
+void gemm_case_M32_K2880_N128(float* xout, const float* x_batch, const __hip_bfloat16* w,
+                              const __hip_bfloat16* bias, int N, int K, int M) {
+    launch_core<32, 64, 32, 2, 4>(xout, x_batch, w, bias, N, K, M);
+}
+
+
+void gemm_case_M201088_K2880_N128(float* xout, const float* x_batch, const __hip_bfloat16* w,
+                                  const __hip_bfloat16* bias, int N, int K, int M) {
+    launch_core<64, 32, 32, 4, 2>(xout, x_batch, w, bias, N, K, M);
+}
+
+
+void gemm(float* xout, const float* x_batch, const __hip_bfloat16* w, const __hip_bfloat16* bias,
+          int batch_size, int K, int M) {
+    const int N = batch_size;
+    if (M == 5120 && K == 2880 && N == 128) {
+        gemm_case_M5120_K2880_N128(xout, x_batch, w, bias, N, K, M);
+        return;
+    }
+    if (M == 2880 && K == 4096 && N == 128) {
+        gemm_case_M2880_K4096_N128(xout, x_batch, w, bias, N, K, M);
+        return;
+    }
+    if (M == 32 && K == 2880 && N == 128) {
+        gemm_case_M32_K2880_N128(xout, x_batch, w, bias, N, K, M);
+        return;
+    }
+    if (M == 201088 && K == 2880 && N == 128) {
+        gemm_case_M201088_K2880_N128(xout, x_batch, w, bias, N, K, M);
+        return;
+    }
+
+    launch_core<32, 64, 32, 2, 4>(xout, x_batch, w, bias, N, K, M);
 }
