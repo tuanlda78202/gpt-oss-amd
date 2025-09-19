@@ -6,7 +6,7 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
 
-    bool show_progress = total_size > 1024 * 1024;
+    bool show_progress = total_size > 1024 * 1024 * 1024;
 
     if (show_progress) {
         printf("  %s (%.1f GB)...", tensor_name, total_size / (1024.0 * 1024.0 * 1024.0));

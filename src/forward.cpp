@@ -468,7 +468,7 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
             // No experts fired: residual add
             vecadd(x, s->e_agg, 1.0f, batch_size, hidden_dim);
         } else if (!ep_group || ep_group->ep_size <= 1 || transformer->ep_local_experts == 0) {
-            // Single-GPU (or EP disabled): keep tmp-main fused path
+            // Single-GPU (EP disabled)
             const long long mlp1_weight_stride = (2LL * p->intermediate_dim) * hidden_dim;
             const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
             const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
