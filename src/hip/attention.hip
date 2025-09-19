@@ -7,8 +7,6 @@
 #include <stdint.h>
 #include <type_traits>
 
-// ======================= NT load/store helpers (AMD Clang) =======================
-// These are hints; the backend may choose regular loads if it can't honor them.
 #if defined(__HIP_DEVICE_COMPILE__)
 template<typename T>
 __device__ __forceinline__ T nt_load(const T* ptr) {
@@ -41,9 +39,7 @@ template<typename T>
 __device__ __forceinline__ void nt_store(T* ptr, T value) { *ptr = value; }
 #endif
 
-// ======================= Wave reductions (Wave64 on MI2xx) =======================
 static __device__ __forceinline__ float wave_reduce_sum(float v) {
-    // One wave per block → no cross-wave sync needed.
     for (int off = warpSize >> 1; off > 0; off >>= 1)
         v += __shfl_down(v, off);
     return v;
@@ -66,9 +62,7 @@ static __device__ __forceinline__ int ring_index(int t, int cap) {
 }
 
 // ======================= K/V vectorized access =======================
-// For FP32: use float4. For BF16: read 2×bf16 as u32, optionally u128 (uint4) when aligned.
 static inline __device__ float bf16_to_f32_intr(__hip_bfloat16 x) {
-    // Use intrinsic conversion for correctness.
     return __bfloat162float(x);
 }
 
@@ -81,7 +75,6 @@ static __device__ __forceinline__ __hip_bfloat16 raw_to_bf16(uint16_t bits) {
     return conv.b;
 }
 
-// ======================= Single-kernel FA decode (typed & mask-specialized) =======================
 template<typename KV_T, bool USE_MASK>
 __global__ void fa_decode_full_typed(
     const float* __restrict__ q_batch,      // (B, H*D)
@@ -115,12 +108,12 @@ __global__ void fa_decode_full_typed(
     const int pos_b = d_pos_per_token[b];
     const int Lb = pos_b + 1;
 
-    // ---- pointers for Q and output (final result per head) ----
+    // ---- pointers for Q and output ----
     const float* __restrict__ q_b    = q_batch + (long long)b * (n_attn_heads * head_dim);
     const float* __restrict__ q_head = q_b + (long long)h * head_dim;
     float* __restrict__ o_out        = tb_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
 
-    // ---- shared memory for q and O (kept the whole sequence) ----
+    // ---- shared memory for q and O ----
     extern __shared__ float smem[];
     float* __restrict__ q_sh = smem;                   // [head_dim]
     float* __restrict__ O_sh = q_sh + head_dim;        // [head_dim]
@@ -138,7 +131,7 @@ __global__ void fa_decode_full_typed(
     if (lane == 0) { m_shared = -std::numeric_limits<float>::infinity(); l_shared = 0.0f; }
     wave_sync();
 
-    // ---- KV layer addressing (ring buffer etc.) ----
+    // ---- KV layer addressing ----
     const long long kv_base = d_layer_kv_off[layer_idx];
     const int       cap     = d_layer_kv_cap[layer_idx];
     const int       local   = d_layer_is_local[layer_idx];
@@ -161,10 +154,8 @@ __global__ void fa_decode_full_typed(
     const long long head_off_bytes = ((long long)g * head_dim) * elem_size;
     const long long step_bytes     = ((long long)kv_dim)      * elem_size;
 
-    // ======================= main time loop =======================
     // One pass (FlashAttention online softmax).
     for (int t = t_start; t < t_end; ++t) {
-        // Resolve ring index if local buffer is used
         int rt;
         if (local != 0) {
             rt = cap_pow2 ? (t & (cap - 1)) : (t % cap);
@@ -290,7 +281,6 @@ __global__ void fa_decode_full_typed(
         wave_sync();
     } // end t
 
-    // Optional attention sink renormalization (decode sink/token)
     if (attn_sinks_half != nullptr) {
         float sink_s = __bfloat162float(attn_sinks_half[h]);
         if (isfinite(sink_s)) {
@@ -307,8 +297,7 @@ __global__ void fa_decode_full_typed(
         }
     }
 
-    // Final writeback (streaming)
-    // Vectorize stores; use non-temporal store hint.
+    // Vectorize stores
     int vecN = head_dim >> 2, rem = head_dim & 3;
     float4* __restrict__ o4 = reinterpret_cast<float4*>(o_out);
     const float4* __restrict__ s4 = reinterpret_cast<const float4*>(O_sh);
@@ -322,7 +311,6 @@ __global__ void fa_decode_full_typed(
     }
 }
 
-// ======================= host wrapper (UNCHANGED SIGNATURE) =======================
 static inline int fa_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
 
 void fa(
@@ -350,7 +338,6 @@ void fa(
 {
     if (B <= 0 || n_attn_heads <= 0 || head_dim <= 0) return;
 
-    // We run one Wave64 (64 threads) per (head, batch) to avoid block-wide syncs.
     const int tpb = 64; // Wave64 on MI250
     const size_t shmem = 2ull * (size_t)head_dim * sizeof(float);
 
