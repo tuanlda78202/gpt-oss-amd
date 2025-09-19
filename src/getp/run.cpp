@@ -23,6 +23,7 @@ static int num_gpus = 1;
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
+    transformer_oss->config.seq_len = 1024;
 
     // Discover GPUs
     CHECK_HIP(hipGetDeviceCount(&num_gpus));
