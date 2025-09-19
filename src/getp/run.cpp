@@ -1,7 +1,7 @@
 #define GETP_SKIP_TYPEDEFS
 #include "../../include/tokenizer.hpp"
-#include "../forward_120b.cpp"
-#include "../model_120b.cpp"
+#include "../forward.cpp"
+#include "../model.cpp"
 #include "../sampler.cpp"
 #include "eval.cpp"
 
@@ -24,6 +24,7 @@ thread_local OssTransformerHybrid* t_d = nullptr;       // primary shard for thi
 static int g_dp_world_size = 1;
 static int g_ep_size = 1;
 static int g_active_devices = 0;
+bool g_duplicate_experts = false;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
@@ -36,8 +37,9 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
     // const char* ep_env = getenv("GETP_EP");
     // int requested_dp = dp_env ? atoi(dp_env) : 1;
     // int requested_ep = ep_env ? atoi(ep_env) : 1;
+    const bool replicate_experts = g_duplicate_experts;
     int requested_dp = 8;
-    int requested_ep = 8;
+    int requested_ep = replicate_experts ? requested_dp : 8;
     if (requested_dp <= 0)
         requested_dp = 1;
     if (requested_ep <= 0)
@@ -102,7 +104,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
         }
 
         copy_transformer_to_device(transformer_oss, g_all_models[idx], device_id, dp_rank,
-                                          g_ep_size, ep_rank, use_kv16);
+                                   g_ep_size, ep_rank, use_kv16, replicate_experts);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
@@ -133,26 +135,48 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
             g_expert_shards[ep].workspace.mlp1_by_expert = nullptr;
             g_expert_shards[ep].workspace.gate_by_expert = nullptr;
             g_expert_shards[ep].workspace.y_by_expert = nullptr;
+            g_expert_shards[ep].workspace.tokens_by_expert = nullptr;
+            g_expert_shards[ep].workspace.weights_by_expert = nullptr;
+            g_expert_shards[ep].workspace.e_by_token = nullptr;
             g_expert_shards[ep].workspace.capacity_tokens = 0;
+            g_expert_shards[ep].workspace.capacity_batch = 0;
             g_expert_shards[ep].mutex_handle = new std::mutex();
         }
     }
 
     for (int dp = 0; dp < g_dp_world_size; ++dp) {
         g_dp_groups[dp].dp_rank = dp;
-        g_dp_groups[dp].ep_size = g_ep_size;
-        g_dp_groups[dp].primary_shard_index = (dp < g_ep_size) ? dp : -1;
-        if (g_ep_size > 0) {
-            g_dp_groups[dp].shards = (OssExpertShard**)malloc(sizeof(OssExpertShard*) * g_ep_size);
+
+        if (replicate_experts) {
+            g_dp_groups[dp].ep_size = 1;
+            g_dp_groups[dp].primary_shard_index = 0;
+            g_dp_groups[dp].shards = (OssExpertShard**)malloc(sizeof(OssExpertShard*));
             if (!g_dp_groups[dp].shards) {
-                fprintf(stderr, "malloc shards pointers for dp=%d failed\n", dp);
+                fprintf(stderr, "malloc replicated shard pointer for dp=%d failed\n", dp);
                 exit(EXIT_FAILURE);
             }
-            for (int ep = 0; ep < g_ep_size; ++ep) {
-                g_dp_groups[dp].shards[ep] = &g_expert_shards[ep];
+            if (dp >= g_ep_size) {
+                fprintf(stderr, "Replica dp=%d requires expert shard but only %d available\n", dp,
+                        g_ep_size);
+                exit(EXIT_FAILURE);
             }
+            g_dp_groups[dp].shards[0] = &g_expert_shards[dp];
         } else {
-            g_dp_groups[dp].shards = nullptr;
+            g_dp_groups[dp].ep_size = g_ep_size;
+            g_dp_groups[dp].primary_shard_index = (dp < g_ep_size) ? dp : -1;
+            if (g_ep_size > 0) {
+                g_dp_groups[dp].shards =
+                    (OssExpertShard**)malloc(sizeof(OssExpertShard*) * g_ep_size);
+                if (!g_dp_groups[dp].shards) {
+                    fprintf(stderr, "malloc shards pointers for dp=%d failed\n", dp);
+                    exit(EXIT_FAILURE);
+                }
+                for (int ep = 0; ep < g_ep_size; ++ep) {
+                    g_dp_groups[dp].shards[ep] = &g_expert_shards[ep];
+                }
+            } else {
+                g_dp_groups[dp].shards = nullptr;
+            }
         }
     }
 
@@ -187,6 +211,12 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
                 CHECK_HIP(hipFree(shard->workspace.gate_by_expert));
             if (shard->workspace.y_by_expert)
                 CHECK_HIP(hipFree(shard->workspace.y_by_expert));
+            if (shard->workspace.tokens_by_expert)
+                CHECK_HIP(hipFree(shard->workspace.tokens_by_expert));
+            if (shard->workspace.weights_by_expert)
+                CHECK_HIP(hipFree(shard->workspace.weights_by_expert));
+            if (shard->workspace.e_by_token)
+                CHECK_HIP(hipFree(shard->workspace.e_by_token));
             delete reinterpret_cast<std::mutex*>(shard->mutex_handle);
             shard->mutex_handle = nullptr;
         }
@@ -199,7 +229,7 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
         for (int idx = 0; idx < g_active_devices; ++idx) {
             CHECK_HIP(hipSetDevice(idx));
             if (g_all_models[idx]) {
-                free_transformer_on_device_hybrid(g_all_models[idx]);
+                free_transformer_on_device(g_all_models[idx]);
                 free(g_all_models[idx]);
             }
         }

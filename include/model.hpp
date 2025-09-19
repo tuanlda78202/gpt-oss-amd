@@ -202,10 +202,10 @@ typedef struct {
 typedef struct {
     OssConfig config;
     OssTransformerWeightsBFloat16 weights; // FP16 weights for memory efficiency
-    OssRunState state;                 // FP32 activations for numerical stability
-    int fd;                            // file descriptor for memory mapping
-    float* data;                       // memory mapped data pointer
-    ssize_t file_size;                 // size of the checkpoint file in bytes
+    OssRunState state;                     // FP32 activations for numerical stability
+    int fd;                                // file descriptor for memory mapping
+    float* data;                           // memory mapped data pointer
+    ssize_t file_size;                     // size of the checkpoint file in bytes
 
     // Expert-parallel metadata
     int device_id;        // HIP device hosting this shard
@@ -224,7 +224,11 @@ typedef struct {
     float* mlp1_by_expert;
     float* gate_by_expert;
     float* y_by_expert;
+    int* tokens_by_expert;
+    float* weights_by_expert;
+    float* e_by_token;
     int capacity_tokens;
+    int capacity_batch;
 } OssExpertWorkspace;
 
 typedef struct {
@@ -243,5 +247,7 @@ typedef struct {
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name);
-void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d, int use_kv16);
+void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d, int device_id,
+                                int dp_rank, int ep_size, int ep_rank, int use_kv16,
+                                bool replicate_experts);
 void free_transformer_on_device(OssTransformerHybrid* t_d);

@@ -1,4 +1,4 @@
-#include "../include/model_120b.hpp"
+#include "../include/model.hpp"
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
 #include "hip/embed.hip"
@@ -33,31 +33,66 @@ static int kGridCap = [] {
 namespace {
 
 void ensure_workspace_capacity(OssExpertShard* shard, int required_tokens, int hidden_dim,
-                               int intermediate_dim) {
-    if (required_tokens <= shard->workspace.capacity_tokens)
+                               int intermediate_dim, int batch_size) {
+    const bool needs_token_space = required_tokens > shard->workspace.capacity_tokens;
+    const bool needs_batch_space = batch_size > shard->workspace.capacity_batch;
+
+    if (!needs_token_space && !needs_batch_space)
         return;
 
     CHECK_HIP(hipSetDevice(shard->device_id));
 
-    if (shard->workspace.x_by_expert)
-        CHECK_HIP(hipFree(shard->workspace.x_by_expert));
-    if (shard->workspace.mlp1_by_expert)
-        CHECK_HIP(hipFree(shard->workspace.mlp1_by_expert));
-    if (shard->workspace.gate_by_expert)
-        CHECK_HIP(hipFree(shard->workspace.gate_by_expert));
-    if (shard->workspace.y_by_expert)
-        CHECK_HIP(hipFree(shard->workspace.y_by_expert));
+    if (needs_token_space) {
+        if (shard->workspace.x_by_expert)
+            CHECK_HIP(hipFree(shard->workspace.x_by_expert));
+        if (shard->workspace.mlp1_by_expert)
+            CHECK_HIP(hipFree(shard->workspace.mlp1_by_expert));
+        if (shard->workspace.gate_by_expert)
+            CHECK_HIP(hipFree(shard->workspace.gate_by_expert));
+        if (shard->workspace.y_by_expert)
+            CHECK_HIP(hipFree(shard->workspace.y_by_expert));
+        if (shard->workspace.tokens_by_expert)
+            CHECK_HIP(hipFree(shard->workspace.tokens_by_expert));
+        if (shard->workspace.weights_by_expert)
+            CHECK_HIP(hipFree(shard->workspace.weights_by_expert));
 
-    size_t tokens_bytes = (size_t)required_tokens * hidden_dim * sizeof(float);
-    size_t mlp1_bytes = (size_t)required_tokens * 2 * intermediate_dim * sizeof(float);
-    size_t gate_bytes = (size_t)required_tokens * intermediate_dim * sizeof(float);
+        size_t tokens_bytes = (size_t)required_tokens * hidden_dim * sizeof(float);
+        size_t mlp1_bytes = (size_t)required_tokens * 2 * intermediate_dim * sizeof(float);
+        size_t gate_bytes = (size_t)required_tokens * intermediate_dim * sizeof(float);
+        size_t tokens_index_bytes = (size_t)required_tokens * sizeof(int);
+        size_t weights_bytes = (size_t)required_tokens * sizeof(float);
 
-    CHECK_HIP(hipMalloc(&shard->workspace.x_by_expert, tokens_bytes));
-    CHECK_HIP(hipMalloc(&shard->workspace.mlp1_by_expert, mlp1_bytes));
-    CHECK_HIP(hipMalloc(&shard->workspace.gate_by_expert, gate_bytes));
-    CHECK_HIP(hipMalloc(&shard->workspace.y_by_expert, tokens_bytes));
+        if (required_tokens > 0) {
+            CHECK_HIP(hipMalloc(&shard->workspace.x_by_expert, tokens_bytes));
+            CHECK_HIP(hipMalloc(&shard->workspace.mlp1_by_expert, mlp1_bytes));
+            CHECK_HIP(hipMalloc(&shard->workspace.gate_by_expert, gate_bytes));
+            CHECK_HIP(hipMalloc(&shard->workspace.y_by_expert, tokens_bytes));
+            CHECK_HIP(hipMalloc(&shard->workspace.tokens_by_expert, tokens_index_bytes));
+            CHECK_HIP(hipMalloc(&shard->workspace.weights_by_expert, weights_bytes));
+        } else {
+            shard->workspace.x_by_expert = nullptr;
+            shard->workspace.mlp1_by_expert = nullptr;
+            shard->workspace.gate_by_expert = nullptr;
+            shard->workspace.y_by_expert = nullptr;
+            shard->workspace.tokens_by_expert = nullptr;
+            shard->workspace.weights_by_expert = nullptr;
+        }
 
-    shard->workspace.capacity_tokens = required_tokens;
+        shard->workspace.capacity_tokens = required_tokens;
+    }
+
+    if (needs_batch_space) {
+        if (shard->workspace.e_by_token)
+            CHECK_HIP(hipFree(shard->workspace.e_by_token));
+
+        size_t agg_bytes = (size_t)batch_size * hidden_dim * sizeof(float);
+        if (batch_size > 0)
+            CHECK_HIP(hipMalloc(&shard->workspace.e_by_token, agg_bytes));
+        else
+            shard->workspace.e_by_token = nullptr;
+
+        shard->workspace.capacity_batch = batch_size;
+    }
 }
 
 std::mutex& shard_mutex(OssExpertShard* shard) {
@@ -432,28 +467,25 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
         if (active_experts == 0) {
             // No experts fired: residual add
             vecadd(x, s->e_agg, 1.0f, batch_size, hidden_dim);
-        } else if (!ep_group || ep_group->shards.empty() || transformer->ep_local_experts == 0) {
+        } else if (!ep_group || ep_group->ep_size <= 1 || transformer->ep_local_experts == 0) {
             // Single-GPU (or EP disabled): keep tmp-main fused path
             const long long mlp1_weight_stride = (2LL * p->intermediate_dim) * hidden_dim;
-            const long long mlp1_bias_stride   = (2LL * p->intermediate_dim);
+            const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
             const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
-            const long long mlp2_bias_stride   = hidden_dim;
+            const long long mlp2_bias_stride = hidden_dim;
             const float alpha = 1.702f;
             const int work_start = 0;
             const int work_count = active_experts;
 
             float mlp1_ms = 0.0f, mlp2_ms = 0.0f;
-            if (g_enable_profiling) CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            if (g_enable_profiling)
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             // Fused MLP1+SwiGLU
-            moe_mlp1_swiglu(
-                d_work_queue, work_start, work_count,
-                s->x_by_expert, s->gate_by_expert,
-                w->w_mlp1 + 1ll * l * p->n_experts * mlp1_weight_stride,
-                w->b_mlp1 + 1ll * l * p->n_experts * mlp1_bias_stride,
-                hidden_dim, p->intermediate_dim,
-                mlp1_weight_stride, mlp1_bias_stride,
-                alpha, p->swiglu_limit,
-                rows_hint, kGridCap, 0);
+            moe_mlp1_swiglu(d_work_queue, work_start, work_count, s->x_by_expert, s->gate_by_expert,
+                            w->w_mlp1 + 1ll * l * p->n_experts * mlp1_weight_stride,
+                            w->b_mlp1 + 1ll * l * p->n_experts * mlp1_bias_stride, hidden_dim,
+                            p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, alpha,
+                            p->swiglu_limit, rows_hint, kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -461,16 +493,14 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
                 g_batch_timings.moe_mlp1_time += mlp1_ms;
             }
 
-            if (g_enable_profiling) CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+            if (g_enable_profiling)
+                CHECK_HIP(hipEventRecord(start_moe_sub, 0));
             // Fused MLP2+Scatter
             moe_mlp2_scatter(
-                d_work_queue, work_start, work_count,
-                s->gate_by_expert, s->tokens_flat, s->weights_flat, s->e_agg,
-                w->w_mlp2 + 1ll * l * p->n_experts * mlp2_weight_stride,
-                w->b_mlp2 + 1ll * l * p->n_experts * mlp2_bias_stride,
-                p->intermediate_dim, hidden_dim,
-                mlp2_weight_stride, mlp2_bias_stride,
-                rows_hint, kGridCap, 0);
+                d_work_queue, work_start, work_count, s->gate_by_expert, s->tokens_flat,
+                s->weights_flat, s->e_agg, w->w_mlp2 + 1ll * l * p->n_experts * mlp2_weight_stride,
+                w->b_mlp2 + 1ll * l * p->n_experts * mlp2_bias_stride, p->intermediate_dim,
+                hidden_dim, mlp2_weight_stride, mlp2_bias_stride, rows_hint, kGridCap, 0);
             if (g_enable_profiling) {
                 CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                 CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -489,9 +519,9 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
             }
 
             struct ShardWork {
-                std::vector<int> experts;  // global expert ids
-                std::vector<int> offsets;  // global offsets in x_by_expert
-                std::vector<int> counts;   // Ne per expert
+                std::vector<int> experts; // global expert ids
+                std::vector<int> offsets; // global offsets in x_by_expert
+                std::vector<int> counts;  // Ne per expert
                 int total = 0;
                 int maxNe = 0;
             };
@@ -499,49 +529,59 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
 
             int local_shard_index = -1;
             for (int sidx = 0; sidx < ep_size; ++sidx) {
-                if (ep_group->shards[sidx]->model == transformer) { local_shard_index = sidx; break; }
+                if (ep_group->shards[sidx]->model == transformer) {
+                    local_shard_index = sidx;
+                    break;
+                }
             }
 
             // Map each (expert, offset, count) to a shard
             for (int idx = 0; idx < active_experts; ++idx) {
                 int global_e = h_work_queue[idx * 3 + 0];
-                int offset   = h_work_queue[idx * 3 + 1];
-                int count    = h_work_queue[idx * 3 + 2];
+                int offset = h_work_queue[idx * 3 + 1];
+                int count = h_work_queue[idx * 3 + 2];
 
                 int shard_idx = -1;
                 for (int sidx = 0; sidx < ep_size; ++sidx) {
                     OssTransformerHybrid* shard_model = ep_group->shards[sidx]->model;
                     int start = shard_model->ep_expert_offset;
-                    int span  = shard_model->ep_local_experts;
+                    int span = shard_model->ep_local_experts;
                     if (span > 0 && global_e >= start && global_e < start + span) {
-                        shard_idx = sidx; break;
+                        shard_idx = sidx;
+                        break;
                     }
                 }
-                if (shard_idx < 0) { fprintf(stderr, "Failed to map expert %d to shard\n", global_e); exit(EXIT_FAILURE); }
+                if (shard_idx < 0) {
+                    fprintf(stderr, "Failed to map expert %d to shard\n", global_e);
+                    exit(EXIT_FAILURE);
+                }
 
                 auto& sw = shard_work[shard_idx];
                 sw.experts.push_back(global_e);
                 sw.offsets.push_back(offset);
                 sw.counts.push_back(count);
                 sw.total += count;
-                if (count > sw.maxNe) sw.maxNe = count;
+                if (count > sw.maxNe)
+                    sw.maxNe = count;
             }
 
             CHECK_HIP(hipMemset(s->e_agg, 0, (size_t)batch_size * hidden_dim * sizeof(float)));
 
             const long long mlp1_weight_stride = (2LL * p->intermediate_dim) * hidden_dim;
-            const long long mlp1_bias_stride   = (2LL * p->intermediate_dim);
+            const long long mlp1_bias_stride = (2LL * p->intermediate_dim);
             const long long mlp2_weight_stride = hidden_dim * (long long)p->intermediate_dim;
-            const long long mlp2_bias_stride   = hidden_dim;
+            const long long mlp2_bias_stride = hidden_dim;
             const float alpha = 1.702f;
 
             // -------- Local shard: run fully fused on the primary device --------
             if (local_shard_index >= 0 && transformer->ep_local_experts > 0) {
                 const ShardWork& local_work = shard_work[local_shard_index];
                 if (!local_work.experts.empty()) {
-                    std::vector<int> local_queue; local_queue.reserve(local_work.experts.size() * 3);
+                    std::vector<int> local_queue;
+                    local_queue.reserve(local_work.experts.size() * 3);
                     for (size_t i = 0; i < local_work.experts.size(); ++i) {
-                        local_queue.push_back(local_work.experts[i] - transformer->ep_expert_offset); // remap to local id
+                        local_queue.push_back(local_work.experts[i] -
+                                              transformer->ep_expert_offset); // remap to local id
                         local_queue.push_back(local_work.offsets[i]);
                         local_queue.push_back(local_work.counts[i]);
                     }
@@ -550,17 +590,16 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
 
                     float mlp1_ms = 0.0f, mlp2_ms = 0.0f;
 
-                    if (g_enable_profiling) CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+                    if (g_enable_profiling)
+                        CHECK_HIP(hipEventRecord(start_moe_sub, 0));
                     // Fused MLP1+SwiGLU (local weights)
                     moe_mlp1_swiglu(
-                        d_work_queue, 0, (int)local_work.experts.size(),
-                        s->x_by_expert, s->gate_by_expert,
+                        d_work_queue, 0, (int)local_work.experts.size(), s->x_by_expert,
+                        s->gate_by_expert,
                         w->w_mlp1 + 1ll * l * transformer->ep_local_experts * mlp1_weight_stride,
                         w->b_mlp1 + 1ll * l * transformer->ep_local_experts * mlp1_bias_stride,
-                        hidden_dim, p->intermediate_dim,
-                        mlp1_weight_stride, mlp1_bias_stride,
-                        alpha, p->swiglu_limit,
-                        local_work.maxNe, kGridCap, 0);
+                        hidden_dim, p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride,
+                        alpha, p->swiglu_limit, local_work.maxNe, kGridCap, 0);
                     if (g_enable_profiling) {
                         CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                         CHECK_HIP(hipEventSynchronize(end_moe_sub));
@@ -568,15 +607,15 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
                         g_batch_timings.moe_mlp1_time += mlp1_ms;
                     }
 
-                    if (g_enable_profiling) CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+                    if (g_enable_profiling)
+                        CHECK_HIP(hipEventRecord(start_moe_sub, 0));
                     // Fused MLP2+Scatter (local weights, scatter directly into primary e_agg)
                     moe_mlp2_scatter(
-                        d_work_queue, 0, (int)local_work.experts.size(),
-                        s->gate_by_expert, s->tokens_flat, s->weights_flat, s->e_agg,
+                        d_work_queue, 0, (int)local_work.experts.size(), s->gate_by_expert,
+                        s->tokens_flat, s->weights_flat, s->e_agg,
                         w->w_mlp2 + 1ll * l * transformer->ep_local_experts * mlp2_weight_stride,
                         w->b_mlp2 + 1ll * l * transformer->ep_local_experts * mlp2_bias_stride,
-                        p->intermediate_dim, hidden_dim,
-                        mlp2_weight_stride, mlp2_bias_stride,
+                        p->intermediate_dim, hidden_dim, mlp2_weight_stride, mlp2_bias_stride,
                         local_work.maxNe, kGridCap, 0);
                     if (g_enable_profiling) {
                         CHECK_HIP(hipEventRecord(end_moe_sub, 0));
@@ -590,124 +629,159 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
 
             // -------- Remote shards: compute remotely, scatter on primary --------
             for (int shard_idx = 0; shard_idx < ep_size; ++shard_idx) {
-                if (shard_idx == local_shard_index) continue;
+                if (shard_idx == local_shard_index)
+                    continue;
 
                 OssExpertShard* shard = ep_group->shards[shard_idx];
                 OssTransformerHybrid* shard_model = shard->model;
-                if (!shard_model || shard_model->ep_local_experts == 0) continue;
+                if (!shard_model || shard_model->ep_local_experts == 0)
+                    continue;
 
                 const ShardWork& work = shard_work[shard_idx];
-                if (work.experts.empty()) continue;
+                if (work.experts.empty())
+                    continue;
 
                 const int remote_device = shard->device_id;
-                OssTransformerWeightsHalf* rw = &shard_model->weights;
+                OssTransformerWeightsBFloat16* rw = &shard_model->weights;
 
-                std::vector<int> remote_queue; remote_queue.reserve(work.experts.size() * 3);
-                std::vector<int> agg_queue;    agg_queue.reserve(work.experts.size() * 3);
+                std::vector<int> remote_queue;
+                remote_queue.reserve(work.experts.size() * 3);
 
                 int local_offset = 0;
                 for (size_t i = 0; i < work.experts.size(); ++i) {
                     const int global_e = work.experts[i];
-                    const int cnt      = work.counts[i];
-                    const int goff     = work.offsets[i];
-
-                    remote_queue.push_back(global_e - shard_model->ep_expert_offset); // local id on remote shard
-                    remote_queue.push_back(local_offset);                              // packed on remote
+                    const int cnt = work.counts[i];
+                    remote_queue.push_back(
+                        global_e - shard_model->ep_expert_offset); // local id on remote shard
+                    remote_queue.push_back(local_offset);          // packed offset on remote shard
                     remote_queue.push_back(cnt);
-
-                    agg_queue.push_back(0);       // local offset on primary for packed 'y' we copy back
-                    agg_queue.push_back(goff);    // global offset where these tokens live
-                    agg_queue.push_back(cnt);
-
                     local_offset += cnt;
                 }
 
                 std::lock_guard<std::mutex> guard(shard_mutex(shard));
-                ensure_workspace_capacity(shard, work.total, hidden_dim, p->intermediate_dim);
+                ensure_workspace_capacity(shard, work.total, hidden_dim, p->intermediate_dim,
+                                          batch_size);
 
                 CHECK_HIP(hipSetDevice(remote_device));
-                // ensure shard_model->ep_work_queue capacity elsewhere in init or here:
                 if ((int)remote_queue.size() > shard_model->ep_work_queue_capacity) {
-                    if (shard_model->ep_work_queue) CHECK_HIP(hipFree(shard_model->ep_work_queue));
-                    CHECK_HIP(hipMalloc(&shard_model->ep_work_queue, remote_queue.size() * sizeof(int)));
+                    if (shard_model->ep_work_queue)
+                        CHECK_HIP(hipFree(shard_model->ep_work_queue));
+                    CHECK_HIP(
+                        hipMalloc(&shard_model->ep_work_queue, remote_queue.size() * sizeof(int)));
                     shard_model->ep_work_queue_capacity = (int)remote_queue.size();
                 }
                 CHECK_HIP(hipMemcpy(shard_model->ep_work_queue, remote_queue.data(),
                                     remote_queue.size() * sizeof(int), hipMemcpyHostToDevice));
 
-                // Copy X slices to remote
-                local_offset = 0;
-                for (size_t i = 0; i < work.experts.size(); ++i) {
-                    const int cnt  = work.counts[i];
-                    const int goff = work.offsets[i];
-                    const size_t bytes = (size_t)cnt * hidden_dim * sizeof(float);
-                    CHECK_HIP(hipMemcpyPeer(
-                        shard->workspace.x_by_expert + (long long)local_offset * hidden_dim, remote_device,
-                        s->x_by_expert           + (long long)goff         * hidden_dim, primary_device,
-                        bytes));
-                    local_offset += cnt;
+                if (work.total > 0) {
+                    local_offset = 0;
+                    for (size_t i = 0; i < work.experts.size(); ++i) {
+                        const int cnt = work.counts[i];
+                        const int goff = work.offsets[i];
+                        const size_t tokens_bytes = (size_t)cnt * hidden_dim * sizeof(float);
+                        const size_t index_bytes = (size_t)cnt * sizeof(int);
+                        const size_t weight_bytes = (size_t)cnt * sizeof(float);
+
+                        CHECK_HIP(hipMemcpyPeer(
+                            shard->workspace.x_by_expert + (long long)local_offset * hidden_dim,
+                            remote_device, s->x_by_expert + (long long)goff * hidden_dim,
+                            primary_device, tokens_bytes));
+
+                        CHECK_HIP(hipMemcpyPeer(shard->workspace.tokens_by_expert + local_offset,
+                                                remote_device, s->tokens_flat + goff,
+                                                primary_device, index_bytes));
+
+                        CHECK_HIP(hipMemcpyPeer(shard->workspace.weights_by_expert + local_offset,
+                                                remote_device, s->weights_flat + goff,
+                                                primary_device, weight_bytes));
+
+                        local_offset += cnt;
+                    }
                 }
 
-                // Remote compute: fused MLP1, then MLP2 as GEMV -> y_by_expert (remote)
+                const size_t agg_bytes = (size_t)batch_size * hidden_dim * sizeof(float);
+                if (agg_bytes > 0)
+                    CHECK_HIP(hipMemset(shard->workspace.e_by_token, 0, agg_bytes));
+
+                float mlp1_ms_remote = 0.0f;
+                float mlp2_ms_remote = 0.0f;
+                float scatter_ms_remote = 0.0f;
+                hipEvent_t remote_start = nullptr;
+                hipEvent_t remote_end = nullptr;
+                if (g_enable_profiling) {
+                    CHECK_HIP(hipEventCreate(&remote_start));
+                    CHECK_HIP(hipEventCreate(&remote_end));
+                }
+
+                if (g_enable_profiling)
+                    CHECK_HIP(hipEventRecord(remote_start, 0));
                 moe_mlp1_swiglu(
                     shard_model->ep_work_queue, 0, (int)work.experts.size(),
                     shard->workspace.x_by_expert, shard->workspace.gate_by_expert,
                     rw->w_mlp1 + 1ll * l * shard_model->ep_local_experts * mlp1_weight_stride,
                     rw->b_mlp1 + 1ll * l * shard_model->ep_local_experts * mlp1_bias_stride,
-                    hidden_dim, p->intermediate_dim,
-                    mlp1_weight_stride, mlp1_bias_stride,
-                    alpha, p->swiglu_limit,
-                    work.maxNe, kGridCap, 0);
-
-                // NOTE: We do NOT scatter on remote. Do matvec for MLP2, copy Y back, then scatter on primary.
-                moe_matvec(
-                    shard_model->ep_work_queue, 0, (int)work.experts.size(),
-                    shard->workspace.gate_by_expert, shard->workspace.y_by_expert,
-                    rw->w_mlp2 + 1ll * l * shard_model->ep_local_experts * mlp2_weight_stride,
-                    rw->b_mlp2 + 1ll * l * shard_model->ep_local_experts * mlp2_bias_stride,
-                    p->intermediate_dim, hidden_dim,
-                    mlp2_weight_stride, mlp2_bias_stride,
-                    work.maxNe, 0);
-
-                // Copy Y back to the primary into the global layout
-                local_offset = 0;
-                for (size_t i = 0; i < work.experts.size(); ++i) {
-                    const int cnt  = work.counts[i];
-                    const int goff = work.offsets[i];
-                    const size_t bytes = (size_t)cnt * hidden_dim * sizeof(float);
-                    CHECK_HIP(hipMemcpyPeer(
-                        s->y_by_expert + (long long)goff * hidden_dim, primary_device,
-                        shard->workspace.y_by_expert + (long long)local_offset * hidden_dim, remote_device,
-                        bytes));
-                    local_offset += cnt;
+                    hidden_dim, p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, alpha,
+                    p->swiglu_limit, work.maxNe, kGridCap, 0);
+                if (g_enable_profiling) {
+                    CHECK_HIP(hipEventRecord(remote_end, 0));
+                    CHECK_HIP(hipEventSynchronize(remote_end));
+                    CHECK_HIP(hipEventElapsedTime(&mlp1_ms_remote, remote_start, remote_end));
+                    g_batch_timings.moe_mlp1_time += mlp1_ms_remote;
                 }
 
-                // Primary device: scatter the contributions using original tokens/weights
+                if (g_enable_profiling)
+                    CHECK_HIP(hipEventRecord(remote_start, 0));
+                moe_mlp2_scatter(
+                    shard_model->ep_work_queue, 0, (int)work.experts.size(),
+                    shard->workspace.gate_by_expert, shard->workspace.tokens_by_expert,
+                    shard->workspace.weights_by_expert, shard->workspace.e_by_token,
+                    rw->w_mlp2 + 1ll * l * shard_model->ep_local_experts * mlp2_weight_stride,
+                    rw->b_mlp2 + 1ll * l * shard_model->ep_local_experts * mlp2_bias_stride,
+                    p->intermediate_dim, hidden_dim, mlp2_weight_stride, mlp2_bias_stride,
+                    work.maxNe, kGridCap, 0);
+                if (g_enable_profiling) {
+                    CHECK_HIP(hipEventRecord(remote_end, 0));
+                    CHECK_HIP(hipEventSynchronize(remote_end));
+                    CHECK_HIP(hipEventElapsedTime(&mlp2_ms_remote, remote_start, remote_end));
+                    g_batch_timings.moe_mlp2_time += mlp2_ms_remote;
+                }
+
+                if (g_enable_profiling) {
+                    CHECK_HIP(hipEventDestroy(remote_start));
+                    CHECK_HIP(hipEventDestroy(remote_end));
+                }
+
+                // Ensure remote work is visible before copying results back
+                CHECK_HIP(hipDeviceSynchronize());
+
                 CHECK_HIP(hipSetDevice(primary_device));
-                if (!agg_queue.empty()) {
-                    CHECK_HIP(hipMemcpy(d_work_queue, agg_queue.data(),
-                                        agg_queue.size() * sizeof(int), hipMemcpyHostToDevice));
-                    if (g_enable_profiling) CHECK_HIP(hipEventRecord(start_moe_sub, 0));
-                    moe_scale_scatter(
-                        d_work_queue, 0, (int)work.experts.size(),
-                        s->y_by_expert, s->tokens_flat, s->weights_flat, s->e_agg,
-                        hidden_dim, batch_size, work.maxNe, 0);
+
+                if (agg_bytes > 0) {
+                    if (g_enable_profiling)
+                        CHECK_HIP(hipEventRecord(start_moe_sub, 0));
+
+                    CHECK_HIP(hipMemcpyPeer(s->y_by_expert, primary_device,
+                                            shard->workspace.e_by_token, remote_device, agg_bytes));
+
+                    vecadd(s->e_agg, s->y_by_expert, 1.0f, batch_size, hidden_dim);
+
+                    // Ensure we finish consuming s->y_by_expert before it gets reused
+                    CHECK_HIP(hipDeviceSynchronize());
+
                     if (g_enable_profiling) {
                         CHECK_HIP(hipEventRecord(end_moe_sub, 0));
                         CHECK_HIP(hipEventSynchronize(end_moe_sub));
-                        float scatter_ms_remote;
-                        CHECK_HIP(hipEventElapsedTime(&scatter_ms_remote, start_moe_sub, end_moe_sub));
+                        CHECK_HIP(
+                            hipEventElapsedTime(&scatter_ms_remote, start_moe_sub, end_moe_sub));
                         g_batch_timings.moe_scatter_time += scatter_ms_remote;
-                        g_batch_timings.expert_processing_time += scatter_ms_remote;
                     }
                 }
-            }
-        }
-            }
-        }
 
-        if (g_enable_profiling) {
-            g_batch_timings.expert_processing_time += accumulated_expert_time;
+                if (g_enable_profiling) {
+                    g_batch_timings.expert_processing_time +=
+                        (mlp1_ms_remote + mlp2_ms_remote + scatter_ms_remote);
+                }
+            }
         }
 
         // ! Residual

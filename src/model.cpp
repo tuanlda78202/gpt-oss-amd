@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <vector>
 
-
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
@@ -57,8 +56,9 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
 }
 
 // ! Hybrid precision (BF16 weights + FP32 activations)
-void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d,
-                                       int device_id, int dp_rank, int ep_size, int ep_rank, int use_kv16) {
+void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int device_id,
+                                int dp_rank, int ep_size, int ep_rank, int use_kv16,
+                                bool replicate_experts) {
     memcpy(&t_d->config, &t_fp32->config, sizeof(OssConfig));
 
     OssConfig* conf = &t_fp32->config;
@@ -78,7 +78,10 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     int local_experts = 0;
     int expert_offset = 0;
-    if (ep_size > 0 && ep_rank >= 0) {
+    if (replicate_experts) {
+        local_experts = n_experts;
+        expert_offset = 0;
+    } else if (ep_size > 0 && ep_rank >= 0) {
         int base_local = n_experts / ep_size;
         int rem = n_experts % ep_size;
         local_experts = base_local + (ep_rank < rem ? 1 : 0);
@@ -87,7 +90,7 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     t_d->device_id = device_id;
     t_d->dp_rank = dp_rank;
-    t_d->ep_size = ep_size;
+    t_d->ep_size = replicate_experts ? 1 : ep_size;
     t_d->ep_rank = ep_rank;
     t_d->ep_local_experts = local_experts;
     t_d->ep_expert_offset = expert_offset;
@@ -112,8 +115,8 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     size_t token_emb_size = (size_t)vocab_size * hidden_dim * sizeof(__hip_bfloat16);
     size_t mlp1_local_size = (size_t)n_layers * (size_t)local_experts * 2 * intermediate_dim *
                              hidden_dim * sizeof(__hip_bfloat16);
-    size_t mlp2_local_size =
-        (size_t)n_layers * (size_t)local_experts * hidden_dim * intermediate_dim * sizeof(__hip_bfloat16);
+    size_t mlp2_local_size = (size_t)n_layers * (size_t)local_experts * hidden_dim *
+                             intermediate_dim * sizeof(__hip_bfloat16);
 
     CHECK_HIP(hipMalloc(&t_d->weights.token_embedding_table, token_emb_size));
     CHECK_HIP(hipMalloc(&t_d->weights.rms_attn_w,
@@ -285,28 +288,32 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         const long long b_mlp2_stride = (long long)hidden_dim;
 
         for (int l = 0; l < n_layers; ++l) {
-            __half* dst_w1 = t_d->weights.w_mlp1 + (long long)l * local_experts * mlp1_stride;
+            __hip_bfloat16* dst_w1 =
+                t_d->weights.w_mlp1 + (long long)l * local_experts * mlp1_stride;
             float* src_w1 =
                 weights->w_mlp1 + ((long long)l * n_experts + expert_offset) * mlp1_stride;
-            size_t bytes_w1 = (size_t)local_experts * mlp1_stride * sizeof(__half);
+            size_t bytes_w1 = (size_t)local_experts * mlp1_stride * sizeof(__hip_bfloat16);
             copy_large_tensor_streaming(&dst_w1, src_w1, bytes_w1, "w_mlp1_shard");
 
-            __half* dst_w2 = t_d->weights.w_mlp2 + (long long)l * local_experts * mlp2_stride;
+            __hip_bfloat16* dst_w2 =
+                t_d->weights.w_mlp2 + (long long)l * local_experts * mlp2_stride;
             float* src_w2 =
                 weights->w_mlp2 + ((long long)l * n_experts + expert_offset) * mlp2_stride;
-            size_t bytes_w2 = (size_t)local_experts * mlp2_stride * sizeof(__half);
+            size_t bytes_w2 = (size_t)local_experts * mlp2_stride * sizeof(__hip_bfloat16);
             copy_large_tensor_streaming(&dst_w2, src_w2, bytes_w2, "w_mlp2_shard");
 
-            __half* dst_b1 = t_d->weights.b_mlp1 + (long long)l * local_experts * b_mlp1_stride;
+            __hip_bfloat16* dst_b1 =
+                t_d->weights.b_mlp1 + (long long)l * local_experts * b_mlp1_stride;
             float* src_b1 =
                 weights->b_mlp1 + ((long long)l * n_experts + expert_offset) * b_mlp1_stride;
-            size_t bytes_b1 = (size_t)local_experts * b_mlp1_stride * sizeof(__half);
+            size_t bytes_b1 = (size_t)local_experts * b_mlp1_stride * sizeof(__hip_bfloat16);
             copy_large_tensor_streaming(&dst_b1, src_b1, bytes_b1, "b_mlp1_shard");
 
-            __half* dst_b2 = t_d->weights.b_mlp2 + (long long)l * local_experts * b_mlp2_stride;
+            __hip_bfloat16* dst_b2 =
+                t_d->weights.b_mlp2 + (long long)l * local_experts * b_mlp2_stride;
             float* src_b2 =
                 weights->b_mlp2 + ((long long)l * n_experts + expert_offset) * b_mlp2_stride;
-            size_t bytes_b2 = (size_t)local_experts * b_mlp2_stride * sizeof(__half);
+            size_t bytes_b2 = (size_t)local_experts * b_mlp2_stride * sizeof(__hip_bfloat16);
             copy_large_tensor_streaming(&dst_b2, src_b2, bytes_b2, "b_mlp2_shard");
         }
     }

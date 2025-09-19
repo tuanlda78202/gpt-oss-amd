@@ -1072,8 +1072,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
 }
 
 #include "getp/eval.cpp"
-// #include "getp/run_20b.cpp"
-#include "getp/run_120b.cpp"
+#include "getp/run.cpp"
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
