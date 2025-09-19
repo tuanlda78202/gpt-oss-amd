@@ -5,11 +5,14 @@
 #include "../sampler.cpp"
 #include "eval.cpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <omp.h>
 #include <stdbool.h>
+#include <vector>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -17,12 +20,107 @@
 static OssTransformerHybrid** g_models = nullptr; // store all the models
 thread_local OssTransformerHybrid* t_d = nullptr; // local model
 
+struct ThreadLocalBatchBuffers {
+    int capacity = 0;
+    int* tokens = nullptr;
+    int* positions = nullptr;
+    int* indices = nullptr;
+    int* sample_results_d = nullptr;
+    int* sample_results_h = nullptr;
+    int* sample_owner = nullptr;
+    int* sample_slots = nullptr;
+};
+
+struct ThreadLocalRequestBuffers {
+    int capacity = 0;
+    const char** input_ptrs = nullptr;
+    int** output_ptrs = nullptr;
+};
+
+static thread_local ThreadLocalBatchBuffers g_batch_buffers;
+static thread_local ThreadLocalRequestBuffers g_request_buffers;
+
+static void ensure_batch_buffers(int required) {
+    ThreadLocalBatchBuffers& buf = g_batch_buffers;
+    if (required <= buf.capacity)
+        return;
+
+    auto release_host = [](int*& ptr) {
+        if (ptr) {
+            CHECK_HIP(hipHostFree(ptr));
+            ptr = nullptr;
+        }
+    };
+
+    if (buf.sample_results_d) {
+        CHECK_HIP(hipFree(buf.sample_results_d));
+        buf.sample_results_d = nullptr;
+    }
+    release_host(buf.tokens);
+    release_host(buf.positions);
+    release_host(buf.indices);
+    release_host(buf.sample_results_h);
+
+    if (buf.sample_owner) {
+        free(buf.sample_owner);
+        buf.sample_owner = nullptr;
+    }
+    if (buf.sample_slots) {
+        free(buf.sample_slots);
+        buf.sample_slots = nullptr;
+    }
+
+    CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.tokens), required * sizeof(int)));
+    CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.positions), required * sizeof(int)));
+    CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.indices), required * sizeof(int)));
+    CHECK_HIP(hipMalloc(&buf.sample_results_d, required * sizeof(int)));
+    CHECK_HIP(
+        hipHostMalloc(reinterpret_cast<void**>(&buf.sample_results_h), required * sizeof(int)));
+
+    buf.sample_owner = reinterpret_cast<int*>(malloc(required * sizeof(int)));
+    buf.sample_slots = reinterpret_cast<int*>(malloc(required * sizeof(int)));
+
+    if (!buf.sample_owner || !buf.sample_slots) {
+        fprintf(stderr, "Failed to allocate thread-local batch buffers\n");
+        exit(EXIT_FAILURE);
+    }
+
+    buf.capacity = required;
+}
+
+static void ensure_request_buffers(int required) {
+    ThreadLocalRequestBuffers& buf = g_request_buffers;
+    if (required <= buf.capacity)
+        return;
+
+    if (buf.input_ptrs) {
+        free(buf.input_ptrs);
+        buf.input_ptrs = nullptr;
+    }
+    if (buf.output_ptrs) {
+        free(buf.output_ptrs);
+        buf.output_ptrs = nullptr;
+    }
+
+    buf.input_ptrs = reinterpret_cast<const char**>(
+        malloc(static_cast<size_t>(required) * sizeof(*buf.input_ptrs)));
+    buf.output_ptrs =
+        reinterpret_cast<int**>(malloc(static_cast<size_t>(required) * sizeof(*buf.output_ptrs)));
+    if (!buf.input_ptrs || !buf.output_ptrs) {
+        fprintf(stderr, "Failed to allocate request buffers\n");
+        exit(EXIT_FAILURE);
+    }
+
+    buf.capacity = required;
+}
+
 #define DP 8
 static int num_gpus = 1;
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
+    transformer_oss->config.seq_len = 1024;
 
     // Discover GPUs
     CHECK_HIP(hipGetDeviceCount(&num_gpus));
@@ -146,9 +244,21 @@ void progress_bar(int batch_size, int* tokens_generated, int* max_tokens, bool* 
 }
 
 long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
-                   const char** input_seqs, int** output_tokens_batch, int batch_size, int steps) {
+                   const char** input_seqs, int** output_tokens_batch, int batch_size, int steps,
+                   bool show_progress) {
     OssSampler* sampler_oss = (OssSampler*)sampler;
+    const bool use_async_sampling = (sampler_oss->temperature == 0.0f);
     long long total_tokens_out = 0;
+
+    ensure_batch_buffers(t_d->config.batch_size);
+    ThreadLocalBatchBuffers& buffers = g_batch_buffers;
+    int* batch_tokens = buffers.tokens;
+    int* batch_positions = buffers.positions;
+    int* batch_indices = buffers.indices;
+    int* sample_owner = buffers.sample_owner;
+    int* sample_slots = buffers.sample_slots;
+    int* sample_results_h = buffers.sample_results_h;
+    int* sample_results_d = buffers.sample_results_d;
 
     // Encode all prompts in the batch
     int** prompt_tokens = (int**)malloc(batch_size * sizeof(int*));
@@ -164,53 +274,75 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
             fprintf(stderr, "Error: expected at least 1 prompt token for batch element %d\n", b);
             exit(EXIT_FAILURE);
         }
-        max_prompt_len =
-            (num_prompt_tokens[b] > max_prompt_len) ? num_prompt_tokens[b] : max_prompt_len;
+        if (num_prompt_tokens[b] > max_prompt_len)
+            max_prompt_len = num_prompt_tokens[b];
     }
 
     // Batch processing variables
-    int* current_tokens = (int*)malloc(batch_size * sizeof(int)); // Current token for each sequence
-    int* pos = (int*)malloc(batch_size * sizeof(int));            // Position for each sequence
-    bool* finished = (bool*)malloc(batch_size * sizeof(bool)); // Whether each sequence is finished
+    int* current_tokens = (int*)malloc(batch_size * sizeof(int));
+    int* pos = (int*)malloc(batch_size * sizeof(int));
+    bool* finished = (bool*)malloc(batch_size * sizeof(bool));
     int active_sequences = batch_size;
 
-    // Initialize batch state
     for (int b = 0; b < batch_size; b++) {
         current_tokens[b] = prompt_tokens[b][0];
         pos[b] = 0;
         finished[b] = false;
     }
 
-    for (int b = 0; b < batch_size; b++) {
-        printf("#%d: ", b + 1);
-        const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
-        safe_printf(first_piece);
-        printf(" | ");
+    if (show_progress) {
+        for (int b = 0; b < batch_size; b++) {
+            printf("#%d: ", b + 1);
+            const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
+            safe_printf(first_piece);
+            printf(" | ");
+        }
+        printf("\n");
+        fflush(stdout);
     }
-    printf("\n");
-    fflush(stdout);
 
-    // Main generation loop
     int* tokens_generated = (int*)calloc(batch_size, sizeof(int));
     int* max_generation_tokens = (int*)malloc(batch_size * sizeof(int));
 
     for (int b = 0; b < batch_size; b++) {
-        max_generation_tokens[b] = steps - 1 - num_prompt_tokens[b];
-        if (max_generation_tokens[b] < 0)
-            max_generation_tokens[b] = 0;
+        int remaining = steps - 1 - num_prompt_tokens[b];
+        max_generation_tokens[b] = remaining > 0 ? remaining : 0;
     }
-    progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
 
-    double total_forward_time = 0.0;
-    int forward_calls = 0;
+    const int progress_stride = 50;
+    int iteration = 0;
+
+    if (show_progress) {
+        progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
+    }
+
+    auto commit_generation = [&](int b_idx, int next_token, bool counted) {
+        if (counted && output_tokens_batch[b_idx]) {
+            int output_idx = pos[b_idx] - num_prompt_tokens[b_idx];
+            if (output_idx >= 0) {
+                output_tokens_batch[b_idx][output_idx] = next_token;
+            }
+        }
+        if (counted) {
+            total_tokens_out++;
+            tokens_generated[b_idx]++;
+        }
+        if ((next_token == 199999 || next_token == 200002 || pos[b_idx] + 1 >= steps) &&
+            !finished[b_idx]) {
+            finished[b_idx] = true;
+            active_sequences--;
+            if (output_tokens_batch[b_idx]) {
+                int end_idx = pos[b_idx] - num_prompt_tokens[b_idx] + 1;
+                if (end_idx >= 0) {
+                    output_tokens_batch[b_idx][end_idx] = -1;
+                }
+            }
+        }
+        current_tokens[b_idx] = next_token;
+    };
 
     while (active_sequences > 0) {
-        int* batch_tokens = (int*)malloc(batch_size * sizeof(int));
-        int* batch_positions = (int*)malloc(batch_size * sizeof(int));
-        int* batch_indices = (int*)malloc(batch_size * sizeof(int));
         int valid_batch_size = 0;
-
-        // Continuous batching
         for (int b = 0; b < batch_size && valid_batch_size < batch_size; b++) {
             if (!finished[b] && pos[b] + 1 < steps) {
                 batch_tokens[valid_batch_size] = current_tokens[b];
@@ -220,61 +352,51 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
             }
         }
 
-        if (valid_batch_size == 0) {
-            free(batch_tokens);
-            free(batch_positions);
-            free(batch_indices);
+        if (valid_batch_size == 0)
             break;
-        }
 
-        // Forward pass for the batch with mixed positions
         float* batch_logits = forward(t_d, batch_tokens, batch_positions, valid_batch_size,
                                       batch_indices, t_d->config.batch_size);
 
-        // Process results for each sequence in the batch
+        int pending_samples = 0;
         for (int i = 0; i < valid_batch_size; i++) {
-            int b = batch_indices[i];
-            int next_token;
+            int b_idx = batch_indices[i];
+            pos[b_idx]++;
 
-            // Advance position
-            pos[b]++;
-
-            if (pos[b] < num_prompt_tokens[b]) {
-                // Still in prompt phase - force next prompt token
-                next_token = prompt_tokens[b][pos[b]];
+            if (pos[b_idx] < num_prompt_tokens[b_idx]) {
+                int next_token = prompt_tokens[b_idx][pos[b_idx]];
+                commit_generation(b_idx, next_token, false);
+            } else if (use_async_sampling) {
+                sample_owner[pending_samples] = b_idx;
+                sample_slots[pending_samples] = i;
+                pending_samples++;
             } else {
-                // Generation phase - sample from logits
                 float* seq_logits = batch_logits + i * t_d->config.vocab_size;
-                next_token = sample_oss_gpu(sampler_oss, seq_logits);
-
-                // Save output token
-                int output_idx = pos[b] - num_prompt_tokens[b];
-                if (output_tokens_batch[b]) {
-                    output_tokens_batch[b][output_idx] = next_token;
-                }
-                total_tokens_out++;
-                tokens_generated[b]++;
+                int next_token = sample_oss_gpu(sampler_oss, seq_logits);
+                commit_generation(b_idx, next_token, true);
             }
-
-            // Check for termination
-            if (next_token == 199999 || next_token == 200002 || pos[b] + 1 >= steps) {
-                finished[b] = true;
-                active_sequences--;
-                if (output_tokens_batch[b]) {
-                    int output_idx = pos[b] - num_prompt_tokens[b] + 1;
-                    output_tokens_batch[b][output_idx] = -1; // End marker
-                }
-            }
-
-            current_tokens[b] = next_token;
         }
 
-        clear_lines(batch_size);
-        progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
+        if (use_async_sampling && pending_samples > 0) {
+            for (int s = 0; s < pending_samples; ++s) {
+                float* seq_logits = batch_logits + sample_slots[s] * t_d->config.vocab_size;
+                sample_argmax(seq_logits, t_d->config.vocab_size, sample_results_d + s);
+            }
+            CHECK_HIP(hipMemcpyAsync(sample_results_h, sample_results_d,
+                                     pending_samples * sizeof(int), hipMemcpyDeviceToHost, 0));
+            CHECK_HIP(hipStreamSynchronize(0));
+            for (int s = 0; s < pending_samples; ++s) {
+                int b_idx = sample_owner[s];
+                int next_token = sample_results_h[s];
+                commit_generation(b_idx, next_token, true);
+            }
+        }
 
-        free(batch_tokens);
-        free(batch_positions);
-        free(batch_indices);
+        iteration++;
+        if (show_progress && ((iteration % progress_stride == 0) || active_sequences == 0)) {
+            clear_lines(batch_size);
+            progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
+        }
     }
 
     for (int b = 0; b < batch_size; b++) {
@@ -293,71 +415,66 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
 
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
-    const int N = requests->num_reqs;
+    const int total_requests = requests->num_reqs;
+    if (total_requests <= 0)
+        return 0;
+
+    const int max_batch_size = g_models[0]->config.batch_size;
+    std::vector<int> batch_starts;
+    batch_starts.reserve((total_requests + max_batch_size - 1) / max_batch_size);
+    for (int start = 0; start < total_requests; start += max_batch_size)
+        batch_starts.push_back(start);
+
+    std::atomic<int> next_batch{0};
     long long total_tokens = 0;
 
 #pragma omp parallel reduction(+ : total_tokens)
     {
-        const int tid = omp_get_thread_num();
-        const int device = tid; // one OMP thread per device
-
+        const int device = omp_get_thread_num();
         CHECK_HIP(hipSetDevice(device));
         t_d = g_models[device];
 
-        // Per-thread sampler clone
         OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
         memcpy(sampler_copy, sampler, sizeof(OssSampler));
 
-        // Build the list of request indices owned by this DP device
-        int my_count = 0;
-        for (int i = device; i < N; i += num_gpus)
-            my_count++;
-        int* my_idx = (int*)malloc(sizeof(int) * (my_count > 0 ? my_count : 1));
-        int w = 0;
-        for (int i = device; i < N; i += num_gpus)
-            my_idx[w++] = i;
+        ensure_request_buffers(max_batch_size);
+        ThreadLocalRequestBuffers& req_buf = g_request_buffers;
 
-        const int batch_size = t_d->config.batch_size;
+        const bool is_log_device = (device == 0);
+        int local_batches = 0;
 
-        // Batched on this replica
 #pragma omp critical
         {
-            printf("🚀 [DP device %d] Batched inference with batch_size = %d (%d reqs)\n", device,
-                   batch_size, my_count);
+            printf("🚀 [DP device %d] Ready with batch_size = %d\n", device,
+                   t_d->config.batch_size);
             fflush(stdout);
         }
 
-        for (int start = 0; start < my_count; start += batch_size) {
-            const int cur_bs = ((my_count - start) < batch_size) ? (my_count - start) : batch_size;
+        while (true) {
+            int batch_id = next_batch.fetch_add(1, std::memory_order_relaxed);
+            if (batch_id >= static_cast<int>(batch_starts.size()))
+                break;
 
-            // Allocate batch views
-            const char** input_seqs = (const char**)malloc(sizeof(char*) * cur_bs);
-            int** out_tok_ptrs = (int**)malloc(sizeof(int*) * cur_bs);
+            const int start = batch_starts[batch_id];
+            const int cur_bs = std::min(max_batch_size, total_requests - start);
+
+            const char** input_seqs = req_buf.input_ptrs;
+            int** out_tok_ptrs = req_buf.output_ptrs;
 
             for (int i = 0; i < cur_bs; ++i) {
-                const int req_idx = my_idx[start + i];
+                const int req_idx = start + i;
                 input_seqs[i] = get_str_req_ptr(requests, req_idx);
                 out_tok_ptrs[i] = get_tok_gen_ptr(requests, req_idx);
             }
 
-#pragma omp critical
-            {
-                printf("[DP device %d] 📦 Batch %d/%d (req #%d → #%d)\n", device,
-                       (start / batch_size) + 1, (my_count + batch_size - 1) / batch_size,
-                       my_idx[start] + 1, my_idx[start + cur_bs - 1] + 1);
-                fflush(stdout);
-            }
-
+            const bool enable_progress = is_log_device && ((local_batches % 8) == 0);
             total_tokens += generate(transformer, tokenizer, (Sampler*)sampler_copy, input_seqs,
-                                     out_tok_ptrs, cur_bs, requests->max_seq_len);
-
-            free(input_seqs);
-            free(out_tok_ptrs);
+                                     out_tok_ptrs, cur_bs, requests->max_seq_len, enable_progress);
+            local_batches++;
         }
 
-        free(my_idx);
         free(sampler_copy);
-    } // omp parallel
+    }
 
     return total_tokens;
 }

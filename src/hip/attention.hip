@@ -3,221 +3,315 @@
 #include <hip/hip_runtime.h>
 #include <vector>
 #include <cmath>
+#include <limits>
+#include <stdint.h>
+#include <type_traits>
 
-__global__ void fa_decode_kernel(
+#if defined(__HIP_DEVICE_COMPILE__)
+template<typename T>
+__device__ __forceinline__ T nt_load(const T* ptr) {
+    using base_t = std::remove_cv_t<T>;
+    if constexpr (std::is_same_v<base_t, float>  || std::is_same_v<base_t, double> ||
+                  std::is_same_v<base_t, int32_t> || std::is_same_v<base_t, uint32_t> ||
+                  std::is_same_v<base_t, int64_t> || std::is_same_v<base_t, uint64_t>) {
+        return __builtin_nontemporal_load(ptr);
+    } else {
+        return *ptr;
+    }
+}
+
+template<typename T>
+__device__ __forceinline__ void nt_store(T* ptr, T value) {
+    using base_t = std::remove_cv_t<T>;
+    if constexpr (std::is_same_v<base_t, float>  || std::is_same_v<base_t, double> ||
+                  std::is_same_v<base_t, int32_t> || std::is_same_v<base_t, uint32_t> ||
+                  std::is_same_v<base_t, int64_t> || std::is_same_v<base_t, uint64_t>) {
+        __builtin_nontemporal_store(value, ptr);
+    } else {
+        *ptr = value;
+    }
+}
+#else
+template<typename T>
+__device__ __forceinline__ T nt_load(const T* ptr) { return *ptr; }
+
+template<typename T>
+__device__ __forceinline__ void nt_store(T* ptr, T value) { *ptr = value; }
+#endif
+
+static __device__ __forceinline__ float wave_reduce_sum(float v) {
+    for (int off = warpSize >> 1; off > 0; off >>= 1)
+        v += __shfl_down(v, off);
+    return v;
+}
+
+static __device__ __forceinline__ void wave_sync() {
+#if defined(__CUDA_ARCH__)
+    __syncwarp();
+#elif defined(__HIP_DEVICE_COMPILE__)
+    __syncthreads();
+#endif
+}
+
+// ======================= Ring index helpers =======================
+static __device__ __forceinline__ bool is_pow2_int(int x){ return (x & (x-1)) == 0; }
+template<bool POW2>
+static __device__ __forceinline__ int ring_index(int t, int cap) {
+    if constexpr (POW2) return t & (cap - 1);
+    else                return (t >= cap) ? (t % cap) : t;
+}
+
+// ======================= K/V vectorized access =======================
+static inline __device__ float bf16_to_f32_intr(__hip_bfloat16 x) {
+    return __bfloat162float(x);
+}
+
+static __device__ __forceinline__ __hip_bfloat16 raw_to_bf16(uint16_t bits) {
+    union {
+        uint16_t u;
+        __hip_bfloat16 b;
+    } conv;
+    conv.u = bits;
+    return conv.b;
+}
+
+template<typename KV_T, bool USE_MASK>
+__global__ void fa_decode_full_typed(
     const float* __restrict__ q_batch,      // (B, H*D)
-    const void*  __restrict__ k_cache_base,
-    const void*  __restrict__ v_cache_base,
-    const float* __restrict__ mask,         // (T, T)
-    float* __restrict__ partial_O,          // (B,H,C,D)
-    float* __restrict__ partial_m,          // (B,H,C)
-    float* __restrict__ partial_l,          // (B,H,C)
-    int seq_len, int head_dim, int kv_dim, int kv_mul,
+    const void*  __restrict__ k_cache_base, // byte addressable
+    const void*  __restrict__ v_cache_base, // byte addressable
+    const float* __restrict__ mask,         // (T,T) if USE_MASK
+    const __hip_bfloat16* __restrict__ attn_sinks_half, // (H) or nullptr
+    float* __restrict__ tb_batch,           // (B, H*D)  [OUTPUT]
+    // sizes & layout
+    int B, int seq_len, int head_dim, int kv_dim, int kv_mul,
     int sliding_window, int layer_idx, int n_attn_heads,
-    int chunk_size, int n_chunks,
-    const int* __restrict__ pos_per_token,  // (B)
-    const int* __restrict__ batch_indices,  // (B)
+    // positions, batch mapping, kv layer info
+    const int* __restrict__ d_pos_per_token,  // (B)
+    const int* __restrict__ d_batch_indices,  // (B)
     long long B_stride,
-    int kv_cache_is_fp16,
     const long long* __restrict__ d_layer_kv_off,
-    const int* __restrict__ d_layer_kv_cap,
-    const int* __restrict__ d_layer_is_local
-) {
+    const int*       __restrict__ d_layer_kv_cap,
+    const int*       __restrict__ d_layer_is_local
+){
+    // grid: (h over x, b over y). One Wave64 per block.
     const int h = blockIdx.x;
-    const int c = blockIdx.y;
-    const int b = blockIdx.z;
-    const int tid = threadIdx.x;
-    if (h >= n_attn_heads || c >= n_chunks) return;
+    const int b = blockIdx.y;
+    const int lane = threadIdx.x;           // 0..63 (we launch 64 threads)
 
+    if (h >= n_attn_heads || b >= B) return;
+
+    // Head group index (GQA/MQA)
     const int g = h / kv_mul;
-    const int pos_b = pos_per_token[b];
+
+    // Token position for this request
+    const int pos_b = d_pos_per_token[b];
     const int Lb = pos_b + 1;
 
-    const int t0 = c * chunk_size;
-    int t1 = t0 + chunk_size; if (t1 > Lb) t1 = Lb;
-    if (t0 >= t1) {
-        if (tid == 0) {
-            partial_m[((long long)b*n_attn_heads + h)*n_chunks + c] = -3.402823466e+38f;
-            partial_l[((long long)b*n_attn_heads + h)*n_chunks + c] = 0.0f;
-        }
-        return;
-    }
+    // ---- pointers for Q and output ----
+    const float* __restrict__ q_b    = q_batch + (long long)b * (n_attn_heads * head_dim);
+    const float* __restrict__ q_head = q_b + (long long)h * head_dim;
+    float* __restrict__ o_out        = tb_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
 
-    // Pointers
-    const float* q_b = q_batch + (long long)b * (n_attn_heads * head_dim);
-    const float* q_head = q_b + (long long)h * head_dim;
-    float* O_c = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + c ) * (long long)head_dim;
-
-    // ---- On-chip buffers: q_sh and O_sh ----
+    // ---- shared memory for q and O ----
     extern __shared__ float smem[];
-    float* q_sh = smem;                    // [head_dim]
-    float* O_sh = q_sh + head_dim;         // [head_dim]
+    float* __restrict__ q_sh = smem;                   // [head_dim]
+    float* __restrict__ O_sh = q_sh + head_dim;        // [head_dim]
 
+    // Scale Q by 1/sqrt(d)
     const float inv_sqrt_d = rsqrtf((float)head_dim);
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        q_sh[i] = q_head[i] * inv_sqrt_d;
-        O_sh[i] = 0.0f;                    // keep O on-chip across the whole chunk
+    for (int j = lane; j < head_dim; j += warpSize) {
+        q_sh[j] = q_head[j] * inv_sqrt_d;
+        O_sh[j] = 0.0f;
     }
-    __syncthreads();
+    wave_sync();
 
-    __shared__ float m_shared, l_shared, scale_old_shared, scale_new_shared, s_shared;
-    __shared__ int masked_step;
-    if (tid == 0) { m_shared = -3.402823466e+38f; l_shared = 0.0f; }
-    __syncthreads();
+    // ---- shared scalars for online softmax ----
+    __shared__ float m_shared, l_shared, scale_old, scale_new, s_curr;
+    if (lane == 0) { m_shared = -std::numeric_limits<float>::infinity(); l_shared = 0.0f; }
+    wave_sync();
 
-    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
-
-    // Ring indexing
+    // ---- KV layer addressing ----
     const long long kv_base = d_layer_kv_off[layer_idx];
     const int       cap     = d_layer_kv_cap[layer_idx];
     const int       local   = d_layer_is_local[layer_idx];
+    const bool      cap_pow2= is_pow2_int(cap);
 
-    const int gb = batch_indices[b];
-    // Handle both float32 and bfloat16 KV cache types
-    const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
-    const long long batch_offset = kv_base + (long long)gb * (long long)cap * kv_dim;
-    const void*  k_layer_base = (const void*)((const char*)k_cache_base + batch_offset * element_size);
-    const void*  v_layer_base = (const void*)((const char*)v_cache_base + batch_offset * element_size);
+    const int  gb = d_batch_indices[b];
+    const long long batch_off_elems = kv_base + (long long)gb * (long long)cap * kv_dim;
 
-    const bool local_no_mask = (local != 0) && (mask == nullptr);
-    const int t_window_start = local_no_mask ? max(0, pos_b - sliding_window + 1) : 0;
+    const size_t elem_size = sizeof(KV_T);
+    const char* __restrict__ k_layer_base = (const char*)k_cache_base + batch_off_elems * elem_size;
+    const char* __restrict__ v_layer_base = (const char*)v_cache_base + batch_off_elems * elem_size;
 
-    const int t_start = local_no_mask ? max(t0, t_window_start) : t0;
+    // Local sliding window bounds (for even layers if you use local KV)
+    const bool local_and_nomask = (local != 0) && !USE_MASK && (sliding_window > 0) && ((layer_idx & 1) == 0);
+    const int t_window_start = local_and_nomask ? max(0, pos_b - sliding_window + 1) : 0;
+    const int t_start        = local_and_nomask ? t_window_start : 0;
+    const int t_end          = Lb;
 
-    for (int t = t_start; t < t1; ++t) {
+    // Per-head base offsets and step in BYTES
+    const long long head_off_bytes = ((long long)g * head_dim) * elem_size;
+    const long long step_bytes     = ((long long)kv_dim)      * elem_size;
+
+    // One pass (FlashAttention online softmax).
+    for (int t = t_start; t < t_end; ++t) {
+        int rt;
+        if (local != 0) {
+            rt = cap_pow2 ? (t & (cap - 1)) : (t % cap);
+        } else {
+            rt = t;
+        }
+
+        const char* __restrict__ kp_bytes = k_layer_base + (long long)rt * step_bytes + head_off_bytes;
+        const char* __restrict__ vp_bytes = v_layer_base + (long long)rt * step_bytes + head_off_bytes;
+
+        const KV_T* __restrict__ k_head = reinterpret_cast<const KV_T*>(kp_bytes);
+        const KV_T* __restrict__ v_head = reinterpret_cast<const KV_T*>(vp_bytes);
+
+        // ---- dot(q, k_t) with vectorized streaming loads ----
         float partial = 0.0f;
-        const int ring_t = local ? (t % cap) : t;
 
-        if (kv_cache_is_fp16) {
-            const __hip_bfloat16* k_head_bf16 = (const __hip_bfloat16*)k_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
-            for (int i = tid; i < head_dim; i += blockDim.x) {
-                partial += q_sh[i] * __bfloat162float(k_head_bf16[i]);
+        if constexpr (std::is_same<KV_T,float>::value) {
+            // FP32 path: float4 vectorization
+            const float4* __restrict__ k4 = reinterpret_cast<const float4*>(k_head);
+            int vecN = head_dim >> 2, rem = head_dim & 3;
+
+            for (int i4 = lane; i4 < vecN; i4 += warpSize) {
+                // non-temporal hint (streaming)
+                float4 kv = nt_load(&k4[i4]);
+                int j = (i4 << 2);
+                partial += q_sh[j+0]*kv.x + q_sh[j+1]*kv.y + q_sh[j+2]*kv.z + q_sh[j+3]*kv.w;
+            }
+            for (int j = (vecN<<2) + lane; j < (vecN<<2)+rem; j += warpSize) {
+                float kj = nt_load(reinterpret_cast<const float*>(k_head) + j);
+                partial += q_sh[j] * kj;
             }
         } else {
-            const float* k_head_f32 = (const float*)k_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
-            for (int i = tid; i < head_dim; i += blockDim.x) {
-                partial += q_sh[i] * k_head_f32[i];
+            // BF16 path: load 2×bf16 as u32 (packed)
+            const uint32_t* __restrict__ k2 = reinterpret_cast<const uint32_t*>(k_head);
+            int pairs = head_dim >> 1, rem = head_dim & 1;
+
+            for (int p = lane; p < pairs; p += warpSize) {
+                uint32_t w = nt_load(k2 + p);
+                __hip_bfloat16 lo = raw_to_bf16((uint16_t)(w & 0xFFFF));
+                __hip_bfloat16 hi = raw_to_bf16((uint16_t)(w >> 16));
+                int j = (p << 1);
+                partial += q_sh[j+0]*bf16_to_f32_intr(lo) + q_sh[j+1]*bf16_to_f32_intr(hi);
+            }
+            if (rem) {
+                int j = (pairs<<1) + lane;
+                if (j < head_dim) {
+                    __hip_bfloat16 kb = nt_load(reinterpret_cast<const __hip_bfloat16*>(k_head) + j);
+                    partial += q_sh[j] * bf16_to_f32_intr(kb);
+                }
             }
         }
-        partial = block_reduce_sum(partial);
 
-        if (tid == 0) {
+        partial = wave_reduce_sum(partial);
+        if (lane == 0) {
             float s = partial;
-            if (use_mask) s += mask[(long long)pos_b * seq_len + t];
-            s_shared = s;
-            masked_step = !isfinite(s);
+            if constexpr (USE_MASK) {
+                s += mask[(long long)pos_b * seq_len + t];
+            }
+            s_curr = s;
         }
-        __syncthreads();
-        if (masked_step) continue;
+        wave_sync();
 
-        if (tid == 0) {
-            const float s = s_shared;
+        // Skip update if masked to -inf
+        if (!isfinite(s_curr)) continue;
+
+        if (lane == 0) {
             const float m_prev = m_shared;
             const float l_prev = l_shared;
-            const float m_new  = fmaxf(m_prev, s);
+            const float m_new  = fmaxf(m_prev, s_curr);
             const float alpha  = __expf(m_prev - m_new);
-            const float p      = __expf(s - m_new);
+            const float p      = __expf(s_curr - m_new);
             const float l_new  = alpha * l_prev + p;
 
-            scale_old_shared = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
-            scale_new_shared = (l_new > 0.0f) ? p / l_new : 0.0f;
+            scale_old = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
+            scale_new = (l_new > 0.0f) ? p / l_new : 0.0f;
 
             m_shared = m_new;
             l_shared = l_new;
         }
-        __syncthreads();
+        wave_sync();
 
-        for (int j = tid; j < head_dim; j += blockDim.x) {
-            float o = O_sh[j];
-            float v_val;
-            if (kv_cache_is_fp16) {
-                const __hip_bfloat16* v_head_bf16 = (const __hip_bfloat16*)v_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
-                v_val = __bfloat162float(v_head_bf16[j]);
-            } else {
-                const float* v_head_f32 = (const float*)v_layer_base + (long long)ring_t * kv_dim + (long long)g * head_dim;
-                v_val = v_head_f32[j];
+        // ---- O update with vectorized V loads (streaming) ----
+        if constexpr (std::is_same<KV_T,float>::value) {
+            const float4* __restrict__ v4 = reinterpret_cast<const float4*>(v_head);
+            int vecN = head_dim >> 2, rem = head_dim & 3;
+
+            for (int i4 = lane; i4 < vecN; i4 += warpSize) {
+                float4 vv = nt_load(&v4[i4]);
+                int j = (i4 << 2);
+                float o0 = scale_old * O_sh[j+0] + scale_new * vv.x;
+                float o1 = scale_old * O_sh[j+1] + scale_new * vv.y;
+                float o2 = scale_old * O_sh[j+2] + scale_new * vv.z;
+                float o3 = scale_old * O_sh[j+3] + scale_new * vv.w;
+                O_sh[j+0]=o0; O_sh[j+1]=o1; O_sh[j+2]=o2; O_sh[j+3]=o3;
             }
-            o = scale_old_shared * o + scale_new_shared * v_val;
-            O_sh[j] = o;
+            for (int j = (vecN<<2) + lane; j < (vecN<<2)+rem; j += warpSize) {
+                float vj = nt_load(reinterpret_cast<const float*>(v_head) + j);
+                O_sh[j] = scale_old * O_sh[j] + scale_new * vj;
+            }
+        } else {
+            const uint32_t* __restrict__ v2 = reinterpret_cast<const uint32_t*>(v_head);
+            int pairs = head_dim >> 1, rem = head_dim & 1;
+
+            for (int p = lane; p < pairs; p += warpSize) {
+                uint32_t w = nt_load(v2 + p);
+                __hip_bfloat16 lo = raw_to_bf16((uint16_t)(w & 0xFFFF));
+                __hip_bfloat16 hi = raw_to_bf16((uint16_t)(w >> 16));
+                int j = (p << 1);
+                float v0 = bf16_to_f32_intr(lo);
+                float v1 = bf16_to_f32_intr(hi);
+                O_sh[j+0] = scale_old * O_sh[j+0] + scale_new * v0;
+                O_sh[j+1] = scale_old * O_sh[j+1] + scale_new * v1;
+            }
+            if (rem) {
+                int j = (pairs<<1) + lane;
+                if (j < head_dim) {
+                    __hip_bfloat16 vb = nt_load(reinterpret_cast<const __hip_bfloat16*>(v_head) + j);
+                    float vj = bf16_to_f32_intr(vb);
+                    O_sh[j] = scale_old * O_sh[j] + scale_new * vj;
+                }
+            }
         }
-        __syncthreads();
-    }
-
-    for (int j = tid; j < head_dim; j += blockDim.x)
-        O_c[j] = O_sh[j];
-
-    if (tid == 0) {
-        partial_m[((long long)b*n_attn_heads + h)*n_chunks + c] = m_shared;
-        partial_l[((long long)b*n_attn_heads + h)*n_chunks + c] = l_shared;
-    }
-}
-
-__global__ void fa_reduce_kernel(
-    const float* __restrict__ partial_O,     // (B,H,C,D)
-    const float* __restrict__ partial_m,     // (B,H,C)
-    const float* __restrict__ partial_l,     // (B,H,C)
-    const __hip_bfloat16* __restrict__ attn_sinks_half, // (H)
-    float* __restrict__ tb_batch,            // (B,H*D)
-    int head_dim, int n_chunks, int n_attn_heads
-) {
-    const int h   = blockIdx.x;
-    const int b   = blockIdx.y;
-    const int tid = threadIdx.x;
-    if (h >= n_attn_heads) return;
-
-    float m = partial_m[((long long)b*n_attn_heads + h)*n_chunks + 0];
-    float l = partial_l[((long long)b*n_attn_heads + h)*n_chunks + 0];
-
-    float* O_acc = tb_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
-
-    const float* O0 = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + 0 ) * (long long)head_dim;
-    for (int i = tid; i < head_dim; i += blockDim.x) O_acc[i] = O0[i];
-    __syncthreads();
-
-    for (int c = 1; c < n_chunks; ++c) {
-        const float mc = partial_m[((long long)b*n_attn_heads + h)*n_chunks + c];
-        const float lc = partial_l[((long long)b*n_attn_heads + h)*n_chunks + c];
-        if (!(isfinite(mc) && lc > 0.0f)) continue;
-
-        const float* Oc = partial_O + ( ((long long)b*n_attn_heads + h) * n_chunks + c ) * (long long)head_dim;
-
-        const float m_new = fmaxf(m, mc);
-        const float a = __expf(m  - m_new) * l;
-        const float b2= __expf(mc - m_new) * lc;
-        const float denom = a + b2;
-        const float wA = (denom > 0.0f) ? a  / denom : 0.0f;
-        const float wB = (denom > 0.0f) ? b2 / denom : 0.0f;
-
-        for (int i = tid; i < head_dim; i += blockDim.x) {
-            float o = wA * O_acc[i] + wB * Oc[i];
-            O_acc[i] = o;
-        }
-        __syncthreads();
-        m = m_new; l = denom;
-    }
+        wave_sync();
+    } // end t
 
     if (attn_sinks_half != nullptr) {
         float sink_s = __bfloat162float(attn_sinks_half[h]);
         if (isfinite(sink_s)) {
-            const float m_prev = m; const float l_prev = l;
+            const float m_prev = m_shared; const float l_prev = l_shared;
             const float m_new  = fmaxf(m_prev, sink_s);
             const float a = __expf(m_prev - m_new) * l_prev;
-            const float b3= __expf(sink_s - m_new);
-            const float denom = a + b3;
-            const float renorm = (denom > 0.0f) ? (a / denom) : 1.0f;
-            for (int i = tid; i < head_dim; i += blockDim.x) O_acc[i] *= renorm;
+            const float b = __expf(sink_s - m_new);
+            const float denom = a + b;
+            const float renorm= (denom > 0.0f) ? (a / denom) : 1.0f;
+
+            for (int j = lane; j < head_dim; j += warpSize)
+                O_sh[j] *= renorm;
+            wave_sync();
         }
+    }
+
+    // Vectorize stores
+    int vecN = head_dim >> 2, rem = head_dim & 3;
+    float4* __restrict__ o4 = reinterpret_cast<float4*>(o_out);
+    const float4* __restrict__ s4 = reinterpret_cast<const float4*>(O_sh);
+
+    for (int i4 = lane; i4 < vecN; i4 += warpSize) {
+        float4 v = s4[i4];
+        nt_store(o4 + i4, v);
+    }
+    for (int j = (vecN<<2) + lane; j < (vecN<<2) + rem; j += warpSize) {
+        nt_store(o_out + j, O_sh[j]);
     }
 }
 
 static inline int fa_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
-static inline int choose_chunk_size(int Lmax, int heads, int target_cta_per_head=8) {
-    if (Lmax <= 256) return Lmax;
-    int c = 256;
-    int chunks = (Lmax + c - 1) / c;
-    if (chunks < target_cta_per_head) c = 128;
-    return c;
-}
 
 void fa(
     const float* q_batch,      // (B, H*D)
@@ -233,10 +327,10 @@ void fa(
     const int* d_pos_per_token,      // (B)
     const int* d_batch_indices,      // (B)
     long long B_stride,              // elements per (B*T*kv_dim) per layer
-    int max_pos_in_batch,            // max(pos[b]) in this batch
-    float* workspace_partial_O,      // Pre-allocated workspace
-    float* workspace_partial_m,      // Pre-allocated workspace
-    float* workspace_partial_l,      // Pre-allocated workspace
+    int /*max_pos_in_batch*/,        // unused in new path
+    float* /*workspace_partial_O*/,  // unused
+    float* /*workspace_partial_m*/,  // unused
+    float* /*workspace_partial_l*/,  // unused
     hipStream_t stream,
     const long long* d_layer_kv_off,
     const int* d_layer_kv_cap,
@@ -244,38 +338,45 @@ void fa(
 {
     if (B <= 0 || n_attn_heads <= 0 || head_dim <= 0) return;
 
-    const int Lmax = seq_len;
-    int chunk_size = choose_chunk_size(Lmax, n_attn_heads);
-    int n_chunks   = (Lmax + chunk_size - 1) / chunk_size;
+    const int tpb = 64; // Wave64 on MI250
+    const size_t shmem = 2ull * (size_t)head_dim * sizeof(float);
 
-    int tpb = fa_pow2(head_dim); if (tpb < 64) tpb = 64; else if (tpb > 256) tpb = 256;
-    size_t shmem = 2ull * (size_t)head_dim * sizeof(float);
-    const __hip_bfloat16* attn_sinks_head = (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
+    const __hip_bfloat16* attn_sinks_head =
+        (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
 
-    float* partial_O = workspace_partial_O; // (B,H,C,D)
-    float* partial_m = workspace_partial_m; // (B,H,C)
-    float* partial_l = workspace_partial_l; // (B,H,C)
+    // Decide compile-time mask specialization for this layer (even layers with SWA)
+    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
 
-    // Kernel 1: per-chunk decode with on-chip O
-    {
-        dim3 grid1(n_attn_heads, n_chunks, B), block1(tpb);
-        hipLaunchKernelGGL(fa_decode_kernel, grid1, block1, shmem, stream,
-                           q_batch, k_cache, v_cache, mask,
-                           partial_O, partial_m, partial_l,
-                           seq_len, head_dim, kv_dim, kv_mul,
-                           sliding_window, layer_idx, n_attn_heads,
-                           chunk_size, n_chunks,
-                           d_pos_per_token, d_batch_indices, (long long)B_stride,
-                           kv_cache_is_fp16,
-                           d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
-    }
-    // Kernel 2: reduction across chunks
-    {
-        dim3 grid2(n_attn_heads, B), block2(tpb);
-        hipLaunchKernelGGL(fa_reduce_kernel, grid2, block2, 0, stream,
-                           partial_O, partial_m, partial_l,
-                           attn_sinks_head, tb_batch,
-                           head_dim, n_chunks, n_attn_heads);
+    dim3 grid(n_attn_heads, B), block(tpb);
+
+    if (kv_cache_is_fp16) {
+        if (use_mask) {
+            hipLaunchKernelGGL((fa_decode_full_typed<__hip_bfloat16, true>),  grid, block, shmem, stream,
+                q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
+                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
+                d_pos_per_token, d_batch_indices, (long long)B_stride,
+                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
+        } else {
+            hipLaunchKernelGGL((fa_decode_full_typed<__hip_bfloat16, false>), grid, block, shmem, stream,
+                q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch,
+                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
+                d_pos_per_token, d_batch_indices, (long long)B_stride,
+                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
+        }
+    } else {
+        if (use_mask) {
+            hipLaunchKernelGGL((fa_decode_full_typed<float, true>),  grid, block, shmem, stream,
+                q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
+                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
+                d_pos_per_token, d_batch_indices, (long long)B_stride,
+                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
+        } else {
+            hipLaunchKernelGGL((fa_decode_full_typed<float, false>), grid, block, shmem, stream,
+                q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch,
+                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
+                d_pos_per_token, d_batch_indices, (long long)B_stride,
+                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
+        }
     }
 
     CHECK_HIP(hipGetLastError());

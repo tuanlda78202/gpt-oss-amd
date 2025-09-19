@@ -84,3 +84,4 @@ legacy.hip/
 time_log.py
 tests/data/input.txt
 tests/data/output.txt
+log*.txt
