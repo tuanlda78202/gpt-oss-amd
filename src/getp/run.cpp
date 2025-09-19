@@ -129,11 +129,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
     int available_devices = 0;
     CHECK_HIP(hipGetDeviceCount(&available_devices));
 
-    // const char* dp_env = getenv("GETP_DP");
-    // const char* ep_env = getenv("GETP_EP");
-    // int requested_dp = dp_env ? atoi(dp_env) : 1;
-    // int requested_ep = ep_env ? atoi(ep_env) : 1;
-    const bool replicate_experts = g_duplicate_experts;
+    const bool replicate_experts = transformer_oss->config.n_experts == 32;
     int requested_dp = 8;
     int requested_ep = replicate_experts ? requested_dp : 8;
     if (requested_dp <= 0)
