@@ -433,9 +433,9 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     }
 
     // Batch processing variables
-    int* current_tokens = (int*)malloc(batch_size * sizeof(int)); // Current token for each sequence
-    int* pos = (int*)malloc(batch_size * sizeof(int));            // Position for each sequence
-    bool* finished = (bool*)malloc(batch_size * sizeof(bool)); // Whether each sequence is finished
+    int* current_tokens = (int*)malloc(batch_size * sizeof(int));
+    int* pos = (int*)malloc(batch_size * sizeof(int));
+    bool* finished = (bool*)malloc(batch_size * sizeof(bool));
     int active_sequences = batch_size;
 
     // Initialize batch state
@@ -498,9 +498,6 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     };
 
     while (active_sequences > 0) {
-        int* batch_tokens = (int*)malloc(batch_size * sizeof(int));
-        int* batch_positions = (int*)malloc(batch_size * sizeof(int));
-        int* batch_indices = (int*)malloc(batch_size * sizeof(int));
         int valid_batch_size = 0;
 
         // Continuous batching
