@@ -618,8 +618,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
         // Batched on this replica
 #pragma omp critical
         {
-            printf("🚀 [DP device %d] Ready with batch_size = %d\n", dp_rank,
-                   t_d->config.batch_size);
+            printf("[DP device %d] Ready with batch_size = %d\n", dp_rank, t_d->config.batch_size);
             fflush(stdout);
         }
 

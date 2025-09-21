@@ -414,7 +414,7 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipDeviceSynchronize());
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-    printf("✅ Hybrid precision model loaded: %.1f GB allocated\n",
+    printf("Hybrid precision model loaded: %.1f GB allocated\n",
            used_mem / (1024.0 * 1024.0 * 1024.0));
 }
 
