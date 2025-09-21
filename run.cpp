@@ -1,4 +1,3 @@
-// ! DO NOT MODIFY THIS FILE
 /* Inference for gpt-oss model in pure C */
 
 #include <assert.h>
@@ -19,7 +18,7 @@
 #include <unistd.h>
 #endif
 
-#include "../include/tokenizer.hpp"
+#include "tokenizer.hpp"
 
 // ----------------------------------------------------------------------------
 
@@ -922,6 +921,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
     fflush(stdout);
 
     while (pos < steps) {
+
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
 
@@ -984,6 +984,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 
 void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
           const char* cli_user_prompt, const char* cli_system_prompt, int steps) {
+
     // buffers for reading the system prompt and user prompt from stdin
     // you'll notice they are soomewhat haphazardly and unsafely set atm
     char system_prompt[512];
@@ -1000,6 +1001,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     int prev_token;
     int pos = 0; // position in the sequence
     while (pos < steps) {
+
         // when it is the user's turn to contribute tokens to the dialog...
         if (user_turn) {
             // get the (optional) system prompt at position 0
@@ -1071,8 +1073,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     free(prompt_tokens);
 }
 
-#include "getp/eval.cpp"
-#include "getp/run.cpp"
+#include "getp-csrc/getp_eval.cpp"
+#include "getp-csrc/getp_run.cpp"
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
@@ -1082,9 +1084,7 @@ void error_usage() {
     fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 1024 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -T <float>  temperature in [0,inf], default 0.0\n");
-    fprintf(stderr, "  -t <int>    truncate input to first N lines (getp mode only), default 0 (no "
-                    "truncation)\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] "
                     "default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
@@ -1095,17 +1095,13 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat|getp, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
-    fprintf(stderr, "  -b <int>    batch size for getp mode, default 32\n");
-    fprintf(stderr, "  -f <0|1>    enable forward profiling (0=off, 1=on), default 0\n");
-    fprintf(stderr, "  -v <string> verification/ground truth file for getp mode, default "
-                    "tests/gt/output_20b.txt\n");
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, char** argv) {
     // default parameters
     char* checkpoint_path = NULL; // e.g. out/model.bin
-    const char* tokenizer_path = "build/tokenizer.bin";
+    const char* tokenizer_path = "tokenizer.bin";
     float temperature = 0.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 1024;         // number of steps to run for
@@ -1115,11 +1111,6 @@ int main(int argc, char** argv) {
     char* system_prompt = NULL;      // the (optional) system prompt to use in chat mode
     char* input_filename = NULL;
     char* output_filename = NULL;
-    int batch_size = 32;          // batch size for getp mode, default 2
-    int enable_profiling = 0;     // profiling flag, default off
-    char* verify_filename = NULL; // verification file for getp mode
-    int truncate_lines = 0;       // truncate input to N lines, 0 = no truncation
-    int use_kv16 = 0;             // use 16-bit KV cache (bfloat16), default: off
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1128,15 +1119,8 @@ int main(int argc, char** argv) {
     } else {
         error_usage();
     }
-    for (int i = 2; i < argc;) {
-        // Special case for --kv16 flag (no argument needed)
-        if (strcmp(argv[i], "--kv16") == 0) {
-            use_kv16 = 1;
-            i += 1; // Only skip one argument (the flag itself)
-            continue;
-        }
-
-        // do some basic validation for regular flags
+    for (int i = 2; i < argc; i += 2) {
+        // do some basic validation
         if (i + 1 >= argc) {
             error_usage();
         } // must have arg after flag
@@ -1147,10 +1131,8 @@ int main(int argc, char** argv) {
             error_usage();
         } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'T') {
+        if (argv[i][1] == 't') {
             temperature = atof(argv[i + 1]);
-        } else if (argv[i][1] == 't') {
-            truncate_lines = atoi(argv[i + 1]);
         } else if (argv[i][1] == 'p') {
             topp = atof(argv[i + 1]);
         } else if (argv[i][1] == 's') {
@@ -1168,18 +1150,9 @@ int main(int argc, char** argv) {
             system_prompt = argv[i + 1];
         } else if (argv[i][1] == 'o') {
             output_filename = argv[i + 1];
-        } else if (argv[i][1] == 'b') {
-            batch_size = atoi(argv[i + 1]);
-        } else if (argv[i][1] == 'f') {
-            enable_profiling = atoi(argv[i + 1]);
-        } else if (argv[i][1] == 'v') {
-            verify_filename = argv[i + 1];
         } else {
             error_usage();
         }
-
-        // Move to next flag (skip flag + its argument)
-        i += 2;
     }
 
     // parameter validation/overrides
@@ -1191,14 +1164,6 @@ int main(int argc, char** argv) {
         topp = 0.9;
     if (steps < 0)
         steps = 0;
-
-    // Set profiling state
-    set_profiling_enabled(enable_profiling != 0);
-    if (enable_profiling) {
-        printf("\033[1;33m📊 PROFILING ENABLED\033[0m\n");
-    } else {
-        printf("\033[1;33m📊 PROFILING DISABLED\033[0m\n");
-    }
 
     // build the Transformer via the model .bin file
     Transformer transformer;
@@ -1220,8 +1185,7 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
-        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps, batch_size,
-             verify_filename, truncate_lines, use_kv16);
+        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

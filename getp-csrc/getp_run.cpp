@@ -1,9 +1,9 @@
 #define GETP_SKIP_TYPEDEFS
-#include "../../include/tokenizer.hpp"
 #include "../forward.cpp"
 #include "../model.cpp"
 #include "../sampler.cpp"
-#include "eval.cpp"
+#include "../tokenizer.hpp"
+#include "getp_eval.cpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -122,8 +122,12 @@ static int g_ep_size = 1;
 static int g_active_devices = 0;
 bool g_duplicate_experts = false;
 
-void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
+void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
+
+    int batch_size = (transformer_oss->config.n_experts == 32) ? 890 : 256;
+    int use_kv16 = 1;
+
     transformer_oss->config.batch_size = batch_size;
     transformer_oss->config.seq_len = 1024;
 
@@ -445,16 +449,16 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         finished[b] = false;
     }
 
-    if (show_progress) {
-        for (int b = 0; b < batch_size; b++) {
-            printf("#%d: ", b + 1);
-            const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
-            safe_printf(first_piece);
-            printf(" | ");
-        }
-        printf("\n");
-        fflush(stdout);
-    }
+    // if (show_progress) {
+    //     for (int b = 0; b < batch_size; b++) {
+    //         printf("#%d: ", b + 1);
+    //         const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
+    //         safe_printf(first_piece);
+    //         printf(" | ");
+    //     }
+    //     printf("\n");
+    //     fflush(stdout);
+    // }
 
     // Main generation loop
     int* tokens_generated = (int*)calloc(batch_size, sizeof(int));
@@ -468,9 +472,9 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     const int progress_stride = 5;
     int iteration = 0;
 
-    if (show_progress) {
-        progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
-    }
+    // if (show_progress) {
+    //     progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
+    // }
 
     auto commit_generation = [&](int b_idx, int next_token, bool counted) {
         if (counted && output_tokens_batch[b_idx]) {
@@ -552,10 +556,10 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         }
 
         iteration++;
-        if (show_progress && ((iteration % progress_stride == 0) || active_sequences == 0)) {
-            clear_lines(batch_size);
-            progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
-        }
+        // if (show_progress && ((iteration % progress_stride == 0) || active_sequences == 0)) {
+        //     clear_lines(batch_size);
+        //     progress_bar(batch_size, tokens_generated, max_generation_tokens, finished);
+        // }
     }
 
     for (int b = 0; b < batch_size; b++) {

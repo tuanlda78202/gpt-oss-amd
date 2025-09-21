@@ -1,4 +1,4 @@
-#include "../include/sampler.hpp"
+#include "include/sampler.hpp"
 #include "hip/sampling.hip"
 #include <cmath>
 #include <cstdio>

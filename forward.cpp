@@ -1,4 +1,3 @@
-#include "../include/model.hpp"
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
 #include "hip/embed.hip"
@@ -11,6 +10,7 @@
 #include "hip/split_qkv.hip"
 #include "hip/topk.hip"
 #include "hip/vecadd.hip"
+#include "include/model.hpp"
 #include "profiler.cpp"
 #include <algorithm>
 #include <cassert>

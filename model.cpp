@@ -1,4 +1,4 @@
-#include "../include/model.hpp"
+#include "include/model.hpp"
 #include <algorithm>
 #include <vector>
 
