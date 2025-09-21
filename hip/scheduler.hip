@@ -40,7 +40,6 @@ __global__ void exclusive_scan_expert_offsets(
     }
 }
 
-// ! pack (token_id, weight) contiguously per expert
 __global__ void compact_by_expert_kernel(const int* __restrict__ expert_ids,
                                          const int* __restrict__ tokens,
                                          const float* __restrict__ weights,
@@ -57,7 +56,6 @@ __global__ void compact_by_expert_kernel(const int* __restrict__ expert_ids,
     weights_flat[dst] = weights[i];
 }
 
-// ! form x_by_expert (all tokens for expert e are a contiguous submatrix)
 __global__ void gather_rows_vec4_kernel(const float* __restrict__ X,
                                         const int*  __restrict__ idx,
                                         float* __restrict__ Y,

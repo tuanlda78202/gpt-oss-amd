@@ -1,7 +1,6 @@
 #include "BLAS.hip"
 #include <hip/hip_runtime.h>
 
-// GPU Argmax kernel
 __global__ void argmax_kernel(float* logits, int vocab_size, int* result) {
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
@@ -52,7 +51,7 @@ __device__ float gpu_random_f32(unsigned long long* state) {
 __global__ void multinomial_sample_kernel(float* probabilities, int vocab_size,
                                         unsigned long long seed, int* result) {
     int tid = threadIdx.x;
-    if (tid != 0) return;  // Only thread 0 does sampling
+    if (tid != 0) return;
 
     unsigned long long rng_state = seed + blockIdx.x;
     float coin = gpu_random_f32(&rng_state);
@@ -91,10 +90,8 @@ void sample_multinomial(float* logits, int vocab_size, float temperature,
                           logits, vocab_size, temperature);
     }
 
-    // Apply softmax
     softmax(logits, vocab_size);
 
-    // Sample
     dim3 block(256);
     dim3 grid(1);
     hipLaunchKernelGGL(multinomial_sample_kernel, grid, block, 0, 0,

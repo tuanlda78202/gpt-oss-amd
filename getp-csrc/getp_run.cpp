@@ -639,7 +639,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
                 out_tok_ptrs[i] = get_tok_gen_ptr(requests, req_idx);
             }
 
-            const bool enable_progress = is_log_device && ((local_batches % 8) == 0);
+            const bool enable_progress = true;
 
             total_tokens += generate(transformer, tokenizer, (Sampler*)sampler_copy, input_seqs,
                                      out_tok_ptrs, cur_bs, requests->max_seq_len, enable_progress);

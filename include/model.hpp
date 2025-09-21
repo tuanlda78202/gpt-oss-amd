@@ -207,15 +207,15 @@ typedef struct {
     float* data;                           // memory mapped data pointer
     ssize_t file_size;                     // size of the checkpoint file in bytes
 
-    // Expert-parallel metadata
-    int device_id;        // HIP device hosting this shard
-    int ep_size;          // number of shards in the expert-parallel group
-    int ep_rank;          // shard rank within the group
-    int ep_local_experts; // number of experts owned by this shard
-    int ep_expert_offset; // global expert offset for this shard
-    int dp_rank;          // data-parallel replica rank owning this shard
+    // EP
+    int device_id;
+    int ep_size;
+    int ep_rank;
+    int ep_local_experts;
+    int ep_expert_offset;
+    int dp_rank;
 
-    int* ep_work_queue; // temporary work queue buffer (device memory)
+    int* ep_work_queue;
     int ep_work_queue_capacity;
 } OssTransformerHybrid;
 
@@ -232,17 +232,17 @@ typedef struct {
 } OssExpertWorkspace;
 
 typedef struct {
-    OssTransformerHybrid* model; // shard-local transformer instance
-    int device_id;               // HIP device for this shard
+    OssTransformerHybrid* model;
+    int device_id;
     OssExpertWorkspace workspace;
-    void* mutex_handle; // opaque pointer to std::mutex
+    void* mutex_handle;
 } OssExpertShard;
 
 typedef struct {
-    OssExpertShard** shards; // array of shard descriptors (shared across groups)
-    int dp_rank;             // owning data-parallel replica rank
-    int ep_size;             // number of shards in this group
-    int primary_shard_index; // index within shards corresponding to primary device (-1 if none)
+    OssExpertShard** shards;
+    int dp_rank;
+    int ep_size;
+    int primary_shard_index;
 } OssExpertParallelGroup;
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,

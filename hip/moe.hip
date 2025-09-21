@@ -5,7 +5,6 @@
 
 static inline __host__ __device__ int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 
-// MLP1 kernel: [Ne, H] x [H, 2I] -> fused SwiGLU [Ne, I]
 template <int MT_M, int MT_N, int BK, int WR, int WC>
 __launch_bounds__(64 * WR * WC, 2)
  __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, int work_start,
@@ -273,7 +272,6 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
                        expert_bias_stride, alpha, swiglu_limit);
 }
 
-// MLP2 kernel: [Ne, I] x [I, H] -> scatter to e_agg
 template <int MT_M, int MT_N, int BK, int WR, int WC>
 __launch_bounds__(64 * WR * WC, 2)
 __global__ void moe_mlp2_scatter_mfma_kernel(

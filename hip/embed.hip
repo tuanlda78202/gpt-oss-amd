@@ -9,7 +9,7 @@ void embed_kernel_vec(const __hip_bfloat16* __restrict__ emb_table,
                                         float* __restrict__ x_batch,
                                         int batch_size, int hidden_dim)
 {
-    const int b = blockIdx.y;  // batch index
+    const int b = blockIdx.y;
     const int t0 = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
 
     if (b >= batch_size || t0 >= hidden_dim) return;

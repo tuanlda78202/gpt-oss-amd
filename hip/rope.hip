@@ -9,7 +9,7 @@ void cosin_kernel(int i, int head_dim,
 {
     const float d_half = (float)(head_dim >> 1);
     const float two_over_hd = 2.0f / (float)head_dim;
-    const float inv_freq_base = -two_over_hd * (float)i; // exponent for base^(...)
+    const float inv_freq_base = -two_over_hd * (float)i;
 
     float inv_freq = powf(base, inv_freq_base);
     float concentration = 1.0f;
@@ -52,18 +52,16 @@ __global__ void rope_qk_kernel(
     const int* __restrict__ d_layer_is_local)
 {
     const int half = head_dim >> 1;
-    const int t    = blockIdx.y;  // token
+    const int t    = blockIdx.y;
     const int i0   = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= B || i0 >= half) return;
 
     const int pos  = pos_per_token[t];
     const int slot = batch_indices[t];
 
-    // compute c,s ONCE
     float c, s;
     cosin_kernel(i0, head_dim, base, scaling_factor, initial_ctx_len, ntk_beta, ntk_alpha, (float)pos, c, s);
 
-    // rotate all Q heads
     float* qrow = q_batch + (long long)t * (long long)(n_q_heads*head_dim);
     #pragma unroll 1
     for (int h = 0; h < n_q_heads; ++h) {
@@ -74,7 +72,6 @@ __global__ void rope_qk_kernel(
         qh[half + i0] = fmaf( x1, s, x2 * c);
     }
 
-    // rotate all K heads at ring position
     const long long kv_base = d_layer_kv_off[layer];
     const int       cap     = d_layer_kv_cap[layer];
     const int       local   = d_layer_is_local[layer];
