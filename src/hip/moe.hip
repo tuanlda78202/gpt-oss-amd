@@ -14,9 +14,12 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
                                             int I, long long expert_weight_stride,
                                             long long expert_bias_stride, float alpha,
                                             float swiglu_limit) {
-    constexpr int MT_M = 256; // rows (M = 2*I)
-    constexpr int MT_N = 64;  // cols (N = Ne)
-    constexpr int BK = 16;    // K-slice
+    constexpr int MT_M = 256; // CTA tile height (M)
+    constexpr int MT_N = 64;  // CTA tile width  (N)
+    constexpr int BK = 64;    // K-slice (multiple of 16)
+    constexpr int PAD = 4;    // Padding for LDS to reduce bank conflicts
+    constexpr int LDS_STRIDE_B = BK + PAD;
+
     constexpr int WR = 16;    // waves along M
     constexpr int WC = 1;     // waves along N
     constexpr int WAVES = WR * WC;
@@ -64,10 +67,7 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
 
     // Shared memory tiles (double-buffered)
     __shared__ union {
-        struct {
-            __align__(16) __hip_bfloat16 sA[2][MT_M * BK];
-            __align__(16) short sB_T[2][MT_N * BK]; // N-major in LDS
-        } tiles;
+        short sB_T[2][MT_N * LDS_STRIDE_B]; // N-major in LDS with padding
     } smem;
 
     // Initialize accumulators with bias
@@ -81,44 +81,31 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
     }
     f4 c0 = bias4, c1 = bias4, c2 = bias4, c3 = bias4;
 
-    const int num_k_tiles = (K + BK - 1) / BK;
+    const int num_k_tiles = CEIL_DIV(K, BK);
 
     auto load_tile_g2s = [&](int n0_tile, int k_start, int buf) {
-        // Load A (MT_M x BK) vectorized as i16x4
-        const int total_vecsA = (MT_M * BK) / 4;
-        for (int v = tid; v < total_vecsA; v += TPB) {
-            int m_loc = v / (BK / 4);
-            int k_loc_base = (v % (BK / 4)) * 4;
-
-            __hip_bfloat16* sA_base = &smem.tiles.sA[buf][m_loc * BK + k_loc_base];
-
-            if (m0_cta + m_loc < M && k_start + k_loc_base < K) {
-                const i16x4* gA = reinterpret_cast<const i16x4*>(A + (size_t)(m0_cta + m_loc) * K +
-                                                                 k_start + k_loc_base);
-                *reinterpret_cast<i16x4*>(sA_base) = *gA; // 8B load + 8B LDS store
-            } else {
-                *reinterpret_cast<i16x4*>(sA_base) = i16x4{0, 0, 0, 0};
-            }
-        }
         // Load B (BK x MT_N), from global B[N,K] f32 => bf16 and transpose into LDS
         const int total_vecsB = (BK * MT_N) / 4;
         for (int vec = tid; vec < total_vecsB; vec += TPB) {
             int n_loc = vec / (BK / 4);
             int k_loc4 = (vec % (BK / 4)) * 4;
             const int n_gl = n0_tile + n_loc;
-            i16x4 b = {0, 0, 0, 0};
+            i16x4 bvals = {0, 0, 0, 0};
             if (n_gl < N && k_start + k_loc4 < K) {
                 const float* gB = B_batch + (size_t)n_gl * K + k_start + k_loc4;
-                b = load_and_convert_f32_to_bf16x4(gB);
+                bvals = load_and_convert_f32_to_bf16x4(gB);
             }
-            i16x4* sBv = reinterpret_cast<i16x4*>(&smem.tiles.sB_T[buf][n_loc * BK + k_loc4]);
-            *sBv = b;
+
+            // Contiguous 8B write in LDS
+            i16x4* sBv =
+                reinterpret_cast<i16x4*>(&smem.sB_T[buf][n_loc * LDS_STRIDE_B + k_loc4]);
+            *sBv = bvals;
         }
     };
 
     // Prefetch first tile
     // Loop across N tiles to honor grid_cap
-    const int total_tiles_n = (N + MT_N - 1) / MT_N;
+    const int total_tiles_n = CEIL_DIV(N, MT_N);
     for (int tile_x = blockIdx.x; tile_x < total_tiles_n; tile_x += gridDim.x) {
         const int n0_tile = tile_x * MT_N;
 
@@ -137,14 +124,28 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
                 load_tile_g2s(n0_tile, k0 + BK, pong);
             }
 
-            const __hip_bfloat16* sA_ping = &smem.tiles.sA[ping][0];
-            const short* sB_ping = &smem.tiles.sB_T[ping][0];
+            const short* sB_ping = &smem.sB_T[ping][0];
 
             // Compute on current tile
 #pragma unroll
             for (int kk = 0; kk < BK; kk += 16) {
-                const __hip_bfloat16* a_sptr = sA_ping + (m0_wave + lane_x) * BK + (kk + lane_y * 4);
-                i16x4 avec = *reinterpret_cast<const i16x4*>(a_sptr);
+                int m_gl = m0_cta + m0_wave + lane_x;
+                i16x4 avec = {0, 0, 0, 0};
+                if (m_gl < M) {
+                    int k_gl_base = k0 + kk + lane_y * 4;
+                    const __hip_bfloat16* gA_ptr = A + (size_t)m_gl * K + k_gl_base;
+                    if (k_gl_base + 3 < K) {
+                        avec = *reinterpret_cast<const i16x4*>(gA_ptr);
+                    } else {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            int k_gl = k_gl_base + i;
+                            if (k_gl < K) {
+                                avec[i] = bf16_bits(gA_ptr[i]);
+                            }
+                        }
+                    }
+                }
 
                 const int k_row_base = kk + lane_y * 4;
 
@@ -153,10 +154,18 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
                 const int n_col2 = n0_wave + 2 * 16 + lane_x;
                 const int n_col3 = n0_wave + 3 * 16 + lane_x;
 
-                i16x4 b0 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col0 * BK + k_row_base]);
-                i16x4 b1 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col1 * BK + k_row_base]);
-                i16x4 b2 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col2 * BK + k_row_base]);
-                i16x4 b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * BK + k_row_base]);
+                i16x4 b0 = {0, 0, 0, 0};
+                i16x4 b1 = {0, 0, 0, 0};
+                i16x4 b2 = {0, 0, 0, 0};
+                i16x4 b3 = {0, 0, 0, 0};
+                if (n_col0 < MT_N)
+                    b0 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col0 * LDS_STRIDE_B + k_row_base]);
+                if (n_col1 < MT_N)
+                    b1 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col1 * LDS_STRIDE_B + k_row_base]);
+                if (n_col2 < MT_N)
+                    b2 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col2 * LDS_STRIDE_B + k_row_base]);
+                if (n_col3 < MT_N)
+                    b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
                 c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
                 c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
@@ -180,25 +189,45 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
             return g * sig * (u + 1.0f);
         };
 
-#pragma unroll
-        for (int i = 0; i < 4; i += 2) {
-            const int m_gate = m_out_base + i;
-            const int m_up = m_gate + 1;
-            if (m_gate >= M || m_up >= M)
-                continue;
+        if (m_out_base + 3 < M) {
+            const int i_idx0 = (m_out_base >> 1); // even, 8B aligned
+            const int i_idx1 = i_idx0 + 1;        // consecutive
 
-            const int i_idx = m_gate >> 1; // [0..I)
-            if (i_idx >= I)
-                continue;
+            f2 v0 = {swiglu(c0[0], c0[1]), swiglu(c0[2], c0[3])};
+            f2 v1 = {swiglu(c1[0], c1[1]), swiglu(c1[2], c1[3])};
+            f2 v2 = {swiglu(c2[0], c2[1]), swiglu(c2[2], c2[3])};
+            f2 v3 = {swiglu(c3[0], c3[1]), swiglu(c3[2], c3[3])};
 
             if (n_out0 < N)
-                O_batch[(size_t)n_out0 * I + i_idx] = swiglu(c0[i], c0[i + 1]);
+                *reinterpret_cast<f2*>(&O_batch[(size_t)n_out0 * I + i_idx0]) = v0;
             if (n_out1 < N)
-                O_batch[(size_t)n_out1 * I + i_idx] = swiglu(c1[i], c1[i + 1]);
+                *reinterpret_cast<f2*>(&O_batch[(size_t)n_out1 * I + i_idx0]) = v1;
             if (n_out2 < N)
-                O_batch[(size_t)n_out2 * I + i_idx] = swiglu(c2[i], c2[i + 1]);
+                *reinterpret_cast<f2*>(&O_batch[(size_t)n_out2 * I + i_idx0]) = v2;
             if (n_out3 < N)
-                O_batch[(size_t)n_out3 * I + i_idx] = swiglu(c3[i], c3[i + 1]);
+                *reinterpret_cast<f2*>(&O_batch[(size_t)n_out3 * I + i_idx0]) = v3;
+        } else {
+            // Tail-safe scalar fallback (matches gemm_qkv style with nt_store)
+#pragma unroll
+            for (int i = 0; i < 4; i += 2) {
+                const int m_gate = m_out_base + i;
+                const int m_up = m_gate + 1;
+                if (m_gate >= M || m_up >= M)
+                    continue;
+
+                const int i_idx = m_gate >> 1;
+                if (i_idx >= I)
+                    continue;
+
+                if (n_out0 < N)
+                    nt_store(&O_batch[(size_t)n_out0 * I + i_idx], swiglu(c0[i], c0[i + 1]));
+                if (n_out1 < N)
+                    nt_store(&O_batch[(size_t)n_out1 * I + i_idx], swiglu(c1[i], c1[i + 1]));
+                if (n_out2 < N)
+                    nt_store(&O_batch[(size_t)n_out2 * I + i_idx], swiglu(c2[i], c2[i + 1]));
+                if (n_out3 < N)
+                    nt_store(&O_batch[(size_t)n_out3 * I + i_idx], swiglu(c3[i], c3[i + 1]));
+            }
         }
         __syncthreads();
     }
@@ -213,7 +242,6 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
     // Match the updated kernel tile sizes (from gemm_o flow)
     constexpr int MT_M = 256;
     constexpr int MT_N = 64;
-    constexpr int BK = 16;
     constexpr int WR = 16;
     constexpr int WC = 1;
     constexpr int WAVES = WR * WC;
@@ -236,9 +264,12 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
     const float* __restrict__ weights_flat, float* __restrict__ e_agg,
     const __hip_bfloat16* __restrict__ weights_base, const __hip_bfloat16* __restrict__ bias_base,
     int I, int H, long long expert_weight_stride, long long expert_bias_stride) {
-    constexpr int MT_M = 256; // rows (M = H)
-    constexpr int MT_N = 64;  // cols (N = Ne)
-    constexpr int BK = 16;    // K-slice
+    constexpr int MT_M = 256; // CTA tile height (M)
+    constexpr int MT_N = 64;  // CTA tile width  (N)
+    constexpr int BK = 64;    // K-slice (multiple of 16)
+    constexpr int PAD = 4;    // Padding for LDS to reduce bank conflicts
+    constexpr int LDS_STRIDE_B = BK + PAD;
+
     constexpr int WR = 16;    // waves along M
     constexpr int WC = 1;     // waves along N
     constexpr int WAVES = WR * WC;
@@ -283,10 +314,7 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
     const int n0_wave = (wave_id / WR) * 64;
 
     __shared__ union {
-        struct {
-            __align__(16) __hip_bfloat16 sA[2][MT_M * BK];
-            __align__(16) short sB_T[2][MT_N * BK]; // N-major in LDS
-        } tiles;
+        short sB_T[2][MT_N * LDS_STRIDE_B]; // N-major in LDS with padding
     } smem;
 
     const int m_bias_base = m0_cta + m0_wave + lane_y * 4;
@@ -298,41 +326,27 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
             bias4[i] = __bfloat162float(bias[m]);
     }
 
-    const int num_k_tiles = (K + BK - 1) / BK;
-    const int total_tiles_n = (N + MT_N - 1) / MT_N;
+    const int num_k_tiles = CEIL_DIV(K, BK);
+    const int total_tiles_n = CEIL_DIV(N, MT_N);
     if (total_tiles_n == 0)
         return;
 
     auto load_tile_g2s = [&](int n0_tile, int k_start, int buf) {
-        // Load A (MT_M x BK) vectorized as i16x4
-        const int total_vecsA = (MT_M * BK) / 4;
-        for (int v = tid; v < total_vecsA; v += TPB) {
-            int m_loc = v / (BK / 4);
-            int k_loc_base = (v % (BK / 4)) * 4;
-
-            __hip_bfloat16* sA_base = &smem.tiles.sA[buf][m_loc * BK + k_loc_base];
-
-            if (m0_cta + m_loc < M && k_start + k_loc_base < K) {
-                const i16x4* gA = reinterpret_cast<const i16x4*>(A + (size_t)(m0_cta + m_loc) * K +
-                                                                 k_start + k_loc_base);
-                *reinterpret_cast<i16x4*>(sA_base) = *gA; // 8B load + 8B LDS store
-            } else {
-                *reinterpret_cast<i16x4*>(sA_base) = i16x4{0, 0, 0, 0};
-            }
-        }
         // Load B (BK x MT_N), from global B[N,K] f32 => bf16 and transpose into LDS
         const int total_vecsB = (BK * MT_N) / 4;
         for (int vec = tid; vec < total_vecsB; vec += TPB) {
             int n_loc = vec / (BK / 4);
             int k_loc4 = (vec % (BK / 4)) * 4;
             const int n_gl = n0_tile + n_loc;
-            i16x4 b = {0, 0, 0, 0};
+            i16x4 bvals = {0, 0, 0, 0};
             if (n_gl < N && k_start + k_loc4 < K) {
                 const float* gB = B_batch + (size_t)n_gl * K + k_start + k_loc4;
-                b = load_and_convert_f32_to_bf16x4(gB);
+                bvals = load_and_convert_f32_to_bf16x4(gB);
             }
-            i16x4* sBv = reinterpret_cast<i16x4*>(&smem.tiles.sB_T[buf][n_loc * BK + k_loc4]);
-            *sBv = b;
+
+            // Contiguous 8B write in LDS
+            i16x4* sBv = reinterpret_cast<i16x4*>(&smem.sB_T[buf][n_loc * LDS_STRIDE_B + k_loc4]);
+            *sBv = bvals;
         }
     };
 
@@ -353,14 +367,27 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
                 load_tile_g2s(n0_tile, k0 + BK, pong);
             }
 
-            const __hip_bfloat16* sA_ping = &smem.tiles.sA[ping][0];
-            const short* sB_ping = &smem.tiles.sB_T[ping][0];
+            const short* sB_ping = &smem.sB_T[ping][0];
 
 #pragma unroll
             for (int kk = 0; kk < BK; kk += 16) {
-                const __hip_bfloat16* a_sptr =
-                    sA_ping + (m0_wave + lane_x) * BK + (kk + lane_y * 4);
-                i16x4 avec = *reinterpret_cast<const i16x4*>(a_sptr);
+                int m_gl = m0_cta + m0_wave + lane_x;
+                i16x4 avec = {0, 0, 0, 0};
+                if (m_gl < M) {
+                    int k_gl_base = k0 + kk + lane_y * 4;
+                    const __hip_bfloat16* gA_ptr = A + (size_t)m_gl * K + k_gl_base;
+                    if (k_gl_base + 3 < K) {
+                        avec = *reinterpret_cast<const i16x4*>(gA_ptr);
+                    } else {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            int k_gl = k_gl_base + i;
+                            if (k_gl < K) {
+                                avec[i] = bf16_bits(gA_ptr[i]);
+                            }
+                        }
+                    }
+                }
 
                 const int k_row_base = kk + lane_y * 4;
 
@@ -369,10 +396,22 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
                 const int n_col2 = n0_wave + 2 * 16 + lane_x;
                 const int n_col3 = n0_wave + 3 * 16 + lane_x;
 
-                i16x4 b0 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col0 * BK + k_row_base]);
-                i16x4 b1 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col1 * BK + k_row_base]);
-                i16x4 b2 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col2 * BK + k_row_base]);
-                i16x4 b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * BK + k_row_base]);
+                i16x4 b0 = {0, 0, 0, 0};
+                i16x4 b1 = {0, 0, 0, 0};
+                i16x4 b2 = {0, 0, 0, 0};
+                i16x4 b3 = {0, 0, 0, 0};
+                if (n_col0 < MT_N)
+                    b0 = *reinterpret_cast<const i16x4*>(
+                        &sB_ping[n_col0 * LDS_STRIDE_B + k_row_base]);
+                if (n_col1 < MT_N)
+                    b1 = *reinterpret_cast<const i16x4*>(
+                        &sB_ping[n_col1 * LDS_STRIDE_B + k_row_base]);
+                if (n_col2 < MT_N)
+                    b2 = *reinterpret_cast<const i16x4*>(
+                        &sB_ping[n_col2 * LDS_STRIDE_B + k_row_base]);
+                if (n_col3 < MT_N)
+                    b3 = *reinterpret_cast<const i16x4*>(
+                        &sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
                 c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
                 c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
@@ -411,25 +450,52 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
             scale3 = scales[n_out3];
         }
 
+        // Fast path: all four rows within bounds → avoid per-element bounds checks
+        if (m_out_base + 3 < M) {
+            if (out0) {
+                f4 v = c0 * scale0;
+                atomicAdd(out0 + m_out_base + 0, v[0]);
+                atomicAdd(out0 + m_out_base + 1, v[1]);
+                atomicAdd(out0 + m_out_base + 2, v[2]);
+                atomicAdd(out0 + m_out_base + 3, v[3]);
+            }
+            if (out1) {
+                f4 v = c1 * scale1;
+                atomicAdd(out1 + m_out_base + 0, v[0]);
+                atomicAdd(out1 + m_out_base + 1, v[1]);
+                atomicAdd(out1 + m_out_base + 2, v[2]);
+                atomicAdd(out1 + m_out_base + 3, v[3]);
+            }
+            if (out2) {
+                f4 v = c2 * scale2;
+                atomicAdd(out2 + m_out_base + 0, v[0]);
+                atomicAdd(out2 + m_out_base + 1, v[1]);
+                atomicAdd(out2 + m_out_base + 2, v[2]);
+                atomicAdd(out2 + m_out_base + 3, v[3]);
+            }
+            if (out3) {
+                f4 v = c3 * scale3;
+                atomicAdd(out3 + m_out_base + 0, v[0]);
+                atomicAdd(out3 + m_out_base + 1, v[1]);
+                atomicAdd(out3 + m_out_base + 2, v[2]);
+                atomicAdd(out3 + m_out_base + 3, v[3]);
+            }
+        } else {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int m_out = m_out_base + i;
-            if (m_out >= M)
-                continue;
+            for (int i = 0; i < 4; ++i) {
+                const int m_out = m_out_base + i;
+                if (m_out >= M)
+                    continue;
 
-            const float v0 = c0[i];
-            const float v1 = c1[i];
-            const float v2 = c2[i];
-            const float v3 = c3[i];
-
-            if (out0)
-                atomicAdd(out0 + m_out, v0 * scale0);
-            if (out1)
-                atomicAdd(out1 + m_out, v1 * scale1);
-            if (out2)
-                atomicAdd(out2 + m_out, v2 * scale2);
-            if (out3)
-                atomicAdd(out3 + m_out, v3 * scale3);
+                if (out0)
+                    atomicAdd(out0 + m_out, c0[i] * scale0);
+                if (out1)
+                    atomicAdd(out1 + m_out, c1[i] * scale1);
+                if (out2)
+                    atomicAdd(out2 + m_out, c2[i] * scale2);
+                if (out3)
+                    atomicAdd(out3 + m_out, c3[i] * scale3);
+            }
         }
         __syncthreads();
     }
@@ -444,7 +510,6 @@ inline void moe_mlp2_scatter(const int* work_queue, int work_start, int work_cou
                              hipStream_t stream) {
     constexpr int MT_M = 256;
     constexpr int MT_N = 64;
-    constexpr int BK = 16;
     constexpr int WR = 16;
     constexpr int WC = 1;
     constexpr int WAVES = WR * WC;
