@@ -2,7 +2,6 @@
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
 #include "hip/embed.hip"
-#include "hip/gemm.hip"
 #include "hip/moe.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
@@ -20,6 +19,11 @@
 #include <cstring>
 #include <omp.h>
 #include <vector>
+
+#include "hip/gemms/gemm_logits.hip"
+#include "hip/gemms/gemm_o.hip"
+#include "hip/gemms/gemm_qkv.hip"
+#include "hip/gemms/gemm_router.hip"
 
 #ifndef ADAPT_MT_M
 #define ADAPT_MT_M 64 // CTA tile on M (rows)
@@ -102,8 +106,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         __hip_bfloat16* b_qkv =
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
-        gemm(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
-             (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+        gemm_qkv(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
+                 (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 
         // ! Split QKV
         split_qkv(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim, p->n_attn_heads,
@@ -135,7 +139,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         __hip_bfloat16* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         __hip_bfloat16* b_o = w->b_o + 1ll * l * hidden_dim;
 
-        gemm(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads, hidden_dim);
+        gemm_o(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads, hidden_dim);
 
         // ! Residual
         vecadd(x, s->tb2, 1.0f, batch_size, hidden_dim);
@@ -147,7 +151,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         __hip_bfloat16* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         __hip_bfloat16* b_router = w->b_router + 1ll * l * n_experts;
 
-        gemm(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim, n_experts);
+        gemm_router(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim, n_experts);
 
         // ! TopK and Softmax
         topk(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts, p->experts_per_token);
@@ -288,8 +292,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         };
 
         // N-dimension for the two MLPs: 2I for MLP1 GEMM, H for MLP2 GEMM
-        const int grid_y_mlp1 = std::max(1, ceil_div_int(2 * intermediate_dim, ADAPT_MT_M));
-        const int grid_y_mlp2 = std::max(1, ceil_div_int(hidden_dim, ADAPT_MT_M));
+        const int grid_y_mlp1 = std::max(1, CEIL_DIV(2 * intermediate_dim, ADAPT_MT_M));
+        const int grid_y_mlp2 = std::max(1, CEIL_DIV(hidden_dim, ADAPT_MT_M));
 
         int rh_heavy_mlp1 = pick_rows_hint(heavy_count, grid_y_mlp1, /*min*/ 2, /*max*/ 8);
         int rh_light_mlp1 = pick_rows_hint(light_count, grid_y_mlp1, /*min*/ 1, /*max*/ 4);
@@ -297,7 +301,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         int rh_light_mlp2 = pick_rows_hint(light_count, grid_y_mlp2, /*min*/ 1, /*max*/ 4);
 
         if (heavy_count > 0) {
-            const int cover_heavy = ceil_div_int(heavy_maxNe, ADAPT_MT_N) * ADAPT_MT_N;
+            const int cover_heavy = CEIL_DIV(heavy_maxNe, ADAPT_MT_N) * ADAPT_MT_N;
             rh_heavy_mlp1 = std::max(rh_heavy_mlp1, cover_heavy);
             rh_heavy_mlp2 = std::max(rh_heavy_mlp2, cover_heavy);
         }
@@ -397,7 +401,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
     rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim);
 
     // ! Linear logits
-    gemm(s->logits, x, w->out, nullptr, batch_size, hidden_dim, p->vocab_size);
+    gemm_logits(s->logits, x, w->out, batch_size, hidden_dim, p->vocab_size);
 
     return s->logits;
 }

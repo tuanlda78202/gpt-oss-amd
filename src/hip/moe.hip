@@ -2,21 +2,25 @@
 #include <cstdint>
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include "BLAS.hip"
 
-static inline __host__ __device__ int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 
-// MLP1 kernel: [Ne, H] x [H, 2I] -> fused SwiGLU [Ne, I]
-template <int MT_M, int MT_N, int BK, int WR, int WC>
-__launch_bounds__(64 * WR * WC, 2)
- __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, int work_start,
-                                     int work_count, const float* __restrict__ x_by_expert,
-                                     float* __restrict__ gate_by_expert,
-                                     const __hip_bfloat16* __restrict__ weights_base,
-                                     const __hip_bfloat16* __restrict__ bias_base, int H, int I,
-                                     long long expert_weight_stride, long long expert_bias_stride,
-                                     float alpha, float swiglu_limit) {
+// MLP1 kernel (updated): [Ne, H] x [H, 2I] -> fused SwiGLU [Ne, I]
+__global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, int work_start,
+                                            int work_count, const float* __restrict__ x_by_expert,
+                                            float* __restrict__ gate_by_expert,
+                                            const __hip_bfloat16* __restrict__ weights_base,
+                                            const __hip_bfloat16* __restrict__ bias_base, int H,
+                                            int I, long long expert_weight_stride,
+                                            long long expert_bias_stride, float alpha,
+                                            float swiglu_limit) {
+    constexpr int MT_M = 256; // rows (M = 2*I)
+    constexpr int MT_N = 64;  // cols (N = Ne)
+    constexpr int BK = 16;    // K-slice
+    constexpr int WR = 16;    // waves along M
+    constexpr int WC = 1;     // waves along N
     constexpr int WAVES = WR * WC;
-    constexpr int TPB = 64 * WAVES;
+    constexpr int TPB = 64 * WAVES; // 1024
 
     const int work_idx = blockIdx.z;
     if (work_idx >= work_count)
@@ -35,212 +39,167 @@ __launch_bounds__(64 * WR * WC, 2)
         return;
 
     const __hip_bfloat16* __restrict__ A =
-        weights_base + static_cast<long long>(e) * expert_weight_stride;
+        weights_base + static_cast<long long>(e) * expert_weight_stride; // [M,K] bf16
     const __hip_bfloat16* __restrict__ bias =
-        bias_base ? (bias_base + static_cast<long long>(e) * expert_bias_stride) : nullptr;
-    const float* __restrict__ B_batch = x_by_expert + static_cast<long long>(off) * H;
-    float* __restrict__ O_batch = gate_by_expert + static_cast<long long>(off) * I;
+        bias_base ? (bias_base + static_cast<long long>(e) * expert_bias_stride) : nullptr; // [M]
+    const float* __restrict__ B_batch = x_by_expert + static_cast<long long>(off) * H;      // [N,K]
+    float* __restrict__ O_batch = gate_by_expert + static_cast<long long>(off) * I;         // [N,I]
 
-    const int m0 = blockIdx.y * MT_M;
-    if (m0 >= M)
+    // CTA tile origins
+    const int m0_cta = blockIdx.y * MT_M;
+    const int n0_cta = blockIdx.x * MT_N;
+    if (m0_cta >= M || n0_cta >= N)
         return;
 
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-    const int wave = tid >> 6;
-    const int lane = tid & 63;
+    // Thread/wave ids
+    const int tid = threadIdx.x;
+    const int wave_id = tid / 64;
+    const int lane_id = tid % 64;
+    const int lane_x = lane_id % 16;
+    const int lane_y = lane_id / 16;
 
-    const int subtile_r = wave / WC;
-    const int subtile_c = wave % WC;
+    // Wave tile origins
+    const int m0_wave = (wave_id % WR) * 16;
+    const int n0_wave = (wave_id / WR) * 64;
 
-    const int m_base = m0 + subtile_r * 16;
+    // Shared memory tiles (double-buffered)
+    __shared__ union {
+        struct {
+            __align__(16) __hip_bfloat16 sA[2][MT_M * BK];
+            __align__(16) short sB_T[2][MT_N * BK]; // N-major in LDS
+        } tiles;
+    } smem;
 
-    extern __shared__ char smem_moe[];
-    __hip_bfloat16* sA0 = reinterpret_cast<__hip_bfloat16*>(smem_moe);
-    __hip_bfloat16* sA1 = sA0 + MT_M * (BK + 1);
-    float* sB0 = reinterpret_cast<float*>(sA1 + MT_M * (BK + 1));
-    float* sB1 = sB0 + BK * (MT_N + 1);
-
-    using f4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
-
-    const int lane_x = lane & 15;
-    const int lane_y = lane >> 4;
-
-    auto ldA = [&](int m, int k) -> __hip_bfloat16 {
-        return (m >= 0 && m < M && k >= 0 && k < K)
-                   ? A[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)]
-                   : __float2bfloat16(0.0f);
-    };
-    auto ldB = [&](int n, int k) -> float {
-        return (n >= 0 && n < N && k >= 0 && k < K)
-                   ? B_batch[static_cast<size_t>(n) * static_cast<size_t>(K) +
-                             static_cast<size_t>(k)]
-                   : 0.0f;
-    };
-
-    const int elemsA = MT_M * BK;
-    const int elemsB = BK * MT_N;
-    const int total_tiles_n = (N + MT_N - 1) / MT_N;
-    if (total_tiles_n == 0)
-        return;
+    // Initialize accumulators with bias
+    const int m_bias_base = m0_cta + m0_wave + lane_y * 4;
+    f4 bias4 = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m = m_bias_base + i;
+        if (bias && m < M)
+            bias4[i] = __bfloat162float(bias[m]);
+    }
+    f4 c0 = bias4, c1 = bias4, c2 = bias4, c3 = bias4;
 
     const int num_k_tiles = (K + BK - 1) / BK;
-    const bool full_m_tile = (m0 + MT_M) <= M;
 
+    auto load_tile_g2s = [&](int n0_tile, int k_start, int buf) {
+        // Load A (MT_M x BK) vectorized as i16x4
+        const int total_vecsA = (MT_M * BK) / 4;
+        for (int v = tid; v < total_vecsA; v += TPB) {
+            int m_loc = v / (BK / 4);
+            int k_loc_base = (v % (BK / 4)) * 4;
+
+            __hip_bfloat16* sA_base = &smem.tiles.sA[buf][m_loc * BK + k_loc_base];
+
+            if (m0_cta + m_loc < M && k_start + k_loc_base < K) {
+                const i16x4* gA = reinterpret_cast<const i16x4*>(A + (size_t)(m0_cta + m_loc) * K +
+                                                                 k_start + k_loc_base);
+                *reinterpret_cast<i16x4*>(sA_base) = *gA; // 8B load + 8B LDS store
+            } else {
+                *reinterpret_cast<i16x4*>(sA_base) = i16x4{0, 0, 0, 0};
+            }
+        }
+        // Load B (BK x MT_N), from global B[N,K] f32 => bf16 and transpose into LDS
+        const int total_vecsB = (BK * MT_N) / 4;
+        for (int vec = tid; vec < total_vecsB; vec += TPB) {
+            int n_loc = vec / (BK / 4);
+            int k_loc4 = (vec % (BK / 4)) * 4;
+            const int n_gl = n0_tile + n_loc;
+            i16x4 b = {0, 0, 0, 0};
+            if (n_gl < N && k_start + k_loc4 < K) {
+                const float* gB = B_batch + (size_t)n_gl * K + k_start + k_loc4;
+                b = load_and_convert_f32_to_bf16x4(gB);
+            }
+            i16x4* sBv = reinterpret_cast<i16x4*>(&smem.tiles.sB_T[buf][n_loc * BK + k_loc4]);
+            *sBv = b;
+        }
+    };
+
+    // Prefetch first tile
+    // Loop across N tiles to honor grid_cap
+    const int total_tiles_n = (N + MT_N - 1) / MT_N;
     for (int tile_x = blockIdx.x; tile_x < total_tiles_n; tile_x += gridDim.x) {
-        const int n0 = tile_x * MT_N;
-        const int n_base = n0 + subtile_c * 16;
-        const bool full_n_tile = (n0 + MT_N) <= N;
+        const int n0_tile = tile_x * MT_N;
 
-        f4 d = {0.f, 0.f, 0.f, 0.f};
+        // Reset accumulators for this N tile
+        f4 c0 = bias4, c1 = bias4, c2 = bias4, c3 = bias4;
 
-        auto copy_tile_A = [&](int k0, __hip_bfloat16* dst) {
-            const bool full_k_tile = (k0 + BK) <= K;
-            const bool vectorizable = full_m_tile && full_k_tile && (K % 8 == 0) &&
-                                      is_aligned_16(A + (size_t)m0 * (size_t)K + (size_t)k0);
-            if constexpr ((BK % 8) == 0) {
-                if (vectorizable) {
-                    const int vec_per_row = BK / 8;
-                    const int total_vec = MT_M * vec_per_row;
-                    for (int idx = tid; idx < total_vec; idx += TPB) {
-                        int mi = idx / vec_per_row;
-                        int vec = idx % vec_per_row;
-                        const __hip_bfloat16* g_row =
-                            A + (size_t)(m0 + mi) * (size_t)K + (size_t)(k0 + vec * 8);
-                        __hip_bfloat16* s_row = dst + mi * (BK + 1) + vec * 8;
-                        uint4 packed = reinterpret_cast<const uint4*>(g_row)[0];
-                        uint16_t* s16 = reinterpret_cast<uint16_t*>(s_row);
-                        s16[0] = static_cast<uint16_t>(packed.x & 0xFFFF);
-                        s16[1] = static_cast<uint16_t>(packed.x >> 16);
-                        s16[2] = static_cast<uint16_t>(packed.y & 0xFFFF);
-                        s16[3] = static_cast<uint16_t>(packed.y >> 16);
-                        s16[4] = static_cast<uint16_t>(packed.z & 0xFFFF);
-                        s16[5] = static_cast<uint16_t>(packed.z >> 16);
-                        s16[6] = static_cast<uint16_t>(packed.w & 0xFFFF);
-                        s16[7] = static_cast<uint16_t>(packed.w >> 16);
-                    }
-                    return;
-                }
-            }
-
-            for (int p = tid; p < elemsA; p += TPB) {
-                const int mi = p / BK;
-                const int kk = p % BK;
-                dst[mi * (BK + 1) + kk] = ldA(m0 + mi, k0 + kk);
-            }
-        };
-
-        auto copy_tile_B = [&](int k0, float* dst) {
-            const bool full_k_tile = (k0 + BK) <= K;
-            const bool vectorizable = full_n_tile && full_k_tile && (K % 4 == 0) &&
-                                      is_aligned_16(B_batch + (size_t)n0 * (size_t)K + (size_t)k0);
-            if constexpr ((BK % 4) == 0) {
-                if (vectorizable) {
-                    const int vec_per_row = BK / 4;
-                    const int total_vec = MT_N * vec_per_row;
-                    for (int idx = tid; idx < total_vec; idx += TPB) {
-                        int nj = idx / vec_per_row;
-                        int vec = idx % vec_per_row;
-                        const float* g_row =
-                            B_batch + (size_t)(n0 + nj) * (size_t)K + (size_t)(k0 + vec * 4);
-                        float4 packed = reinterpret_cast<const float4*>(g_row)[0];
-                        float* s_col = dst + (vec * 4) * (MT_N + 1) + nj;
-                        s_col[0] = packed.x;
-                        s_col[(MT_N + 1)] = packed.y;
-                        s_col[2 * (MT_N + 1)] = packed.z;
-                        s_col[3 * (MT_N + 1)] = packed.w;
-                    }
-                    return;
-                }
-            }
-
-            for (int p = tid; p < elemsB; p += TPB) {
-                const int ki = p % BK;
-                const int nj = p / BK;
-                dst[ki * (MT_N + 1) + nj] = ldB(n0 + nj, k0 + ki);
-            }
-        };
-
-        copy_tile_A(0, sA0);
-        copy_tile_B(0, sB0);
+        load_tile_g2s(n0_tile, 0, 0);
         __syncthreads();
 
-        int ping = 0;
+        for (int kt = 0; kt < num_k_tiles; ++kt) {
+            const int ping = kt & 1;
+            const int pong = ping ^ 1;
+            const int k0 = kt * BK;
 
-        for (int tile = 0; tile < num_k_tiles; ++tile) {
-            __hip_bfloat16* sA = (ping == 0) ? sA0 : sA1;
-            float* sB = (ping == 0) ? sB0 : sB1;
-
-            const int next_k0 = (tile + 1) * BK;
-            if (tile + 1 < num_k_tiles) {
-                __hip_bfloat16* sA_next = (ping == 0) ? sA1 : sA0;
-                float* sB_next = (ping == 0) ? sB1 : sB0;
-
-                copy_tile_A(next_k0, sA_next);
-                copy_tile_B(next_k0, sB_next);
+            if (kt + 1 < num_k_tiles) {
+                load_tile_g2s(n0_tile, k0 + BK, pong);
             }
 
+            const __hip_bfloat16* sA_ping = &smem.tiles.sA[ping][0];
+            const short* sB_ping = &smem.tiles.sB_T[ping][0];
+
+            // Compute on current tile
 #pragma unroll
-            for (int kk4 = 0; kk4 < BK; kk4 += 4) {
-                const int k_cur = kk4 + lane_y;
-                const int a_row = (m_base - m0) + lane_x;
-                const int b_col = (n_base - n0) + lane_x;
+            for (int kk = 0; kk < BK; kk += 16) {
+                const __hip_bfloat16* a_sptr = sA_ping + (m0_wave + lane_x) * BK + (kk + lane_y * 4);
+                i16x4 avec = *reinterpret_cast<const i16x4*>(a_sptr);
 
-                float amk = 0.f;
-                float bkn = 0.f;
-                if (static_cast<unsigned>(a_row) < static_cast<unsigned>(MT_M) &&
-                    static_cast<unsigned>(k_cur) < static_cast<unsigned>(BK)) {
-                    amk = __bfloat162float(sA[a_row * (BK + 1) + k_cur]);
-                }
-                if (static_cast<unsigned>(k_cur) < static_cast<unsigned>(BK) &&
-                    static_cast<unsigned>(b_col) < static_cast<unsigned>(MT_N)) {
-                    bkn = sB[k_cur * (MT_N + 1) + b_col];
-                }
+                const int k_row_base = kk + lane_y * 4;
 
-                d = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, d, 0, 0, 0);
+                const int n_col0 = n0_wave + 0 * 16 + lane_x;
+                const int n_col1 = n0_wave + 1 * 16 + lane_x;
+                const int n_col2 = n0_wave + 2 * 16 + lane_x;
+                const int n_col3 = n0_wave + 3 * 16 + lane_x;
+
+                i16x4 b0 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col0 * BK + k_row_base]);
+                i16x4 b1 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col1 * BK + k_row_base]);
+                i16x4 b2 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col2 * BK + k_row_base]);
+                i16x4 b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * BK + k_row_base]);
+
+                c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
+                c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
+                c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b2, c2, 0, 0, 0);
+                c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b3, c3, 0, 0, 0);
             }
-
             __syncthreads();
-            ping ^= 1;
         }
 
-        const int n_out = n_base + lane_x;
-        if (n_out < N) {
-            float* __restrict__ out_row = O_batch + static_cast<size_t>(n_out) * I;
+        // Epilogue: fused SwiGLU and store [N,I]
+        const int m_out_base = m0_cta + m0_wave + lane_y * 4; // 4 rows per thread
+        const int n_out0 = n0_tile + n0_wave + 0 * 16 + lane_x;
+        const int n_out1 = n0_tile + n0_wave + 1 * 16 + lane_x;
+        const int n_out2 = n0_tile + n0_wave + 2 * 16 + lane_x;
+        const int n_out3 = n0_tile + n0_wave + 3 * 16 + lane_x;
+
+        auto swiglu = [&](float gate_v, float up_v) {
+            float g = fminf(gate_v, swiglu_limit);
+            float u = fminf(fmaxf(up_v, -swiglu_limit), swiglu_limit);
+            float sig = 1.0f / (1.0f + __expf(-alpha * g));
+            return g * sig * (u + 1.0f);
+        };
 
 #pragma unroll
-            for (int pair = 0; pair < 2; ++pair) {
-                const int lane_block = lane >> 4; // 0..3
-                const int row_local = lane_block * 4 + pair * 2;
-                const int gate_row = m_base + row_local;
-                const int up_row = gate_row + 1;
-                if (gate_row >= M)
-                    continue;
+        for (int i = 0; i < 4; i += 2) {
+            const int m_gate = m_out_base + i;
+            const int m_up = m_gate + 1;
+            if (m_gate >= M || m_up >= M)
+                continue;
 
-                const int i_idx = gate_row >> 1;
-                if (i_idx >= I)
-                    continue;
+            const int i_idx = m_gate >> 1; // [0..I)
+            if (i_idx >= I)
+                continue;
 
-                float gate_val = d[pair * 2];
-                float up_val = (up_row < M) ? d[pair * 2 + 1] : 0.0f;
-
-                if (bias) {
-                    gate_val += __bfloat162float(bias[gate_row]);
-                    if (up_row < M) {
-                        up_val += __bfloat162float(bias[up_row]);
-                    }
-                }
-
-                gate_val = fminf(gate_val, swiglu_limit);
-                up_val = fminf(up_val, swiglu_limit);
-                up_val = fmaxf(up_val, -swiglu_limit);
-
-                const float sigmoid = 1.0f / (1.0f + __expf(-alpha * gate_val));
-                float out_val = gate_val * sigmoid * (up_val + 1.0f);
-
-                out_row[i_idx] = out_val;
-            }
+            if (n_out0 < N)
+                O_batch[(size_t)n_out0 * I + i_idx] = swiglu(c0[i], c0[i + 1]);
+            if (n_out1 < N)
+                O_batch[(size_t)n_out1 * I + i_idx] = swiglu(c1[i], c1[i + 1]);
+            if (n_out2 < N)
+                O_batch[(size_t)n_out2 * I + i_idx] = swiglu(c2[i], c2[i + 1]);
+            if (n_out3 < N)
+                O_batch[(size_t)n_out3 * I + i_idx] = swiglu(c3[i], c3[i + 1]);
         }
-
         __syncthreads();
     }
 }
@@ -251,37 +210,37 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
                             int H, int I, long long expert_weight_stride,
                             long long expert_bias_stride, float alpha, float swiglu_limit,
                             int maxNe, int grid_cap, hipStream_t stream) {
-    constexpr int MT_M = 64;
-    constexpr int MT_N = 32;
-    constexpr int BK = 32;
-    constexpr int WR = 4;
-    constexpr int WC = 2;
+    // Match the updated kernel tile sizes (from gemm_o flow)
+    constexpr int MT_M = 256;
+    constexpr int MT_N = 64;
+    constexpr int BK = 16;
+    constexpr int WR = 16;
+    constexpr int WC = 1;
     constexpr int WAVES = WR * WC;
 
-    const int grid_x = max(1, min(grid_cap, ceil_div_int(maxNe, MT_N)));
-    const int grid_y = max(1, ceil_div_int(2 * I, MT_M));
+    const int grid_x = max(1, min(grid_cap, CEIL_DIV(maxNe, MT_N)));
+    const int grid_y = max(1, CEIL_DIV(2 * I, MT_M));
 
-    dim3 block(64 * WAVES, 1, 1);
+    dim3 block(64 * WAVES, 1, 1); // 1024 threads
     dim3 grid(grid_x, grid_y, work_count);
 
-    const size_t shmem_bytes =
-        2 * (MT_M * (BK + 1) * sizeof(__hip_bfloat16)) + 2 * (BK * (MT_N + 1) * sizeof(float));
-
-    hipLaunchKernelGGL((moe_mlp1_swiglu_mfma_kernel<MT_M, MT_N, BK, WR, WC>), grid, block,
-                       shmem_bytes, stream, work_queue, work_start, work_count, x_by_expert,
-                       gate_by_expert, weights_base, bias_base, H, I, expert_weight_stride,
-                       expert_bias_stride, alpha, swiglu_limit);
+    moe_mlp1_swiglu_mfma_kernel<<<grid, block>>>(
+        work_queue, work_start, work_count, x_by_expert, gate_by_expert, weights_base, bias_base, H,
+        I, expert_weight_stride, expert_bias_stride, alpha, swiglu_limit);
 }
 
-// MLP2 kernel: [Ne, I] x [I, H] -> scatter to e_agg
-template <int MT_M, int MT_N, int BK, int WR, int WC>
-__launch_bounds__(64 * WR * WC, 2)
+// MLP2 kernel (updated): [Ne, I] x [I, H] -> scatter to e_agg using bf16 MFMA flow
 __global__ void moe_mlp2_scatter_mfma_kernel(
     const int* __restrict__ work_queue, int work_start, int work_count,
     const float* __restrict__ gate_by_expert, const int* __restrict__ tokens_flat,
     const float* __restrict__ weights_flat, float* __restrict__ e_agg,
     const __hip_bfloat16* __restrict__ weights_base, const __hip_bfloat16* __restrict__ bias_base,
     int I, int H, long long expert_weight_stride, long long expert_bias_stride) {
+    constexpr int MT_M = 256; // rows (M = H)
+    constexpr int MT_N = 64;  // cols (N = Ne)
+    constexpr int BK = 16;    // K-slice
+    constexpr int WR = 16;    // waves along M
+    constexpr int WC = 1;     // waves along N
     constexpr int WAVES = WR * WC;
     constexpr int TPB = 64 * WAVES;
 
@@ -302,197 +261,176 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
         return;
 
     const __hip_bfloat16* __restrict__ A =
-        weights_base + static_cast<long long>(e) * expert_weight_stride;
+        weights_base + static_cast<long long>(e) * expert_weight_stride; // [M,K] bf16
     const __hip_bfloat16* __restrict__ bias =
-        bias_base ? (bias_base + static_cast<long long>(e) * expert_bias_stride) : nullptr;
-    const float* __restrict__ B_batch = gate_by_expert + static_cast<long long>(off) * I;
+        bias_base ? (bias_base + static_cast<long long>(e) * expert_bias_stride) : nullptr; // [M]
+    const float* __restrict__ B_batch = gate_by_expert + static_cast<long long>(off) * I;   // [N,K]
     const int* __restrict__ tokens = tokens_flat + off;
     const float* __restrict__ scales = weights_flat + off;
 
-    const int m0 = blockIdx.y * MT_M;
-    if (m0 >= M)
+    const int m0_cta = blockIdx.y * MT_M;
+    const int n0_cta = blockIdx.x * MT_N;
+    if (m0_cta >= M || n0_cta >= N)
         return;
 
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-    const int wave = tid >> 6;
-    const int lane = tid & 63;
+    const int tid = threadIdx.x;
+    const int wave_id = tid / 64;
+    const int lane_id = tid % 64;
+    const int lane_x = lane_id % 16;
+    const int lane_y = lane_id / 16;
 
-    const int subtile_r = wave / WC;
-    const int subtile_c = wave % WC;
+    const int m0_wave = (wave_id % WR) * 16;
+    const int n0_wave = (wave_id / WR) * 64;
 
-    const int m_base = m0 + subtile_r * 16;
+    __shared__ union {
+        struct {
+            __align__(16) __hip_bfloat16 sA[2][MT_M * BK];
+            __align__(16) short sB_T[2][MT_N * BK]; // N-major in LDS
+        } tiles;
+    } smem;
 
-    extern __shared__ char smem_moe[];
-    __hip_bfloat16* sA0 = reinterpret_cast<__hip_bfloat16*>(smem_moe);
-    __hip_bfloat16* sA1 = sA0 + MT_M * (BK + 1);
-    float* sB0 = reinterpret_cast<float*>(sA1 + MT_M * (BK + 1));
-    float* sB1 = sB0 + BK * (MT_N + 1);
+    const int m_bias_base = m0_cta + m0_wave + lane_y * 4;
+    f4 bias4 = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int m = m_bias_base + i;
+        if (bias && m < M)
+            bias4[i] = __bfloat162float(bias[m]);
+    }
 
-    using f4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
-
-    const int lane_x = lane & 15;
-    const int lane_y = lane >> 4;
-
-    auto ldA = [&](int m, int k) -> __hip_bfloat16 {
-        return (m >= 0 && m < M && k >= 0 && k < K)
-                   ? A[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)]
-                   : __float2bfloat16(0.0f);
-    };
-    auto ldB = [&](int n, int k) -> float {
-        return (n >= 0 && n < N && k >= 0 && k < K)
-                   ? B_batch[static_cast<size_t>(n) * static_cast<size_t>(K) +
-                             static_cast<size_t>(k)]
-                   : 0.0f;
-    };
-
-    const int elemsA = MT_M * BK;
-    const int elemsB = BK * MT_N;
+    const int num_k_tiles = (K + BK - 1) / BK;
     const int total_tiles_n = (N + MT_N - 1) / MT_N;
     if (total_tiles_n == 0)
         return;
 
-    const int num_k_tiles = (K + BK - 1) / BK;
-    const bool full_m_tile = (m0 + MT_M) <= M;
+    auto load_tile_g2s = [&](int n0_tile, int k_start, int buf) {
+        // Load A (MT_M x BK) vectorized as i16x4
+        const int total_vecsA = (MT_M * BK) / 4;
+        for (int v = tid; v < total_vecsA; v += TPB) {
+            int m_loc = v / (BK / 4);
+            int k_loc_base = (v % (BK / 4)) * 4;
+
+            __hip_bfloat16* sA_base = &smem.tiles.sA[buf][m_loc * BK + k_loc_base];
+
+            if (m0_cta + m_loc < M && k_start + k_loc_base < K) {
+                const i16x4* gA = reinterpret_cast<const i16x4*>(A + (size_t)(m0_cta + m_loc) * K +
+                                                                 k_start + k_loc_base);
+                *reinterpret_cast<i16x4*>(sA_base) = *gA; // 8B load + 8B LDS store
+            } else {
+                *reinterpret_cast<i16x4*>(sA_base) = i16x4{0, 0, 0, 0};
+            }
+        }
+        // Load B (BK x MT_N), from global B[N,K] f32 => bf16 and transpose into LDS
+        const int total_vecsB = (BK * MT_N) / 4;
+        for (int vec = tid; vec < total_vecsB; vec += TPB) {
+            int n_loc = vec / (BK / 4);
+            int k_loc4 = (vec % (BK / 4)) * 4;
+            const int n_gl = n0_tile + n_loc;
+            i16x4 b = {0, 0, 0, 0};
+            if (n_gl < N && k_start + k_loc4 < K) {
+                const float* gB = B_batch + (size_t)n_gl * K + k_start + k_loc4;
+                b = load_and_convert_f32_to_bf16x4(gB);
+            }
+            i16x4* sBv = reinterpret_cast<i16x4*>(&smem.tiles.sB_T[buf][n_loc * BK + k_loc4]);
+            *sBv = b;
+        }
+    };
 
     for (int tile_x = blockIdx.x; tile_x < total_tiles_n; tile_x += gridDim.x) {
-        const int n0 = tile_x * MT_N;
-        const int n_base = n0 + subtile_c * 16;
-        const bool full_n_tile = (n0 + MT_N) <= N;
+        const int n0_tile = tile_x * MT_N;
 
-        f4 d = {0.f, 0.f, 0.f, 0.f};
+        f4 c0 = bias4, c1 = bias4, c2 = bias4, c3 = bias4;
 
-        auto copy_tile_A = [&](int k0, __hip_bfloat16* dst) {
-            const bool full_k_tile = (k0 + BK) <= K;
-            const bool vectorizable = full_m_tile && full_k_tile && (K % 8 == 0) &&
-                                      is_aligned_16(A + (size_t)m0 * (size_t)K + (size_t)k0);
-            if constexpr ((BK % 8) == 0) {
-                if (vectorizable) {
-                    const int vec_per_row = BK / 8;
-                    const int total_vec = MT_M * vec_per_row;
-                    for (int idx = tid; idx < total_vec; idx += TPB) {
-                        int mi = idx / vec_per_row;
-                        int vec = idx % vec_per_row;
-                        const __hip_bfloat16* g_row =
-                            A + (size_t)(m0 + mi) * (size_t)K + (size_t)(k0 + vec * 8);
-                        __hip_bfloat16* s_row = dst + mi * (BK + 1) + vec * 8;
-                        uint4 packed = reinterpret_cast<const uint4*>(g_row)[0];
-                        uint16_t* s16 = reinterpret_cast<uint16_t*>(s_row);
-                        s16[0] = static_cast<uint16_t>(packed.x & 0xFFFF);
-                        s16[1] = static_cast<uint16_t>(packed.x >> 16);
-                        s16[2] = static_cast<uint16_t>(packed.y & 0xFFFF);
-                        s16[3] = static_cast<uint16_t>(packed.y >> 16);
-                        s16[4] = static_cast<uint16_t>(packed.z & 0xFFFF);
-                        s16[5] = static_cast<uint16_t>(packed.z >> 16);
-                        s16[6] = static_cast<uint16_t>(packed.w & 0xFFFF);
-                        s16[7] = static_cast<uint16_t>(packed.w >> 16);
-                    }
-                    return;
-                }
-            }
-
-            for (int p = tid; p < elemsA; p += TPB) {
-                const int mi = p / BK;
-                const int kk = p % BK;
-                dst[mi * (BK + 1) + kk] = ldA(m0 + mi, k0 + kk);
-            }
-        };
-
-        auto copy_tile_B = [&](int k0, float* dst) {
-            const bool full_k_tile = (k0 + BK) <= K;
-            const bool vectorizable = full_n_tile && full_k_tile && (K % 4 == 0) &&
-                                      is_aligned_16(B_batch + (size_t)n0 * (size_t)K + (size_t)k0);
-            if constexpr ((BK % 4) == 0) {
-                if (vectorizable) {
-                    const int vec_per_row = BK / 4;
-                    const int total_vec = MT_N * vec_per_row;
-                    for (int idx = tid; idx < total_vec; idx += TPB) {
-                        int nj = idx / vec_per_row;
-                        int vec = idx % vec_per_row;
-                        const float* g_row =
-                            B_batch + (size_t)(n0 + nj) * (size_t)K + (size_t)(k0 + vec * 4);
-                        float4 packed = reinterpret_cast<const float4*>(g_row)[0];
-                        float* s_col = dst + (vec * 4) * (MT_N + 1) + nj;
-                        s_col[0] = packed.x;
-                        s_col[(MT_N + 1)] = packed.y;
-                        s_col[2 * (MT_N + 1)] = packed.z;
-                        s_col[3 * (MT_N + 1)] = packed.w;
-                    }
-                    return;
-                }
-            }
-
-            for (int p = tid; p < elemsB; p += TPB) {
-                const int ki = p % BK;
-                const int nj = p / BK;
-                dst[ki * (MT_N + 1) + nj] = ldB(n0 + nj, k0 + ki);
-            }
-        };
-
-        copy_tile_A(0, sA0);
-        copy_tile_B(0, sB0);
+        load_tile_g2s(n0_tile, 0, 0);
         __syncthreads();
 
-        int ping = 0;
+        for (int kt = 0; kt < num_k_tiles; ++kt) {
+            const int ping = kt & 1;
+            const int pong = ping ^ 1;
+            const int k0 = kt * BK;
 
-        for (int tile = 0; tile < num_k_tiles; ++tile) {
-            __hip_bfloat16* sA = (ping == 0) ? sA0 : sA1;
-            float* sB = (ping == 0) ? sB0 : sB1;
-
-            const int next_k0 = (tile + 1) * BK;
-            if (tile + 1 < num_k_tiles) {
-                __hip_bfloat16* sA_next = (ping == 0) ? sA1 : sA0;
-                float* sB_next = (ping == 0) ? sB1 : sB0;
-
-                copy_tile_A(next_k0, sA_next);
-                copy_tile_B(next_k0, sB_next);
+            if (kt + 1 < num_k_tiles) {
+                load_tile_g2s(n0_tile, k0 + BK, pong);
             }
+
+            const __hip_bfloat16* sA_ping = &smem.tiles.sA[ping][0];
+            const short* sB_ping = &smem.tiles.sB_T[ping][0];
 
 #pragma unroll
-            for (int kk4 = 0; kk4 < BK; kk4 += 4) {
-                const int k_cur = kk4 + lane_y;
-                const int a_row = (m_base - m0) + lane_x;
-                const int b_col = (n_base - n0) + lane_x;
+            for (int kk = 0; kk < BK; kk += 16) {
+                const __hip_bfloat16* a_sptr =
+                    sA_ping + (m0_wave + lane_x) * BK + (kk + lane_y * 4);
+                i16x4 avec = *reinterpret_cast<const i16x4*>(a_sptr);
 
-                float amk = 0.f;
-                float bkn = 0.f;
-                if (static_cast<unsigned>(a_row) < static_cast<unsigned>(MT_M) &&
-                    static_cast<unsigned>(k_cur) < static_cast<unsigned>(BK)) {
-                    amk = __bfloat162float(sA[a_row * (BK + 1) + k_cur]);
-                }
-                if (static_cast<unsigned>(k_cur) < static_cast<unsigned>(BK) &&
-                    static_cast<unsigned>(b_col) < static_cast<unsigned>(MT_N)) {
-                    bkn = sB[k_cur * (MT_N + 1) + b_col];
-                }
+                const int k_row_base = kk + lane_y * 4;
 
-                d = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, d, 0, 0, 0);
+                const int n_col0 = n0_wave + 0 * 16 + lane_x;
+                const int n_col1 = n0_wave + 1 * 16 + lane_x;
+                const int n_col2 = n0_wave + 2 * 16 + lane_x;
+                const int n_col3 = n0_wave + 3 * 16 + lane_x;
+
+                i16x4 b0 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col0 * BK + k_row_base]);
+                i16x4 b1 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col1 * BK + k_row_base]);
+                i16x4 b2 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col2 * BK + k_row_base]);
+                i16x4 b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * BK + k_row_base]);
+
+                c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
+                c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
+                c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b2, c2, 0, 0, 0);
+                c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b3, c3, 0, 0, 0);
             }
-
             __syncthreads();
-            ping ^= 1;
         }
 
-        const int n_out = n_base + lane_x;
-        if (n_out < N) {
-            const int token = tokens[n_out];
-            const float scale = scales[n_out];
-            float* __restrict__ eagg_row = e_agg + static_cast<size_t>(token) * H;
+        const int m_out_base = m0_cta + m0_wave + lane_y * 4;
+        const int n_out0 = n0_tile + n0_wave + lane_x;
+        const int n_out1 = n_out0 + 16;
+        const int n_out2 = n_out0 + 32;
+        const int n_out3 = n_out0 + 48;
+
+        float* out0 = nullptr;
+        float* out1 = nullptr;
+        float* out2 = nullptr;
+        float* out3 = nullptr;
+        float scale0 = 0.f, scale1 = 0.f, scale2 = 0.f, scale3 = 0.f;
+
+        if (n_out0 < N) {
+            out0 = e_agg + static_cast<size_t>(tokens[n_out0]) * H;
+            scale0 = scales[n_out0];
+        }
+        if (n_out1 < N) {
+            out1 = e_agg + static_cast<size_t>(tokens[n_out1]) * H;
+            scale1 = scales[n_out1];
+        }
+        if (n_out2 < N) {
+            out2 = e_agg + static_cast<size_t>(tokens[n_out2]) * H;
+            scale2 = scales[n_out2];
+        }
+        if (n_out3 < N) {
+            out3 = e_agg + static_cast<size_t>(tokens[n_out3]) * H;
+            scale3 = scales[n_out3];
+        }
 
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int lane_block = lane >> 4; // 0..3
-                const int row_local = lane_block * 4 + i;
-                const int m_out = m_base + row_local;
-                if (m_out >= M)
-                    continue;
+        for (int i = 0; i < 4; ++i) {
+            const int m_out = m_out_base + i;
+            if (m_out >= M)
+                continue;
 
-                float out_val = d[i];
-                if (bias) {
-                    out_val += __bfloat162float(bias[m_out]);
-                }
-                atomicAdd(&eagg_row[m_out], out_val * scale);
-            }
+            const float v0 = c0[i];
+            const float v1 = c1[i];
+            const float v2 = c2[i];
+            const float v3 = c3[i];
+
+            if (out0)
+                atomicAdd(out0 + m_out, v0 * scale0);
+            if (out1)
+                atomicAdd(out1 + m_out, v1 * scale1);
+            if (out2)
+                atomicAdd(out2 + m_out, v2 * scale2);
+            if (out3)
+                atomicAdd(out3 + m_out, v3 * scale3);
         }
-
         __syncthreads();
     }
 }
@@ -504,24 +442,20 @@ inline void moe_mlp2_scatter(const int* work_queue, int work_start, int work_cou
                              int I, int H, long long expert_weight_stride,
                              long long expert_bias_stride, int maxNe, int grid_cap,
                              hipStream_t stream) {
-    constexpr int MT_M = 64;
-    constexpr int MT_N = 32;
-    constexpr int BK = 32;
-    constexpr int WR = 4;
-    constexpr int WC = 2;
+    constexpr int MT_M = 256;
+    constexpr int MT_N = 64;
+    constexpr int BK = 16;
+    constexpr int WR = 16;
+    constexpr int WC = 1;
     constexpr int WAVES = WR * WC;
 
-    const int grid_x = max(1, min(grid_cap, ceil_div_int(maxNe, MT_N)));
-    const int grid_y = max(1, ceil_div_int(H, MT_M));
+    const int grid_x = max(1, min(grid_cap, CEIL_DIV(maxNe, MT_N)));
+    const int grid_y = max(1, CEIL_DIV(H, MT_M));
 
     dim3 block(64 * WAVES, 1, 1);
     dim3 grid(grid_x, grid_y, work_count);
 
-    const size_t shmem_bytes =
-        2 * (MT_M * (BK + 1) * sizeof(__hip_bfloat16)) + 2 * (BK * (MT_N + 1) * sizeof(float));
-
-    hipLaunchKernelGGL((moe_mlp2_scatter_mfma_kernel<MT_M, MT_N, BK, WR, WC>), grid, block,
-                       shmem_bytes, stream, work_queue, work_start, work_count, gate_by_expert,
-                       tokens_flat, weights_flat, e_agg, weights_base, bias_base, I, H,
-                       expert_weight_stride, expert_bias_stride);
+    moe_mlp2_scatter_mfma_kernel<<<grid, block>>>(
+        work_queue, work_start, work_count, gate_by_expert, tokens_flat, weights_flat, e_agg,
+        weights_base, bias_base, I, H, expert_weight_stride, expert_bias_stride);
 }
