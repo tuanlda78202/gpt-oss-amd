@@ -12,13 +12,10 @@
 #define FA_USE_NT 0
 #endif
 
-// ---- NT policy: only stream when no L2 reuse is expected ----
+// ---- NT policy: more decode-friendly for streaming K/V ----
 __device__ __forceinline__ bool use_nt_for_kv(int kv_mul, int B, int H, int head_dim, int T) {
-    // Heuristics:
-    // - Disable NT if multiple heads share K/V (kv_mul>1) => let L2 share.
-    // - Disable NT for small batch*heads (not enough outstanding misses to hide latency).
-    // - Enable NT for long sequences where we truly stream.
-    return (FA_USE_NT != 0) && (kv_mul == 1) && (B * H >= 8) && (T >= 256) && (head_dim >= 64);
+    // For decode with kv_mul==1, be more aggressive since it's a one-pass stream
+    return (FA_USE_NT != 0) && (kv_mul == 1) && (T >= 128);
 }
 
 template<typename T>
@@ -46,6 +43,15 @@ static __device__ __forceinline__ float wave_reduce_sum(float v) {
     #pragma unroll
     for (int off = warpSize >> 1; off > 0; off >>= 1)
         v += __shfl_down(v, off, warpSize);
+    return v;
+}
+
+// Width-aware warp reductions for BF16 (32 lanes) vs FP32 (64 lanes)
+template<int WIDTH>
+__device__ __forceinline__ float wave_reduce_sum_width(float v) {
+    #pragma unroll
+    for (int off = WIDTH >> 1; off > 0; off >>= 1)
+        v += __shfl_down(v, off, WIDTH);
     return v;
 }
 
@@ -87,48 +93,8 @@ __device__ __forceinline__ void unpack_bf16x2(uint32_t packed, float& lo, float&
     hi = bf16_to_f32_intr(bf_hi);
 }
 
-// ======================= LDS bank conflict mitigation =======================
-// one pad every 32 floats (per 128B) to break 32-bank conflicts
-#define PAD32_INDEX(j) ((j) + ((j) >> 5))  // j + j/32
-
-__device__ __forceinline__ bool is_aligned_16(const void* p) {
-    return ((uintptr_t)p & 0xF) == 0;
-}
-
 __device__ __forceinline__ bool is_aligned_4(const void* p) {
     return ((uintptr_t)p & 3) == 0;
-}
-
-// Coalesced store from padded shared O to global contiguous O
-__device__ void store_O_from_padded(float* __restrict__ dst,
-                                    const float* __restrict__ o_sh,
-                                    int head_dim)
-{
-    // Fast path: aligned v4
-    if (is_aligned_16(dst)) {
-        int vec = head_dim >> 2;      // /4
-        // cooperate: each thread writes many float4s spaced by blockDim.x
-        float4* d4 = reinterpret_cast<float4*>(dst);
-        for (int i = threadIdx.x; i < vec; i += blockDim.x) {
-            int j = i << 2;
-            float4 v;
-            v.x = o_sh[PAD32_INDEX(j+0)];
-            v.y = o_sh[PAD32_INDEX(j+1)];
-            v.z = o_sh[PAD32_INDEX(j+2)];
-            v.w = o_sh[PAD32_INDEX(j+3)];
-            d4[i] = v;
-        }
-        int tail = head_dim & 3;
-        int base = vec << 2;
-        if (tail && threadIdx.x == 0) {
-            for (int t = 0; t < tail; ++t) dst[base + t] = o_sh[PAD32_INDEX(base + t)];
-        }
-    } else {
-        // Scalar fallback (still coalesced across lanes)
-        for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
-            dst[j] = o_sh[PAD32_INDEX(j)];
-        }
-    }
 }
 
 // ======================================================================
@@ -195,23 +161,38 @@ __global__ void fa2_decode_br1_head64(
     // ---- NT streaming heuristic ----
     const bool NT = use_nt_for_kv(kv_mul, B, n_attn_heads, 64, Lb);
 
-    // ---- Shared memory layout ----
+    // ---- Shared memory layout (only s_sh needed now) ----
     extern __shared__ float smem[];
-    float* __restrict__ q_sh = smem;                                 // padded
-    float* __restrict__ O_sh = q_sh + (64 + (64 >> 5) + 1);          // padded
-    float* __restrict__ s_sh = O_sh + (64 + (64 >> 5) + 1);          // up to BcMax scalars
+    float* __restrict__ s_sh = smem;  // up to BcMax scalars
 
-    // ---- Load & scale Q, zero O ----
+    // ---- Load & scale Q, zero O (keep in registers) ----
     const float* __restrict__ q_b    = q_batch + (long long)b * (n_attn_heads * 64);
     const float* __restrict__ q_head = q_b + (long long)h * 64;
     float* __restrict__ o_out        = tb_batch + (long long)b * (n_attn_heads * 64) + (long long)h * 64;
 
     const float inv_sqrt_d = rsqrtf(64.0f);
-    for (int j = lane; j < 64; j += warpSize) {
-        q_sh[PAD32_INDEX(j)] = q_head[j] * inv_sqrt_d;
-        O_sh[PAD32_INDEX(j)] = 0.0f;
+
+    // Determine reduction width based on KV type
+    constexpr int REDW = std::is_same<KV_T,__hip_bfloat16>::value ? 32 : 64;
+
+    // Keep Q and O in registers (no shared memory)
+    float q_reg = 0.0f, o_reg = 0.0f;          // FP32 path: each lane handles 1 dim
+    float q0 = 0.0f, q1 = 0.0f;                // BF16 path: each lane <32 handles 2 dims
+    float o0 = 0.0f, o1 = 0.0f;
+
+    if constexpr (std::is_same<KV_T,float>::value) {
+        if (lane < 64) {
+            q_reg = q_head[lane] * inv_sqrt_d;
+            o_reg = 0.0f;
+        }
+    } else {
+        if (lane < 32) {
+            q0 = q_head[(lane<<1)+0] * inv_sqrt_d;
+            q1 = q_head[(lane<<1)+1] * inv_sqrt_d;
+            o0 = 0.0f;
+            o1 = 0.0f;
+        }
     }
-    wave_sync();
 
     // ---- Running LSE state (m, l) ----
     __shared__ float m_shared, l_shared;
@@ -238,7 +219,7 @@ __global__ void fa2_decode_br1_head64(
                 const float* __restrict__ k_head = reinterpret_cast<const float*>(kp_bytes);
                 if (lane < 64) {
                     float kv = ld_global_cond(k_head + lane, NT);
-                    partial = q_sh[PAD32_INDEX(lane)] * kv;
+                    partial = q_reg * kv;  // use register-resident q_reg
                 }
             } else { // BF16 path: 32 lanes load (2 elems each)
                 if (lane < 32) {
@@ -246,56 +227,78 @@ __global__ void fa2_decode_br1_head64(
                         const uint32_t* __restrict__ k2 = reinterpret_cast<const uint32_t*>(kp_bytes);
                         uint32_t w = ld_global_u32_cond(k2 + lane, NT);
                         float k0, k1; unpack_bf16x2(w, k0, k1);
-                        int j = lane << 1;
-                        partial = q_sh[PAD32_INDEX(j+0)] * k0 + q_sh[PAD32_INDEX(j+1)] * k1;
+                        partial = q0 * k0 + q1 * k1;  // use register-resident q0, q1
                     } else {
                         const __hip_bfloat16* __restrict__ k16 = reinterpret_cast<const __hip_bfloat16*>(kp_bytes);
-                        int j = lane << 1;
-                        float k0 = bf16_to_f32_intr(k16[j+0]);
-                        float k1 = bf16_to_f32_intr(k16[j+1]);
-                        partial = q_sh[PAD32_INDEX(j+0)] * k0 + q_sh[PAD32_INDEX(j+1)] * k1;
+                        float k0 = bf16_to_f32_intr(k16[(lane<<1)+0]);
+                        float k1 = bf16_to_f32_intr(k16[(lane<<1)+1]);
+                        partial = q0 * k0 + q1 * k1;  // use register-resident q0, q1
                     }
                 }
             }
 
-            // Reduce dot(q, k_t) across the wave
-            float s = wave_reduce_sum(partial);
+            // Reduce dot(q, k_t) across the wave with width-aware reduction
+            float s = wave_reduce_sum_width<REDW>(partial);
             if (lane == 0) {
                 if constexpr (USE_MASK) s += mask[(long long)pos_b * seq_len + t];
                 s_sh[r] = s;
                 m_tile = fmaxf(m_tile, s);
             }
-            wave_sync();
+            // No sync here - only lane 0 writes, no one else reads until after the loop
         }
+        // Single barrier after the entire loop
+        wave_sync();
 
         // -------- Per-tile (m,l) update --------
         __shared__ float scale_old, inv_l_new, m_new_shared;
+
+        // Parallelize the tile row-sum (sumexp) computation
+        float m_new;
+        if (lane == 0) {
+            const float m_prev = m_shared;
+            m_new = fmaxf(m_prev, m_tile);
+            m_new_shared = m_new;
+        }
+        wave_sync();
+        m_new = m_new_shared;  // broadcast m_new to all lanes
+
+        // Distribute sumexp computation across lanes
+        float part = 0.0f;
+        for (int r = lane; r < bc; r += REDW) {
+            part += __expf(s_sh[r] - m_new);
+        }
+        float sumexp = wave_reduce_sum_width<REDW>(part);
+
         if (lane == 0) {
             const float m_prev = m_shared;
             const float l_prev = l_shared;
-
-            const float m_new  = fmaxf(m_prev, m_tile);
-            const float alpha  = __expf(m_prev - m_new);
-
-            float sumexp = 0.0f;
-            for (int r = 0; r < bc; ++r) sumexp += __expf(s_sh[r] - m_new);
-
+            const float alpha = __expf(m_prev - m_new);
             const float l_new = alpha * l_prev + sumexp;
 
-            scale_old    = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
-            inv_l_new    = (l_new > 0.0f) ? 1.0f / l_new : 0.0f;
-            m_new_shared = m_new;
-            m_shared     = m_new;
-            l_shared     = l_new;
+            scale_old = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
+            inv_l_new = (l_new > 0.0f) ? 1.0f / l_new : 0.0f;
+            m_shared = m_new;
+            l_shared = l_new;
         }
         wave_sync();
 
-        // Pre-scale old O once
-        for (int j = lane; j < 64; j += warpSize)
-            O_sh[PAD32_INDEX(j)] *= scale_old;
-        wave_sync();
+        // Pre-scale old O once (register-resident)
+        float scale_old_v = __shfl(scale_old, 0, REDW);
+        if constexpr (std::is_same<KV_T,float>::value) {
+            if (lane < 64) {
+                o_reg *= scale_old_v;
+            }
+        } else {
+            if (lane < 32) {
+                o0 *= scale_old_v;
+                o1 *= scale_old_v;
+            }
+        }
 
         // -------- Pass 2: mix V with weights exp(s - m_new)/l_new --------
+        float inv_l_new_v = __shfl(inv_l_new, 0, REDW);
+        float m_new_v = __shfl(m_new_shared, 0, REDW);
+
         #pragma unroll 1
         for (int r = 0; r < bc; ++r) {
             const int t  = t0 + r;
@@ -303,16 +306,16 @@ __global__ void fa2_decode_br1_head64(
 
             const char* __restrict__ vp_bytes = v_layer_base + (long long)rt * step_bytes + head_off_bytes;
 
-            // Reuse s_sh[r] to broadcast weight to all lanes
-            if (lane == 0) s_sh[r] = __expf(s_sh[r] - m_new_shared) * inv_l_new;
-            wave_sync();
-            const float w = s_sh[r];
+            // Use shuffle broadcast for weight (no LDS, no barrier)
+            float w;
+            if (lane == 0) w = __expf(s_sh[r] - m_new_v) * inv_l_new_v;
+            w = __shfl(w, 0, REDW);   // broadcast weight from lane 0
 
             if constexpr (std::is_same<KV_T,float>::value) {
                 const float* __restrict__ v_head = reinterpret_cast<const float*>(vp_bytes);
                 if (lane < 64) {
                     float vv = ld_global_cond(v_head + lane, NT);
-                    O_sh[PAD32_INDEX(lane)] += w * vv;
+                    o_reg += w * vv;  // update register-resident o_reg
                 }
             } else { // BF16
                 if (lane < 32) {
@@ -320,42 +323,61 @@ __global__ void fa2_decode_br1_head64(
                         const uint32_t* __restrict__ v2 = reinterpret_cast<const uint32_t*>(vp_bytes);
                         uint32_t w2 = ld_global_u32_cond(v2 + lane, NT);
                         float v0, v1; unpack_bf16x2(w2, v0, v1);
-                        int j = lane << 1;
-                        O_sh[PAD32_INDEX(j+0)] += w * v0;
-                        O_sh[PAD32_INDEX(j+1)] += w * v1;
+                        o0 += w * v0;  // update register-resident o0, o1
+                        o1 += w * v1;
                     } else {
                         const __hip_bfloat16* __restrict__ v16 = reinterpret_cast<const __hip_bfloat16*>(vp_bytes);
-                        int j = lane << 1;
-                        float v0 = bf16_to_f32_intr(v16[j+0]);
-                        float v1 = bf16_to_f32_intr(v16[j+1]);
-                        O_sh[PAD32_INDEX(j+0)] += w * v0;
-                        O_sh[PAD32_INDEX(j+1)] += w * v1;
+                        float v0 = bf16_to_f32_intr(v16[(lane<<1)+0]);
+                        float v1 = bf16_to_f32_intr(v16[(lane<<1)+1]);
+                        o0 += w * v0;  // update register-resident o0, o1
+                        o1 += w * v1;
                     }
                 }
             }
-            wave_sync();
+            // No sync needed - shuffle is warp-synchronous
         }
     }
 
-    // ---- Optional attention sink post-renorm (kept same as your decode) ----
+    // ---- Optional attention sink post-renorm (register-resident) ----
     if (attn_sinks_half != nullptr) {
         float sink_s = __bfloat162float(attn_sinks_half[h]);
         if (isfinite(sink_s)) {
-            const float m_prev = m_shared; const float l_prev = l_shared;
-            const float m_new  = fmaxf(m_prev, sink_s);
-            const float a = __expf(m_prev - m_new) * l_prev;
-            const float b = __expf(sink_s - m_new);
-            const float denom = a + b;
-            const float renorm= (denom > 0.0f) ? (a / denom) : 1.0f;
-            for (int j = lane; j < 64; j += warpSize)
-                O_sh[PAD32_INDEX(j)] *= renorm;
-            wave_sync();
-            m_shared = m_new; l_shared = denom; // optional: keep LSE consistent
+            float renorm = 1.0f;
+            if (lane == 0) {
+                const float m_prev = m_shared; const float l_prev = l_shared;
+                const float m_new  = fmaxf(m_prev, sink_s);
+                const float a = __expf(m_prev - m_new) * l_prev;
+                const float b = __expf(sink_s - m_new);
+                const float denom = a + b;
+                renorm = (denom > 0.0f) ? (a / denom) : 1.0f;
+                m_shared = m_new; l_shared = denom; // optional: keep LSE consistent
+            }
+            renorm = __shfl(renorm, 0, REDW);
+
+            if constexpr (std::is_same<KV_T,float>::value) {
+                if (lane < 64) {
+                    o_reg *= renorm;
+                }
+            } else {
+                if (lane < 32) {
+                    o0 *= renorm;
+                    o1 *= renorm;
+                }
+            }
         }
     }
 
-    // ---- Store O ----
-    store_O_from_padded(o_out, O_sh, 64);
+    // ---- Store O from registers ----
+    if constexpr (std::is_same<KV_T,float>::value) {
+        if (lane < 64) {
+            o_out[lane] = o_reg;
+        }
+    } else {
+        if (lane < 32) {
+            o_out[(lane<<1)+0] = o0;
+            o_out[(lane<<1)+1] = o1;
+        }
+    }
 }
 
 static inline int fa_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
@@ -385,10 +407,9 @@ void fa(
 {
     if (B <= 0 || n_attn_heads <= 0 || head_dim != 64) return; // this path specializes D=64
 
-    // ---- shared memory: q_sh + o_sh + s_sh(BcMax) ----
-    auto padded = [](int n){ return n + (n >> 5) + 1; };
+    // ---- shared memory: only s_sh(BcMax) needed now (Q/O in registers) ----
     constexpr int BcMax = 64;                 // safe default on MI250
-    size_t shmem = (padded(64) + padded(64) + BcMax) * sizeof(float);
+    size_t shmem = BcMax * sizeof(float);     // only s_sh array needed
 
     const __hip_bfloat16* attn_sinks_head =
         (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
