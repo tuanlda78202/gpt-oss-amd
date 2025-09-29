@@ -12,11 +12,11 @@ __global__ void gemm_bf16_f32_mfma_qkv(const __hip_bfloat16* __restrict__ A,    
     //
     // 1. Tiling and Thread Decomposition
     //
-    constexpr int MT_M = 128; // CTA tile height (M dimension)
+    constexpr int MT_M = 256; // CTA tile height (M dimension)
     constexpr int MT_N = 64;  // CTA tile width (N dimension)
     constexpr int BK = 16;    // K-slice size, must be multiple of 16 for mfma_bf16
 
-    constexpr int WR = 8; // Waves along M: 8 waves * 16 rows/wave = 128
+    constexpr int WR = 16; // Waves along M: 8 waves * 16 rows/wave = 128
     constexpr int WC = 1;  // Waves along N: 1 wave  * 64 cols/wave = 64
     constexpr int WAVES_PER_CTA = WR * WC;
     constexpr int THREADS_PER_CTA = 64 * WAVES_PER_CTA; // 512
@@ -198,8 +198,8 @@ __global__ void gemm_bf16_f32_mfma_qkv(const __hip_bfloat16* __restrict__ A,    
 
 void gemm_qkv(float* xout, const float* x_batch, const __hip_bfloat16* w,
               const __hip_bfloat16* bias, int N, int K, int M) {
-    dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 128));
-    dim3 block(512, 1, 1);
+    dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 256));
+    dim3 block(1024, 1, 1);
 
     gemm_bf16_f32_mfma_qkv<<<grid, block>>>(w, x_batch, xout, bias, M, N, K);
 }

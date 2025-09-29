@@ -8,12 +8,12 @@ __global__ void gemm_bf16_f32_mfma_logits(const __hip_bfloat16* __restrict__ A, 
                                           float* __restrict__ C,                // [N,M] f32
                                           int M, int N, int K) {
     // Tile geometry
-    constexpr int MT_M = 128; // CTA tile height (M)
+    constexpr int MT_M = 256; // CTA tile height (M)
     constexpr int MT_N = 64;  // CTA tile width  (N)
     constexpr int BK = 16;    // K-slice (multiple of 16)
 
     // 16 waves × 64 threads = 1024 threads per CTA
-    constexpr int WR = 8;                              // waves along M (8 * 16 rows = 128)
+    constexpr int WR = 16;                              // waves along M (8 * 16 rows = 128)
     constexpr int WC = 1;                               // waves along N (1 * 64 cols = 64)
     constexpr int WAVES_PER_CTA = WR * WC;              // 16
     constexpr int THREADS_PER_CTA = 64 * WAVES_PER_CTA; // 1024
@@ -166,8 +166,8 @@ __global__ void gemm_bf16_f32_mfma_logits(const __hip_bfloat16* __restrict__ A, 
 }
 
 void gemm_logits(float* xout, const float* x_batch, const __hip_bfloat16* w, int N, int K, int M) {
-    dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 128));
-    dim3 block(512, 1, 1);
+    dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 256));
+    dim3 block(1024, 1, 1);
 
     gemm_bf16_f32_mfma_logits<<<grid, block>>>(w, x_batch, xout, M, N, K);
 }
