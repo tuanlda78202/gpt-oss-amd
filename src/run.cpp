@@ -1119,7 +1119,7 @@ int main(int argc, char** argv) {
     int enable_profiling = 0;     // profiling flag, default off
     char* verify_filename = NULL; // verification file for getp mode
     int truncate_lines = 0;       // truncate input to N lines, 0 = no truncation
-    int use_kv16 = 0;             // use 16-bit KV cache (bfloat16), default: off
+    int use_kv16 = 1;             // use 16-bit KV cache (bfloat16), default: on
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1129,10 +1129,14 @@ int main(int argc, char** argv) {
         error_usage();
     }
     for (int i = 2; i < argc;) {
-        // Special case for --kv16 flag (no argument needed)
         if (strcmp(argv[i], "--kv16") == 0) {
             use_kv16 = 1;
             i += 1; // Only skip one argument (the flag itself)
+            continue;
+        }
+        if (strcmp(argv[i], "--kv32") == 0) {
+            use_kv16 = 0;
+            i += 1;
             continue;
         }
 
