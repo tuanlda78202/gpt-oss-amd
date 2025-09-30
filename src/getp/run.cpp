@@ -309,7 +309,7 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         max_generation_tokens[b] = remaining > 0 ? remaining : 0;
     }
 
-    const int progress_stride = 5;
+    const int progress_stride = 1;
     int iteration = 0;
 
     if (show_progress) {

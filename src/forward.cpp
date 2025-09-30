@@ -2,6 +2,10 @@
 #include "hip/BLAS.hip"
 #include "hip/attention.hip"
 #include "hip/embed.hip"
+#include "hip/gemms/gemm_logits.hip"
+#include "hip/gemms/gemm_o.hip"
+#include "hip/gemms/gemm_qkv.hip"
+#include "hip/gemms/gemm_router.hip"
 #include "hip/moe.hip"
 #include "hip/rmsnorm.hip"
 #include "hip/rope.hip"
@@ -19,11 +23,6 @@
 #include <cstring>
 #include <omp.h>
 #include <vector>
-
-#include "hip/gemms/gemm_logits.hip"
-#include "hip/gemms/gemm_o.hip"
-#include "hip/gemms/gemm_qkv.hip"
-#include "hip/gemms/gemm_router.hip"
 
 #ifndef ADAPT_MT_M
 #define ADAPT_MT_M 64 // CTA tile on M (rows)
