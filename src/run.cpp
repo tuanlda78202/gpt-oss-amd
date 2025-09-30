@@ -1120,6 +1120,7 @@ int main(int argc, char** argv) {
     char* verify_filename = NULL; // verification file for getp mode
     int truncate_lines = 0;       // truncate input to N lines, 0 = no truncation
     int use_kv16 = 1;             // use 16-bit KV cache (bfloat16), default: on
+    int odd_window = 0;           // odd-layer sliding window (0 = full context)
 
     // poor man's C argparse so we can override the defaults above from the
     // command line
@@ -1137,6 +1138,13 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--kv32") == 0) {
             use_kv16 = 0;
             i += 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--odd_win") == 0) {
+            if (i + 1 >= argc)
+                error_usage();
+            odd_window = atoi(argv[i + 1]);
+            i += 2;
             continue;
         }
 
@@ -1225,7 +1233,7 @@ int main(int argc, char** argv) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
         getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps, batch_size,
-             verify_filename, truncate_lines, use_kv16);
+             verify_filename, truncate_lines, use_kv16, odd_window);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

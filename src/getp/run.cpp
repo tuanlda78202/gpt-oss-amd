@@ -117,7 +117,8 @@ static void ensure_request_buffers(int required) {
 #define DP 8
 static int num_gpus = 1;
 
-void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16) {
+void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16,
+             int odd_window) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
     transformer_oss->config.batch_size = batch_size;
     transformer_oss->config.seq_len = 1024;
@@ -149,7 +150,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
             exit(EXIT_FAILURE);
         }
 
-        copy_transformer_to_device(transformer_oss, g_models[g], use_kv16);
+        copy_transformer_to_device(transformer_oss, g_models[g], use_kv16, odd_window);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));

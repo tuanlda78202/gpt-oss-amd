@@ -58,7 +58,8 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
 }
 
 // ! Hybrid precision (BF16 weights + FP32 activations)
-void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int use_kv16) {
+void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int use_kv16,
+                                int odd_window) {
     memcpy(&t_d->config, &t_fp32->config, sizeof(OssConfig));
 
     OssConfig* conf = &t_fp32->config;
@@ -168,11 +169,6 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     const int kv_dim = n_kv_heads * head_dim;
     const int W_even = std::max(0, conf->sliding_window);
     const size_t elem_sz = use_kv16 ? sizeof(__hip_bfloat16) : sizeof(float);
-
-    int odd_window = 0;
-    if (const char* p = std::getenv("OSS_ODD_WINDOW")) {
-        odd_window = std::max(0, atoi(p)); // 0 => keep full context on odd layers
-    }
 
     // Host arrays for layout computation
     std::vector<int> h_cap(n_layers);

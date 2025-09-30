@@ -274,6 +274,7 @@ cmd_run() {
   local truncate_lines=""
   local kv16_flag=""
   local kv32_flag=""
+  local odd_win=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -295,6 +296,7 @@ cmd_run() {
       -t) truncate_lines="$2"; shift 2 ;;
       --kv16) kv16_flag="1"; shift 1 ;;
       --kv32) kv32_flag="1"; shift 1 ;;
+      --odd_win) odd_win="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -367,6 +369,7 @@ cmd_run() {
   else
     print_kv "kv_cache" "bf16" "(default)"
   fi
+  [[ -n "${odd_win}" ]] && print_kv "odd_win" "${odd_win}" "(--odd_win)"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
   if [[ ! -x build/run ]]; then
@@ -390,6 +393,7 @@ cmd_run() {
   [[ -n "${truncate_lines}" ]] && args+=(-t "${truncate_lines}")
   [[ -n "${kv16_flag}" ]] && args+=(--kv16)
   [[ -n "${kv32_flag}" ]] && args+=(--kv32)
+  [[ -n "${odd_win}" ]] && args+=(--odd_win "${odd_win}")
 
   local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
