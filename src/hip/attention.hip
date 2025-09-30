@@ -7,44 +7,24 @@
 #include <stdint.h>
 #include <type_traits>
 
-#ifndef FA_USE_NT
-#define FA_USE_NT 0
-#endif
-
-__device__ __forceinline__ bool use_nt_for_kv(int kv_mul, int B, int H, int head_dim, int T) {
-    // For decode with kv_mul==1, be more aggressive since it's a one-pass stream
-    return (FA_USE_NT != 0) && (kv_mul == 1) && (T >= 128);
-}
-
 template<typename T>
-__device__ __forceinline__ T ld_global_cond(const T* p, bool nt) {
+__device__ __forceinline__ T ld_global_cond(const T* p) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    // Only use NT loads for supported types (integer, float, pointer, not bf16 or vector types)
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
                   std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t> ||
                   std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>) {
-        if (nt) return __builtin_nontemporal_load(p);
     }
 #endif
     return *p;
 }
 
-// BF16 packed (two bf16 in a u32)
-__device__ __forceinline__ uint32_t ld_global_u32_cond(const uint32_t* p, bool nt) {
+__device__ __forceinline__ uint32_t ld_global_u32_cond(const uint32_t* p) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    if (nt) return __builtin_nontemporal_load(p);
+    return __builtin_nontemporal_load(p);
 #endif
     return *p;
 }
 
-static __device__ __forceinline__ float wave_reduce_sum(float v) {
-    #pragma unroll
-    for (int off = warpSize >> 1; off > 0; off >>= 1)
-        v += __shfl_down(v, off, warpSize);
-    return v;
-}
-
-// Width-aware warp reductions for BF16 (32 lanes) vs FP32 (64 lanes)
 template<int WIDTH>
 __device__ __forceinline__ float wave_reduce_sum_width(float v) {
     #pragma unroll
@@ -61,7 +41,6 @@ static __device__ __forceinline__ void wave_sync() {
 #endif
 }
 
-// ======================= Ring index helpers =======================
 static __device__ __forceinline__ bool is_pow2_int(int x){ return (x & (x-1)) == 0; }
 template<bool POW2>
 static __device__ __forceinline__ int ring_index(int t, int cap) {
@@ -69,7 +48,6 @@ static __device__ __forceinline__ int ring_index(int t, int cap) {
     else                return (t >= cap) ? (t % cap) : t;
 }
 
-// ======================= K/V vectorized access =======================
 static inline __device__ float bf16_to_f32_intr(__hip_bfloat16 x) {
     return __bfloat162float(x);
 }
@@ -83,7 +61,6 @@ static __device__ __forceinline__ __hip_bfloat16 raw_to_bf16(uint16_t bits) {
     return conv.b;
 }
 
-// Unpack two bf16 from u32
 __device__ __forceinline__ void unpack_bf16x2(uint32_t packed, float& lo, float& hi) {
     __hip_bfloat16 bf_lo = raw_to_bf16((uint16_t)(packed & 0xFFFF));
     __hip_bfloat16 bf_hi = raw_to_bf16((uint16_t)(packed >> 16));
@@ -159,8 +136,6 @@ __global__ void fa2_decode_br4_head64(
     const long long head_off_bytes = ((long long)g0 * 64) * elem_size;
     const long long step_bytes     = ((long long)kv_dim) * elem_size;
 
-    const bool NT = use_nt_for_kv(kv_mul, B, n_attn_heads, 64, Lb);
-
     extern __shared__ float smem[];
     float* __restrict__ s0 = smem + 0 * BcMax;
     float* __restrict__ s1 = smem + 1 * BcMax;
@@ -228,14 +203,14 @@ __global__ void fa2_decode_br4_head64(
             if constexpr (std::is_same<KV_T,float>::value) {
                 const float* __restrict__ k_head = reinterpret_cast<const float*>(kp_bytes);
                 if (lane < 64) {
-                    float kv = ld_global_cond(k_head + lane, NT);
+                    float kv = ld_global_cond(k_head + lane);
                     p0 = q0r * kv; p1 = q1r * kv; p2 = q2r * kv; p3 = q3r * kv;
                 }
             } else {
                 if (lane < 32) {
                     if (is_aligned_4(kp_bytes)) {
                         const uint32_t* __restrict__ k2 = reinterpret_cast<const uint32_t*>(kp_bytes);
-                        uint32_t w = ld_global_u32_cond(k2 + lane, NT);
+                        uint32_t w = ld_global_u32_cond(k2 + lane);
                         float k0, k1; unpack_bf16x2(w, k0, k1);
                         p0 = q0_0 * k0 + q0_1 * k1;
                         p1 = q1_0 * k0 + q1_1 * k1;
@@ -361,14 +336,14 @@ __global__ void fa2_decode_br4_head64(
             if constexpr (std::is_same<KV_T,float>::value) {
                 const float* __restrict__ v_head = reinterpret_cast<const float*>(vp_bytes);
                 if (lane < 64) {
-                    float vv = ld_global_cond(v_head + lane, NT);
+                    float vv = ld_global_cond(v_head + lane);
                     o0r += w0f * vv; o1r += w1f * vv; o2r += w2f * vv; o3r += w3f * vv;
                 }
             } else {
                 if (lane < 32) {
                     if (is_aligned_4(vp_bytes)) {
                         const uint32_t* __restrict__ v2 = reinterpret_cast<const uint32_t*>(vp_bytes);
-                        uint32_t w = ld_global_u32_cond(v2 + lane, NT);
+                        uint32_t w = ld_global_u32_cond(v2 + lane);
                         float v0, v1; unpack_bf16x2(w, v0, v1);
                         oo0_0 += w0f * v0; oo0_1 += w0f * v1;
                         oo1_0 += w1f * v0; oo1_1 += w1f * v1;
@@ -437,18 +412,14 @@ void fa(
     if (B <= 0 || n_attn_heads <= 0 || head_dim != 64) return; // this path specializes D=64
 
     // ---- shared memory size hint ----
-    constexpr int BcMax = 64;                 // safe default on MI250
-    size_t shmem_br1 = BcMax * sizeof(float);           // one score buffer
-    size_t shmem_br2 = 2 * BcMax * sizeof(float);       // two score buffers
+    constexpr int BcMax = 64;
+    size_t shmem_br4 = 4 * BcMax * sizeof(float);
 
     const __hip_bfloat16* attn_sinks_head =
         (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
-
     const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
 
     dim3 block(64); // one wave per CTA
-
-    // Heuristic Bc to try: big enough to amortize LSE, small enough for latency
     const int bc_tile_hint = min(64, seq_len);
 
     const bool can_br4 = (n_attn_heads % 4 == 0) && (kv_mul % 4 == 0);
@@ -458,7 +429,7 @@ void fa(
             if (use_mask) {
                 hipLaunchKernelGGL(
                     (fa2_decode_br4_head64<__hip_bfloat16, true, BcMax>),
-                    grid4, block, 4 * shmem_br1, stream,
+                    grid4, block, shmem_br4, stream,
                     q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
                     B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
                     d_pos_per_token, d_batch_indices, (long long)B_stride,
@@ -468,7 +439,7 @@ void fa(
             } else {
                 hipLaunchKernelGGL(
                     (fa2_decode_br4_head64<__hip_bfloat16, false, BcMax>),
-                    grid4, block, 4 * shmem_br1, stream,
+                    grid4, block, shmem_br4, stream,
                     q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch,
                     B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
                     d_pos_per_token, d_batch_indices, (long long)B_stride,
@@ -480,7 +451,7 @@ void fa(
             if (use_mask) {
                 hipLaunchKernelGGL(
                     (fa2_decode_br4_head64<float, true, BcMax>),
-                    grid4, block, 4 * shmem_br1, stream,
+                    grid4, block, shmem_br4, stream,
                     q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
                     B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
                     d_pos_per_token, d_batch_indices, (long long)B_stride,
@@ -490,7 +461,7 @@ void fa(
             } else {
                 hipLaunchKernelGGL(
                     (fa2_decode_br4_head64<float, false, BcMax>),
-                    grid4, block, 4 * shmem_br1, stream,
+                    grid4, block, shmem_br4, stream,
                     q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch,
                     B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
                     d_pos_per_token, d_batch_indices, (long long)B_stride,
