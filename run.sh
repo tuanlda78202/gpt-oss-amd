@@ -128,11 +128,12 @@ usage() {
   echo -e "    ${WHITE}-b BATCH_SIZE${NC}          Batch size for getp mode (default: 32)"
   echo -e "    ${WHITE}-f${NC}                     Enable forward pass profiling (shows timing breakdown)"
   echo -e "    ${WHITE}-v VERIFY_FILE${NC}         Ground truth file for verification (default: tests/gt/output_20b.txt)"
-  echo -e "    ${WHITE}--kv16${NC}                 Enable 16-bit KV cache (bfloat16, default: off)"
+  echo -e "    ${WHITE}--kv16${NC}                 Use 16-bit KV cache (bfloat16, default)"
+  echo -e "    ${WHITE}--kv32${NC}                 Use 32-bit KV cache (override kv16)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE] [--kv16]${NC}"
+  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE] [--kv16|--kv32]${NC}"
   echo ""
   echo -e "  ${CYAN}Features:${NC}"
   echo -e "    • Combines: ${WHITE}./run.sh build && ./run.sh run${NC}"
@@ -272,6 +273,8 @@ cmd_run() {
   local verify_file=""
   local truncate_lines=""
   local kv16_flag=""
+  local kv32_flag=""
+  local odd_win=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -292,6 +295,8 @@ cmd_run() {
       -v) verify_file="$2"; shift 2 ;;
       -t) truncate_lines="$2"; shift 2 ;;
       --kv16) kv16_flag="1"; shift 1 ;;
+      --kv32) kv32_flag="1"; shift 1 ;;
+      --odd_win) odd_win="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -357,6 +362,14 @@ cmd_run() {
   print_kv "profiling(-f)" "${enable_profiling:+enabled}" "$([[ -n "${enable_profiling}" ]] && echo "(forward timing)" || echo "(disabled)")"
   print_kv "logging(-l)"   "${log_output:+enabled}" "$([[ -n "${log_output}" ]] && echo "(to log.txt)" || echo "(disabled)")"
   print_kv "truncate(-t)" "${truncate_lines:-<none>}" "$([[ -n "${truncate_lines}" ]] && echo "(limit to first ${truncate_lines} lines)" || echo "(process all lines)")"
+  if [[ -n "${kv32_flag}" ]]; then
+    print_kv "kv_cache" "fp32" "(--kv32)"
+  elif [[ -n "${kv16_flag}" ]]; then
+    print_kv "kv_cache" "bf16" "(--kv16)"
+  else
+    print_kv "kv_cache" "bf16" "(default)"
+  fi
+  [[ -n "${odd_win}" ]] && print_kv "odd_win" "${odd_win}" "(--odd_win)"
 
   # Optional helpful hint if build/run doesn't exist or isn't executable
   if [[ ! -x build/run ]]; then
@@ -379,6 +392,8 @@ cmd_run() {
   [[ -n "${verify_file}" ]] && args+=(-v "${verify_file}")
   [[ -n "${truncate_lines}" ]] && args+=(-t "${truncate_lines}")
   [[ -n "${kv16_flag}" ]] && args+=(--kv16)
+  [[ -n "${kv32_flag}" ]] && args+=(--kv32)
+  [[ -n "${odd_win}" ]] && args+=(--odd_win "${odd_win}")
 
   local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"

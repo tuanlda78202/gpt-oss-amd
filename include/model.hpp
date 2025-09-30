@@ -207,8 +207,3 @@ typedef struct {
     float* data;                           // memory mapped data pointer
     ssize_t file_size;                     // size of the checkpoint file in bytes
 } OssTransformerHybrid;
-
-void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
-                                 const char* tensor_name);
-void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d, int use_kv16);
-void free_transformer_on_device(OssTransformerHybrid* t_d);

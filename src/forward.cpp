@@ -124,12 +124,19 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                 /*stream=*/0, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
 
         // ! Attention
-        const int is_local = ((p->sliding_window > 0) && ((l % 2) == 0));
-        const int L_full = max_pos_in_batch + 1;
-        const float* mask_ptr = is_local ? nullptr : s->mask;
+        int is_local_flag = 0, kv_cap = p->seq_len;
+        CHECK_HIP(
+            hipMemcpy(&is_local_flag, s->d_layer_is_local + l, sizeof(int), hipMemcpyDeviceToHost));
+        CHECK_HIP(hipMemcpy(&kv_cap, s->d_layer_kv_cap + l, sizeof(int), hipMemcpyDeviceToHost));
+        const int is_local = (is_local_flag != 0);
+        const float* mask_ptr =
+            is_local ? nullptr : s->mask; // local => ring buffer path; dense => causal mask
+
+        const int steps_so_far = max_pos_in_batch + 1;
+        const int visible_len = is_local ? std::min(kv_cap, steps_so_far) : steps_so_far;
 
         fa(s->q, (const void*)s->key_cache, (const void*)s->value_cache, mask_ptr, w->attn_sinks,
-           s->tb, batch_size, /*seq_len*/ L_full, head_dim, kv_dim, kv_mul, p->sliding_window,
+           s->tb, batch_size, /*seq_len*/ visible_len, head_dim, kv_dim, kv_mul, p->sliding_window,
            (int)l, p->n_attn_heads, s->kv_cache_is_fp16, s->d_pos_per_token, s->d_batch_indices,
            (long long)B_stride, max_pos_in_batch, s->fa_partial_O, s->fa_partial_m, s->fa_partial_l,
            0, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
