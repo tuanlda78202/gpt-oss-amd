@@ -1,5 +1,7 @@
 #include "../include/model.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
@@ -164,23 +166,40 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     // Compact KV allocation with per-layer capacities for cyclic cache
     const int kv_dim = n_kv_heads * head_dim;
-    const int W = conf->sliding_window;
+    const int W_even = std::max(0, conf->sliding_window);
     const size_t elem_sz = use_kv16 ? sizeof(__hip_bfloat16) : sizeof(float);
+
+    int odd_window = 0;
+    if (const char* p = std::getenv("OSS_ODD_WINDOW")) {
+        odd_window = std::max(0, atoi(p)); // 0 => keep full context on odd layers
+    }
 
     // Host arrays for layout computation
     std::vector<int> h_cap(n_layers);
     std::vector<int> h_is_local(n_layers);
     std::vector<long long> h_off(n_layers + 1, 0);
 
-    // Parity rule: mirror the existing mask parity (local on even layers when sliding_window > 0)
-    auto is_local_layer = [&](int l) { return (conf->sliding_window > 0) && ((l % 2) == 0); };
-
+    // Compute per-layer capacities: even layers use W_even, odd layers use odd_window if set
     for (int l = 0; l < n_layers; ++l) {
-        h_is_local[l] = is_local_layer(l) ? 1 : 0;      // keep behavior identical to mask
-        h_cap[l] = h_is_local[l] ? std::min(W, seq_len) // local: window
-                                 : seq_len;             // dense: full
+        const bool even = (l % 2 == 0);
+        int cap = seq_len;
+        int is_local = 0;
+
+        if (even && W_even > 0) {
+            is_local = 1;
+            cap = std::min(W_even, seq_len);
+        } else if (!even && odd_window > 0 && odd_window < seq_len) {
+            is_local = 1;
+            cap = odd_window;
+        } else {
+            is_local = 0;
+            cap = seq_len; // dense (full context)
+        }
+
+        h_is_local[l] = is_local;
+        h_cap[l] = cap;
         // pack (B, T_cap, kv_dim)
-        h_off[l + 1] = h_off[l] + (long long)batch_size * h_cap[l] * kv_dim;
+        h_off[l + 1] = h_off[l] + (long long)batch_size * cap * kv_dim;
     }
     const size_t kv_elems_total = (size_t)h_off.back();
     const size_t kv_bytes_total = kv_elems_total * elem_sz;

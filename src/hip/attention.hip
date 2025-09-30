@@ -117,14 +117,14 @@ __global__ void fa2_decode_br4_head64(
     const int Lb    = pos_b + 1;
 
     const int  local = d_layer_is_local[layer_idx];
-    const bool local_nomask = (local != 0) && !USE_MASK && (sliding_window > 0) && ((layer_idx & 1) == 0);
-    const int  t_window_start = local_nomask ? max(0, pos_b - sliding_window + 1) : 0;
-    const int  t_start = local_nomask ? t_window_start : 0;
-    const int  t_end   = Lb;
-
     const long long kv_base = d_layer_kv_off[layer_idx];
     const int       cap     = d_layer_kv_cap[layer_idx];
     const bool      cap_pow2= is_pow2_int(cap);
+
+    const bool local_nomask = (local != 0) && !USE_MASK;
+    const int  t_window_start = local_nomask ? max(0, pos_b - cap + 1) : 0;
+    const int  t_start = local_nomask ? t_window_start : 0;
+    const int  t_end   = Lb;
 
     const int  gb = d_batch_indices[b];
     const long long batch_off_elems = kv_base + (long long)gb * (long long)cap * kv_dim;
