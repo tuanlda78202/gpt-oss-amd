@@ -245,58 +245,97 @@ __global__ void fa2_decode_br4_head64(
         }
         wave_sync();
 
-        __shared__ float sc0, il0, mn0_sh;
-        if (lane == 0) { float mp=m0_sh; float mn=fmaxf(mp, m_tile0); mn0_sh=mn; }
-        wave_sync();
-        float mn0 = __shfl(mn0_sh, 0, REDW);
-        float part0 = 0.0f; for (int r = lane; r < bc; r += REDW) part0 += __expf(s0[r] - mn0);
-        float sum0 = wave_reduce_sum_width<REDW>(part0);
-        if (lane == 0) {
-            float mp=m0_sh, lp=l0_sh; float a=__expf(mp - mn0); float ln=a*lp + sum0;
-            sc0 = (ln>0.0f)? (a*lp)/ln : 0.0f; il0 = (ln>0.0f)? 1.0f/ln : 0.0f; m0_sh=mn0; l0_sh=ln;
-        }
-        wave_sync();
+        float s_sc0 = 0.0f, s_sc1 = 0.0f, s_sc2 = 0.0f, s_sc3 = 0.0f;
+        float s_il0 = 0.0f, s_il1 = 0.0f, s_il2 = 0.0f, s_il3 = 0.0f;
+        float s_mn0 = -std::numeric_limits<float>::infinity();
+        float s_mn1 = -std::numeric_limits<float>::infinity();
+        float s_mn2 = -std::numeric_limits<float>::infinity();
+        float s_mn3 = -std::numeric_limits<float>::infinity();
 
-        __shared__ float sc1, il1, mn1_sh;
-        if (lane == 0) { float mp=m1_sh; float mn=fmaxf(mp, m_tile1); mn1_sh=mn; }
-        wave_sync();
-        float mn1 = __shfl(mn1_sh, 0, REDW);
-        float part1 = 0.0f; for (int r = lane; r < bc; r += REDW) part1 += __expf(s1[r] - mn1);
-        float sum1 = wave_reduce_sum_width<REDW>(part1);
-        if (lane == 0) {
-            float mp=m1_sh, lp=l1_sh; float a=__expf(mp - mn1); float ln=a*lp + sum1;
-            sc1 = (ln>0.0f)? (a*lp)/ln : 0.0f; il1 = (ln>0.0f)? 1.0f/ln : 0.0f; m1_sh=mn1; l1_sh=ln;
+        {
+            float mn_local = (lane == 0) ? fmaxf(m0_sh, m_tile0) : -std::numeric_limits<float>::infinity();
+            float mn = __shfl(mn_local, 0, REDW);
+            float part = 0.0f;
+            if (lane < REDW) {
+                for (int r = lane; r < bc; r += REDW) part += __expf(s0[r] - mn);
+            }
+            float sum = wave_reduce_sum_width<REDW>(part);
+            float sc_lane = 0.0f;
+            float il_lane = 0.0f;
+            if (lane == 0) {
+                float mp = m0_sh, lp = l0_sh; float a = __expf(mp - mn); float ln = a * lp + sum;
+                sc_lane = (ln > 0.0f) ? (a * lp) / ln : 0.0f;
+                il_lane = (ln > 0.0f) ? 1.0f / ln : 0.0f;
+                m0_sh = mn; l0_sh = ln;
+            }
+            s_sc0 = __shfl(sc_lane, 0, REDW);
+            s_il0 = __shfl(il_lane, 0, REDW);
+            s_mn0 = mn;
         }
-        wave_sync();
 
-        __shared__ float sc2, il2, mn2_sh;
-        if (lane == 0) { float mp=m2_sh; float mn=fmaxf(mp, m_tile2); mn2_sh=mn; }
-        wave_sync();
-        float mn2 = __shfl(mn2_sh, 0, REDW);
-        float part2 = 0.0f; for (int r = lane; r < bc; r += REDW) part2 += __expf(s2[r] - mn2);
-        float sum2 = wave_reduce_sum_width<REDW>(part2);
-        if (lane == 0) {
-            float mp=m2_sh, lp=l2_sh; float a=__expf(mp - mn2); float ln=a*lp + sum2;
-            sc2 = (ln>0.0f)? (a*lp)/ln : 0.0f; il2 = (ln>0.0f)? 1.0f/ln : 0.0f; m2_sh=mn2; l2_sh=ln;
+        {
+            float mn_local = (lane == 0) ? fmaxf(m1_sh, m_tile1) : -std::numeric_limits<float>::infinity();
+            float mn = __shfl(mn_local, 0, REDW);
+            float part = 0.0f;
+            if (lane < REDW) {
+                for (int r = lane; r < bc; r += REDW) part += __expf(s1[r] - mn);
+            }
+            float sum = wave_reduce_sum_width<REDW>(part);
+            float sc_lane = 0.0f;
+            float il_lane = 0.0f;
+            if (lane == 0) {
+                float mp = m1_sh, lp = l1_sh; float a = __expf(mp - mn); float ln = a * lp + sum;
+                sc_lane = (ln > 0.0f) ? (a * lp) / ln : 0.0f;
+                il_lane = (ln > 0.0f) ? 1.0f / ln : 0.0f;
+                m1_sh = mn; l1_sh = ln;
+            }
+            s_sc1 = __shfl(sc_lane, 0, REDW);
+            s_il1 = __shfl(il_lane, 0, REDW);
+            s_mn1 = mn;
         }
-        wave_sync();
 
-        __shared__ float sc3, il3, mn3_sh;
-        if (lane == 0) { float mp=m3_sh; float mn=fmaxf(mp, m_tile3); mn3_sh=mn; }
-        wave_sync();
-        float mn3 = __shfl(mn3_sh, 0, REDW);
-        float part3 = 0.0f; for (int r = lane; r < bc; r += REDW) part3 += __expf(s3[r] - mn3);
-        float sum3 = wave_reduce_sum_width<REDW>(part3);
-        if (lane == 0) {
-            float mp=m3_sh, lp=l3_sh; float a=__expf(mp - mn3); float ln=a*lp + sum3;
-            sc3 = (ln>0.0f)? (a*lp)/ln : 0.0f; il3 = (ln>0.0f)? 1.0f/ln : 0.0f; m3_sh=mn3; l3_sh=ln;
+        {
+            float mn_local = (lane == 0) ? fmaxf(m2_sh, m_tile2) : -std::numeric_limits<float>::infinity();
+            float mn = __shfl(mn_local, 0, REDW);
+            float part = 0.0f;
+            if (lane < REDW) {
+                for (int r = lane; r < bc; r += REDW) part += __expf(s2[r] - mn);
+            }
+            float sum = wave_reduce_sum_width<REDW>(part);
+            float sc_lane = 0.0f;
+            float il_lane = 0.0f;
+            if (lane == 0) {
+                float mp = m2_sh, lp = l2_sh; float a = __expf(mp - mn); float ln = a * lp + sum;
+                sc_lane = (ln > 0.0f) ? (a * lp) / ln : 0.0f;
+                il_lane = (ln > 0.0f) ? 1.0f / ln : 0.0f;
+                m2_sh = mn; l2_sh = ln;
+            }
+            s_sc2 = __shfl(sc_lane, 0, REDW);
+            s_il2 = __shfl(il_lane, 0, REDW);
+            s_mn2 = mn;
         }
-        wave_sync();
 
-        const float s_sc0 = __shfl(sc0, 0, REDW);
-        const float s_sc1 = __shfl(sc1, 0, REDW);
-        const float s_sc2 = __shfl(sc2, 0, REDW);
-        const float s_sc3 = __shfl(sc3, 0, REDW);
+        {
+            float mn_local = (lane == 0) ? fmaxf(m3_sh, m_tile3) : -std::numeric_limits<float>::infinity();
+            float mn = __shfl(mn_local, 0, REDW);
+            float part = 0.0f;
+            if (lane < REDW) {
+                for (int r = lane; r < bc; r += REDW) part += __expf(s3[r] - mn);
+            }
+            float sum = wave_reduce_sum_width<REDW>(part);
+            float sc_lane = 0.0f;
+            float il_lane = 0.0f;
+            if (lane == 0) {
+                float mp = m3_sh, lp = l3_sh; float a = __expf(mp - mn); float ln = a * lp + sum;
+                sc_lane = (ln > 0.0f) ? (a * lp) / ln : 0.0f;
+                il_lane = (ln > 0.0f) ? 1.0f / ln : 0.0f;
+                m3_sh = mn; l3_sh = ln;
+            }
+            s_sc3 = __shfl(sc_lane, 0, REDW);
+            s_il3 = __shfl(il_lane, 0, REDW);
+            s_mn3 = mn;
+        }
+
         if constexpr (std::is_same<KV_T,float>::value) {
             if (lane < 64) { o0r *= s_sc0; o1r *= s_sc1; o2r *= s_sc2; o3r *= s_sc3; }
         } else {
@@ -306,14 +345,15 @@ __global__ void fa2_decode_br4_head64(
             }
         }
 
-        const float s_il0 = __shfl(il0, 0, REDW);
-        const float s_il1 = __shfl(il1, 0, REDW);
-        const float s_il2 = __shfl(il2, 0, REDW);
-        const float s_il3 = __shfl(il3, 0, REDW);
-        const float s_mn0 = __shfl(mn0_sh, 0, REDW);
-        const float s_mn1 = __shfl(mn1_sh, 0, REDW);
-        const float s_mn2 = __shfl(mn2_sh, 0, REDW);
-        const float s_mn3 = __shfl(mn3_sh, 0, REDW);
+        if (lane < REDW) {
+            for (int r = lane; r < bc; r += REDW) {
+                s0[r] = __expf(s0[r] - s_mn0) * s_il0;
+                s1[r] = __expf(s1[r] - s_mn1) * s_il1;
+                s2[r] = __expf(s2[r] - s_mn2) * s_il2;
+                s3[r] = __expf(s3[r] - s_mn3) * s_il3;
+            }
+        }
+        wave_sync();
 
         #pragma unroll 1
         for (int r = 0; r < bc; ++r) {
@@ -321,17 +361,10 @@ __global__ void fa2_decode_br4_head64(
             const int rt = (local != 0) ? (cap_pow2 ? (t & (cap - 1)) : (t % cap)) : t;
             const char* __restrict__ vp_bytes = v_layer_base + (long long)rt * step_bytes + head_off_bytes;
 
-            float w0f, w1f, w2f, w3f;
-            if (lane == 0) {
-                w0f = __expf(s0[r] - s_mn0) * s_il0;
-                w1f = __expf(s1[r] - s_mn1) * s_il1;
-                w2f = __expf(s2[r] - s_mn2) * s_il2;
-                w3f = __expf(s3[r] - s_mn3) * s_il3;
-            }
-            w0f = __shfl(w0f, 0, REDW);
-            w1f = __shfl(w1f, 0, REDW);
-            w2f = __shfl(w2f, 0, REDW);
-            w3f = __shfl(w3f, 0, REDW);
+            const float w0f = s0[r];
+            const float w1f = s1[r];
+            const float w2f = s2[r];
+            const float w3f = s3[r];
 
             if constexpr (std::is_same<KV_T,float>::value) {
                 const float* __restrict__ v_head = reinterpret_cast<const float*>(vp_bytes);
