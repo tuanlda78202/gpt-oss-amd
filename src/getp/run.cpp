@@ -29,6 +29,7 @@ struct ThreadLocalBatchBuffers {
     int* sample_results_h = nullptr;
     int* sample_owner = nullptr;
     int* sample_slots = nullptr;
+    int* sample_slots_d = nullptr;
 };
 
 struct ThreadLocalRequestBuffers {
@@ -56,6 +57,10 @@ static void ensure_batch_buffers(int required) {
         CHECK_HIP(hipFree(buf.sample_results_d));
         buf.sample_results_d = nullptr;
     }
+    if (buf.sample_slots_d) {
+        CHECK_HIP(hipFree(buf.sample_slots_d));
+        buf.sample_slots_d = nullptr;
+    }
     release_host(buf.tokens);
     release_host(buf.positions);
     release_host(buf.indices);
@@ -74,6 +79,7 @@ static void ensure_batch_buffers(int required) {
     CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.positions), required * sizeof(int)));
     CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.indices), required * sizeof(int)));
     CHECK_HIP(hipMalloc(&buf.sample_results_d, required * sizeof(int)));
+    CHECK_HIP(hipMalloc(&buf.sample_slots_d, required * sizeof(int)));
     CHECK_HIP(
         hipHostMalloc(reinterpret_cast<void**>(&buf.sample_results_h), required * sizeof(int)));
 
@@ -261,6 +267,11 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     int* sample_results_h = buffers.sample_results_h;
     int* sample_results_d = buffers.sample_results_d;
 
+    static thread_local hipStream_t s_sampling = nullptr;
+    if (!s_sampling) {
+        CHECK_HIP(hipStreamCreateWithFlags(&s_sampling, hipStreamNonBlocking));
+    }
+
     // Encode all prompts in the batch
     int** prompt_tokens = (int**)malloc(batch_size * sizeof(int*));
     int* num_prompt_tokens = (int*)malloc(batch_size * sizeof(int));
@@ -379,13 +390,19 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         }
 
         if (use_async_sampling && pending_samples > 0) {
-            for (int s = 0; s < pending_samples; ++s) {
-                float* seq_logits = batch_logits + sample_slots[s] * t_d->config.vocab_size;
-                sample_argmax(seq_logits, t_d->config.vocab_size, sample_results_d + s);
-            }
+            CHECK_HIP(hipMemcpyAsync(buffers.sample_slots_d, sample_slots,
+                                     pending_samples * sizeof(int), hipMemcpyHostToDevice,
+                                     s_sampling));
+
+            sample_argmax_batched(batch_logits, t_d->config.vocab_size, buffers.sample_slots_d,
+                                  pending_samples, sample_results_d, s_sampling);
+
             CHECK_HIP(hipMemcpyAsync(sample_results_h, sample_results_d,
-                                     pending_samples * sizeof(int), hipMemcpyDeviceToHost, 0));
-            CHECK_HIP(hipStreamSynchronize(0));
+                                     pending_samples * sizeof(int), hipMemcpyDeviceToHost,
+                                     s_sampling));
+
+            CHECK_HIP(hipStreamSynchronize(s_sampling));
+
             for (int s = 0; s < pending_samples; ++s) {
                 int b_idx = sample_owner[s];
                 int next_token = sample_results_h[s];
