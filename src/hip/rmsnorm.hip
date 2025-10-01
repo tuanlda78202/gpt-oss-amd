@@ -36,10 +36,10 @@ __global__ void rmsnorm_kernel(float* o_batch, float* x_batch, __hip_bfloat16* w
     }
 }
 
-void rmsnorm(float* o_batch, float* x_batch, __hip_bfloat16* weight, int batch_size, int size) {
+void rmsnorm(float* o_batch, float* x_batch, __hip_bfloat16* weight, int batch_size, int size, hipStream_t stream) {
     dim3 blockDim(1024);
     dim3 gridDim(batch_size);
-    hipLaunchKernelGGL(rmsnorm_kernel, gridDim, blockDim, 0, 0, o_batch, x_batch, weight, batch_size, size);
+    hipLaunchKernelGGL(rmsnorm_kernel, gridDim, blockDim, 0, stream, o_batch, x_batch, weight, batch_size, size);
 
     CHECK_HIP(hipGetLastError());
 }

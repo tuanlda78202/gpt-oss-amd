@@ -169,23 +169,45 @@ typedef struct {
     float* sin_vals;      // (head_dim/2) - persistent RoPE sin coefficients
 
     //  MoE expert-batching scratch buffers
-    int* assign_expert;    // [B*K] - expert assignment per token
-    int* assign_token;     // [B*K] - token index per assignment
-    float* assign_weight;  // [B*K] - router weight per assignment
-    int* expert_counts;    // [E] - tokens per expert (temp/reused as counters)
-    int* expert_offsets;   // [E+1] - exclusive prefix sum of expert_counts
-    int* tokens_flat;      // [B*K] - tokens grouped by expert
-    float* weights_flat;   // [B*K] - weights grouped by expert
-    float* x_by_expert;    // [B*K, H] - gathered input by expert
-    float* mlp1_by_expert; // [B*K, 2*I] - MLP1 output by expert
-    float* gate_by_expert; // [B*K, I] - gate values by expert
-    float* up_by_expert;   // [B*K, I] - up values by expert
-    float* y_by_expert;    // [B*K, H] - final output by expert
+    int* assign_expert;      // [B*K] - expert assignment per token
+    int* assign_token;       // [B*K] - token index per assignment
+    float* assign_weight;    // [B*K] - router weight per assignment
+    int* expert_counts;      // [E] - tokens per expert (temp/reused as counters)
+    int* expert_offsets;     // [E+1] - exclusive prefix sum of expert_counts
+    int* tokens_flat;        // [B*K] - tokens grouped by expert
+    float* weights_flat;     // [B*K] - weights grouped by expert
+    float* x_by_expert;      // [B*K, H] - gathered input by expert
+    float* mlp1_by_expert;   // [B*K, 2*I] - MLP1 output by expert
+    float* gate_by_expert;   // [B*K, I] - gate values by expert
+    float* up_by_expert;     // [B*K, I] - up values by expert
+    float* y_by_expert;      // [B*K, H] - final output by expert
+    int* d_wq_heavy;         // persistent MoE heavy bucket queue buffer [3*E]
+    int* d_wq_light;         // persistent MoE light bucket queue buffer [3*E]
+    int d_wq_heavy_capacity; // number of ints allocated for heavy queue
+    int d_wq_light_capacity; // number of ints allocated for light queue
 
     // Attention workspace buffers
     float* fa_partial_O; // Workspace for flash attention partial outputs
     float* fa_partial_m; // Workspace for flash attention partial max values
     float* fa_partial_l; // Workspace for flash attention partial normalizers
+
+    // Host-side copies and staging for overlap orchestration
+    int* h_layer_kv_cap;   // host view of per-layer kv capacities (immutable)
+    int* h_layer_is_local; // host view of per-layer locality flags (immutable)
+
+    int* h_tokens_staging[2];        // double-buffered pinned H2D staging (tokens)
+    int* h_pos_staging[2];           // double-buffered pinned H2D staging (positions)
+    int* h_batch_indices_staging[2]; // double-buffered pinned H2D staging (batch indices)
+    hipEvent_t h2d_stage_copied[2];  // events signalling copy completion per staging slot
+    int h2d_stage_capacity;          // number of elements each staging buffer can hold
+    int h2d_stage_cursor;            // ping-pong slot selector for staging reuse
+
+    // HIP graph capture handles (optional execution replay)
+    bool forward_graph_enabled;        // set via env/config to request graph capture
+    bool forward_graph_ready;          // true once graph has been captured/instantiated
+    hipGraph_t forward_graph;          // captured graph for forward path
+    hipGraphExec_t forward_graph_exec; // executable graph instance
+    int forward_graph_batch_size;      // batch size used for capture (for validation)
 } OssRunState;
 
 // ! Main Transformer struct

@@ -184,9 +184,9 @@ __global__ void gemm_bf16_f32_mfma_qkv(const __hip_bfloat16* __restrict__ A,    
 }
 
 void gemm_qkv(float* xout, const float* x_batch, const __hip_bfloat16* w,
-              const __hip_bfloat16* bias, int N, int K, int M) {
+              const __hip_bfloat16* bias, int N, int K, int M, hipStream_t stream) {
     dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 256));
     dim3 block(1024, 1, 1);
 
-    gemm_bf16_f32_mfma_qkv<<<grid, block>>>(w, x_batch, xout, bias, M, N, K);
+    gemm_bf16_f32_mfma_qkv<<<grid, block, 0, stream>>>(w, x_batch, xout, bias, M, N, K);
 }
