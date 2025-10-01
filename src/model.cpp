@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
@@ -65,6 +66,32 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     OssConfig* conf = &t_fp32->config;
     OssTransformerWeights* weights = &t_fp32->weights;
     OssRunState* state = &t_fp32->state;
+    OssRunState* state_d = &t_d->state;
+
+    // Initialize extended runtime bookkeeping for the device copy
+    state_d->h_layer_kv_cap = nullptr;
+    state_d->h_layer_is_local = nullptr;
+    state_d->h2d_stage_capacity = conf->batch_size;
+    state_d->h2d_stage_cursor = 0;
+    for (int i = 0; i < 2; ++i) {
+        state_d->h_tokens_staging[i] = nullptr;
+        state_d->h_pos_staging[i] = nullptr;
+        state_d->h_batch_indices_staging[i] = nullptr;
+        state_d->h2d_stage_copied[i] = nullptr;
+    }
+    state_d->d_wq_heavy = nullptr;
+    state_d->d_wq_light = nullptr;
+    state_d->d_wq_heavy_capacity = 0;
+    state_d->d_wq_light_capacity = 0;
+    state_d->forward_graph_enabled = false;
+    state_d->forward_graph_ready = false;
+    state_d->forward_graph = nullptr;
+    state_d->forward_graph_exec = nullptr;
+    state_d->forward_graph_batch_size = 0;
+
+    if (const char* graph_env = std::getenv("OSS_ENABLE_HIP_GRAPH")) {
+        state_d->forward_graph_enabled = (std::atoi(graph_env) != 0);
+    }
 
     int vocab_size = conf->vocab_size;
     int hidden_dim = conf->hidden_dim;
@@ -197,6 +224,17 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         // pack (B, T_cap, kv_dim)
         h_off[l + 1] = h_off[l] + (long long)batch_size * cap * kv_dim;
     }
+    if (n_layers > 0) {
+        state_d->h_layer_kv_cap = (int*)malloc((size_t)n_layers * sizeof(int));
+        state_d->h_layer_is_local = (int*)malloc((size_t)n_layers * sizeof(int));
+        if (!state_d->h_layer_kv_cap || !state_d->h_layer_is_local) {
+            fprintf(stderr, "Failed to allocate host layer metadata buffers\n");
+            exit(EXIT_FAILURE);
+        }
+        std::memcpy(state_d->h_layer_kv_cap, h_cap.data(), (size_t)n_layers * sizeof(int));
+        std::memcpy(state_d->h_layer_is_local, h_is_local.data(), (size_t)n_layers * sizeof(int));
+    }
+
     const size_t kv_elems_total = (size_t)h_off.back();
     const size_t kv_bytes_total = kv_elems_total * elem_sz;
 
@@ -228,6 +266,16 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.d_tokens, (size_t)batch_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.d_pos_per_token, (size_t)batch_size * sizeof(int)));
+    for (int i = 0; i < 2; ++i) {
+        CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&state_d->h_tokens_staging[i]),
+                                (size_t)batch_size * sizeof(int), hipHostMallocDefault));
+        CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&state_d->h_pos_staging[i]),
+                                (size_t)batch_size * sizeof(int), hipHostMallocDefault));
+        CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&state_d->h_batch_indices_staging[i]),
+                                (size_t)batch_size * sizeof(int), hipHostMallocDefault));
+        CHECK_HIP(hipEventCreateWithFlags(&state_d->h2d_stage_copied[i], hipEventDisableTiming));
+        CHECK_HIP(hipEventRecord(state_d->h2d_stage_copied[i], 0));
+    }
     CHECK_HIP(hipMalloc(&t_d->state.cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
 
@@ -248,6 +296,11 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(
         hipMalloc(&t_d->state.up_by_expert, (size_t)BK_max * intermediate_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.y_by_expert, (size_t)BK_max * hidden_dim * sizeof(float)));
+    const size_t wq_ints = (size_t)n_experts * 3;
+    CHECK_HIP(hipMalloc(&state_d->d_wq_heavy, wq_ints * sizeof(int)));
+    CHECK_HIP(hipMalloc(&state_d->d_wq_light, wq_ints * sizeof(int)));
+    state_d->d_wq_heavy_capacity = (int)wq_ints;
+    state_d->d_wq_light_capacity = (int)wq_ints;
 
     int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
     size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
@@ -430,9 +483,56 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.gate_by_expert));
     CHECK_HIP(hipFree(t_d->state.up_by_expert));
     CHECK_HIP(hipFree(t_d->state.y_by_expert));
+    if (t_d->state.d_wq_heavy) {
+        CHECK_HIP(hipFree(t_d->state.d_wq_heavy));
+        t_d->state.d_wq_heavy = nullptr;
+        t_d->state.d_wq_heavy_capacity = 0;
+    }
+    if (t_d->state.d_wq_light) {
+        CHECK_HIP(hipFree(t_d->state.d_wq_light));
+        t_d->state.d_wq_light = nullptr;
+        t_d->state.d_wq_light_capacity = 0;
+    }
     CHECK_HIP(hipFree(t_d->state.fa_partial_O));
     CHECK_HIP(hipFree(t_d->state.fa_partial_m));
     CHECK_HIP(hipFree(t_d->state.fa_partial_l));
+
+    for (int i = 0; i < 2; ++i) {
+        if (t_d->state.h_tokens_staging[i]) {
+            CHECK_HIP(hipHostFree(t_d->state.h_tokens_staging[i]));
+            t_d->state.h_tokens_staging[i] = nullptr;
+        }
+        if (t_d->state.h_pos_staging[i]) {
+            CHECK_HIP(hipHostFree(t_d->state.h_pos_staging[i]));
+            t_d->state.h_pos_staging[i] = nullptr;
+        }
+        if (t_d->state.h_batch_indices_staging[i]) {
+            CHECK_HIP(hipHostFree(t_d->state.h_batch_indices_staging[i]));
+            t_d->state.h_batch_indices_staging[i] = nullptr;
+        }
+        if (t_d->state.h2d_stage_copied[i]) {
+            CHECK_HIP(hipEventDestroy(t_d->state.h2d_stage_copied[i]));
+            t_d->state.h2d_stage_copied[i] = nullptr;
+        }
+    }
+
+    if (t_d->state.h_layer_kv_cap) {
+        free(t_d->state.h_layer_kv_cap);
+        t_d->state.h_layer_kv_cap = nullptr;
+    }
+    if (t_d->state.h_layer_is_local) {
+        free(t_d->state.h_layer_is_local);
+        t_d->state.h_layer_is_local = nullptr;
+    }
+
+    if (t_d->state.forward_graph_exec) {
+        CHECK_HIP(hipGraphExecDestroy(t_d->state.forward_graph_exec));
+        t_d->state.forward_graph_exec = nullptr;
+    }
+    if (t_d->state.forward_graph) {
+        CHECK_HIP(hipGraphDestroy(t_d->state.forward_graph));
+        t_d->state.forward_graph = nullptr;
+    }
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));

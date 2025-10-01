@@ -169,9 +169,9 @@ __global__ void gemm_bf16_f32_mfma_logits(const __hip_bfloat16* __restrict__ A, 
     }
 }
 
-void gemm_logits(float* xout, const float* x_batch, const __hip_bfloat16* w, int N, int K, int M) {
+void gemm_logits(float* xout, const float* x_batch, const __hip_bfloat16* w, int N, int K, int M, hipStream_t stream) {
     dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 256));
     dim3 block(1024, 1, 1);
 
-    gemm_bf16_f32_mfma_logits<<<grid, block>>>(w, x_batch, xout, M, N, K);
+    gemm_bf16_f32_mfma_logits<<<grid, block, 0, stream>>>(w, x_batch, xout, M, N, K);
 }

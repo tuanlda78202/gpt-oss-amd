@@ -57,7 +57,8 @@ void embed(float* x_batch,
                      __hip_bfloat16* emb_table,
                      int* tokens,
                      int batch_size,
-                     int hidden_dim)
+                     int hidden_dim,
+                     hipStream_t stream)
 {
     const int threads = 256;
 
@@ -66,7 +67,7 @@ void embed(float* x_batch,
         dim3 block(threads);
         dim3 grid((hidden_dim / VEC + threads - 1) / threads, batch_size);
         hipLaunchKernelGGL((embed_kernel_vec<VEC>),
-                           grid, block, 0, 0,
+                           grid, block, 0, stream,
                            (const __hip_bfloat16*)emb_table, (const int*)tokens, x_batch,
                            batch_size, hidden_dim);
     } else if ((hidden_dim & 1) == 0) {
@@ -74,14 +75,14 @@ void embed(float* x_batch,
         dim3 block(threads);
         dim3 grid((hidden_dim / VEC + threads - 1) / threads, batch_size);
         hipLaunchKernelGGL((embed_kernel_vec<VEC>),
-                           grid, block, 0, 0,
+                           grid, block, 0, stream,
                            (const __hip_bfloat16*)emb_table, (const int*)tokens, x_batch,
                            batch_size, hidden_dim);
     } else {
         dim3 block(threads);
         dim3 grid((hidden_dim + threads - 1) / threads, batch_size);
         hipLaunchKernelGGL(embed_kernel_scalar,
-                           grid, block, 0, 0,
+                           grid, block, 0, stream,
                            (const __hip_bfloat16*)emb_table, (const int*)tokens, x_batch,
                            batch_size, hidden_dim);
     }

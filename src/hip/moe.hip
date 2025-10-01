@@ -252,7 +252,7 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
     dim3 block(64 * WAVES, 1, 1); // 1024 threads
     dim3 grid(grid_x, grid_y, work_count);
 
-    moe_mlp1_swiglu_mfma_kernel<<<grid, block>>>(
+    moe_mlp1_swiglu_mfma_kernel<<<grid, block, 0, stream>>>(
         work_queue, work_start, work_count, x_by_expert, gate_by_expert, weights_base, bias_base, H,
         I, expert_weight_stride, expert_bias_stride, alpha, swiglu_limit);
 }
@@ -520,7 +520,7 @@ inline void moe_mlp2_scatter(const int* work_queue, int work_start, int work_cou
     dim3 block(64 * WAVES, 1, 1);
     dim3 grid(grid_x, grid_y, work_count);
 
-    moe_mlp2_scatter_mfma_kernel<<<grid, block>>>(
+    moe_mlp2_scatter_mfma_kernel<<<grid, block, 0, stream>>>(
         work_queue, work_start, work_count, gate_by_expert, tokens_flat, weights_flat, e_agg,
         weights_base, bias_base, I, H, expert_weight_stride, expert_bias_stride);
 }

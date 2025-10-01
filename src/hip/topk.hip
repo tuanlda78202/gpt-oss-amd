@@ -59,7 +59,7 @@ __global__ void topk_kernel(float* router_scores, float* topk_values, int* topk_
 }
 
 void topk(float* topk_values, int* topk_indices, float* router_scores,
-                    int batch_size, int num_experts, int experts_per_token) {
+                    int batch_size, int num_experts, int experts_per_token, hipStream_t stream = 0) {
     if (num_experts > 1024) {
         fprintf(stderr, "TOPK BATCH DEVICE Warning: num_experts=%d exceeds 1024\n", num_experts);
         return;
@@ -67,7 +67,7 @@ void topk(float* topk_values, int* topk_indices, float* router_scores,
 
     dim3 blockDim(1024);
     dim3 gridDim(batch_size);
-    hipLaunchKernelGGL(topk_kernel, gridDim, blockDim, 0, 0,
+    hipLaunchKernelGGL(topk_kernel, gridDim, blockDim, 0, stream,
                        router_scores, topk_values, topk_indices,
                        batch_size, num_experts, experts_per_token);
     CHECK_HIP(hipGetLastError());

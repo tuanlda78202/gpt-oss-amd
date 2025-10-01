@@ -26,7 +26,7 @@ __global__ void count_tokens_per_expert(
 }
 
 __global__ void exclusive_scan_expert_offsets(
-    const int* __restrict__ counts, int* __restrict__ offsets, int E)
+    int* __restrict__ counts, int* __restrict__ offsets, int E)
 {
     if (threadIdx.x == 0) {
         int acc = 0;
@@ -36,6 +36,7 @@ __global__ void exclusive_scan_expert_offsets(
             int c = counts[i];
             acc += c;
             offsets[i+1] = acc;
+            counts[i] = 0;
         }
     }
 }
