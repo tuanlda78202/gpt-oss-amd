@@ -50,9 +50,10 @@ __device__ float gpu_random_f32(unsigned long long* state) {
 }
 
 __global__ void multinomial_sample_kernel(float* probabilities, int vocab_size,
-                                        unsigned long long seed, int* result) {
+                                          unsigned long long seed, int* result) {
     int tid = threadIdx.x;
-    if (tid != 0) return;  // Only thread 0 does sampling
+    if (tid != 0)
+        return; // Only thread 0 does sampling
 
     unsigned long long rng_state = seed + blockIdx.x;
     float coin = gpu_random_f32(&rng_state);
@@ -75,20 +76,20 @@ __global__ void temperature_scale_kernel(float* logits, int vocab_size, float te
     }
 }
 
-void sample_argmax(float* logits, int vocab_size, int* result_d) {
+void sample_argmax(float* logits, int vocab_size, int* result_d, hipStream_t stream = nullptr) {
     dim3 block(1024);
     dim3 grid(1);
-    hipLaunchKernelGGL(argmax_kernel, grid, block, 0, 0, logits, vocab_size, result_d);
+    hipLaunchKernelGGL(argmax_kernel, grid, block, 0, stream, logits, vocab_size, result_d);
     CHECK_HIP(hipGetLastError());
 }
 
-void sample_multinomial(float* logits, int vocab_size, float temperature,
-                                   unsigned long long seed, int* result_d) {
+void sample_multinomial(float* logits, int vocab_size, float temperature, unsigned long long seed,
+                        int* result_d) {
     if (temperature != 1.0f) {
         dim3 temp_block(256);
         dim3 temp_grid((vocab_size + 255) / 256);
-        hipLaunchKernelGGL(temperature_scale_kernel, temp_grid, temp_block, 0, 0,
-                          logits, vocab_size, temperature);
+        hipLaunchKernelGGL(temperature_scale_kernel, temp_grid, temp_block, 0, 0, logits,
+                           vocab_size, temperature);
     }
 
     // Apply softmax
@@ -97,7 +98,7 @@ void sample_multinomial(float* logits, int vocab_size, float temperature,
     // Sample
     dim3 block(256);
     dim3 grid(1);
-    hipLaunchKernelGGL(multinomial_sample_kernel, grid, block, 0, 0,
-                      logits, vocab_size, seed, result_d);
+    hipLaunchKernelGGL(multinomial_sample_kernel, grid, block, 0, 0, logits, vocab_size, seed,
+                       result_d);
     CHECK_HIP(hipGetLastError());
 }

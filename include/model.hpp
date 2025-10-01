@@ -228,4 +228,47 @@ typedef struct {
     int fd;                                // file descriptor for memory mapping
     float* data;                           // memory mapped data pointer
     ssize_t file_size;                     // size of the checkpoint file in bytes
+
+    // Expert-parallel metadata
+    int device_id;        // HIP device hosting this shard
+    int ep_size;          // number of shards in the expert-parallel group
+    int ep_rank;          // shard rank within the group
+    int ep_local_experts; // number of experts owned by this shard
+    int ep_expert_offset; // global expert offset for this shard
+    int dp_rank;          // data-parallel replica rank owning this shard
+
+    hipStream_t* ep_aggregate_streams; // per-shard aggregation streams on the primary device
+    hipEvent_t* ep_aggregate_events;   // per-stream completion events for fan-in to stream 0
+    float** ep_remote_buffers;         // per-shard scratch buffers for remote contributions
+    size_t ep_remote_buffer_bytes;     // size in bytes of each per-shard scratch buffer
 } OssTransformerHybrid;
+
+typedef struct {
+    float* x_by_expert;
+    float* mlp1_by_expert;
+    float* gate_by_expert;
+    float* y_by_expert;
+    int* tokens_by_expert;
+    float* weights_by_expert;
+    float* e_by_token;
+    int capacity_tokens;
+    int capacity_batch;
+    int* work_queue;
+    int work_queue_capacity;
+} OssExpertWorkspace;
+
+typedef struct {
+    OssTransformerHybrid* model;    // shard-local transformer instance
+    int device_id;                  // HIP device for this shard
+    OssExpertWorkspace* workspaces; // per-DP workspaces
+    hipStream_t* streams;           // per-DP non-blocking streams
+    void** mutex_handles;           // per-DP mutex guards
+    int workspace_count;            // number of per-DP workspaces
+} OssExpertShard;
+
+typedef struct {
+    OssExpertShard** shards; // array of shard descriptors (shared across groups)
+    int dp_rank;             // owning data-parallel replica rank
+    int ep_size;             // number of shards in this group
+    int primary_shard_index; // index within shards corresponding to primary device (-1 if none)
+} OssExpertParallelGroup;
