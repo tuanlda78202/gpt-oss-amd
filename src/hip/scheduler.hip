@@ -1,5 +1,13 @@
 #include "BLAS.hip"
 
+struct MoEStats {
+    int heavy_count;
+    int light_count;
+    int heavy_maxNe;
+    int active_experts;
+    long long sumNe;
+};
+
 __global__ void count_tokens_per_expert(
     const int* __restrict__ topk_i,
     const float* __restrict__ topk_v,
@@ -111,4 +119,81 @@ __global__ void build_expert_work_queue(
     }
     meta[0].x = active;
     meta[0].y = maxNe;
+}
+
+// Build heavy/light work queues entirely on device.
+// Each entry is 3 ints: {expert_id, offset, Ne}
+__global__ void classify_and_build_queues(
+    const int* __restrict__ expert_offsets,
+    int E,
+    int very_sparse_cutoff,          // ADAPT_VERY_SPARSE_CUTOFF
+    float heavy_factor_sparse,       // ADAPT_HEAVY_FACTOR_SPARSE
+    float heavy_factor_default,      // ADAPT_HEAVY_FACTOR_DEFAULT
+    int* __restrict__ wq_heavy,      // [3*E]
+    int* __restrict__ wq_light,      // [3*E]
+    MoEStats* __restrict__ stats_out // single struct
+){
+    // Single CTA is plenty (E is typically small), simple loop avoids atomics.
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    // First pass: collect simple stats
+    int active = 0;
+    int maxNe  = 0;
+    long long sumNe_ll = 0;
+    for (int e = 0; e < E; ++e) {
+        int off = expert_offsets[e];
+        int ne  = expert_offsets[e+1] - off;
+        if (ne > 0) {
+            ++active;
+            sumNe_ll += ne;
+            if (ne > maxNe) maxNe = ne;
+        }
+    }
+    if (active == 0) {
+        stats_out->heavy_count = 0;
+        stats_out->light_count = 0;
+        stats_out->heavy_maxNe = 0;
+        stats_out->active_experts = 0;
+        stats_out->sumNe = 0;
+        return;
+    }
+
+    float avgNe = float(sumNe_ll) / float(active);
+    float heavy_factor = heavy_factor_default;
+    if (active <= very_sparse_cutoff) {
+        heavy_factor = 1.0f; // treat everyone heavy for 1..cutoff
+    } else if (active <= 12) {
+        heavy_factor = heavy_factor_sparse;
+    }
+    const int heavy_thresh = int(ceilf(heavy_factor * avgNe));
+
+    // Second pass: partition + pack queues
+    int heavy_count = 0;
+    int light_count = 0;
+    int heavy_max = 0;
+    for (int e = 0; e < E; ++e) {
+        int off = expert_offsets[e];
+        int ne  = expert_offsets[e+1] - off;
+        if (ne <= 0) continue;
+        if (active <= very_sparse_cutoff || ne >= heavy_thresh) {
+            int i3 = heavy_count * 3;
+            wq_heavy[i3 + 0] = e;
+            wq_heavy[i3 + 1] = off;
+            wq_heavy[i3 + 2] = ne;
+            ++heavy_count;
+            if (ne > heavy_max) heavy_max = ne;
+        } else {
+            int i3 = light_count * 3;
+            wq_light[i3 + 0] = e;
+            wq_light[i3 + 1] = off;
+            wq_light[i3 + 2] = ne;
+            ++light_count;
+        }
+    }
+
+    stats_out->heavy_count     = heavy_count;
+    stats_out->light_count     = light_count;
+    stats_out->heavy_maxNe     = heavy_max;
+    stats_out->active_experts  = active;
+    stats_out->sumNe           = sumNe_ll;
 }
