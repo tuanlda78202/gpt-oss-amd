@@ -53,7 +53,7 @@
 #define ADAPT_DEBUG 0
 #endif
 
-static int kGridCap = [] {
+static thread_local int kGridCap = [] {
     hipDeviceProp_t prop{};
     int dev = 0;
     CHECK_HIP(hipGetDevice(&dev));
@@ -63,36 +63,45 @@ static int kGridCap = [] {
 
 // --- Stream scaffolding for async execution and overlap ---
 namespace {
-hipStream_t s_compute = nullptr;   // main compute stream
-hipStream_t s_h2d = nullptr;       // host->device copies
-hipStream_t s_d2h = nullptr;       // device->host copies
-hipStream_t s_moe_heavy = nullptr; // MoE heavy bucket
-hipStream_t s_moe_light = nullptr; // MoE light bucket
-hipEvent_t evt_h2d_ready, evt_moe_heavy_done, evt_moe_light_done;
-hipEvent_t evt_meta_ready, evt_meta_done;
-hipEvent_t evt_offsets_ready, evt_offsets_done;
-hipEvent_t evt_wq_heavy_ready, evt_wq_light_ready;
+struct StreamsAndEvents {
+    hipStream_t compute = nullptr;   // main compute stream
+    hipStream_t h2d = nullptr;       // host->device copies
+    hipStream_t d2h = nullptr;       // device->host copies
+    hipStream_t moe_heavy = nullptr; // MoE heavy bucket
+    hipStream_t moe_light = nullptr; // MoE light bucket
+    hipEvent_t evt_h2d_ready = nullptr;
+    hipEvent_t evt_moe_heavy_done = nullptr;
+    hipEvent_t evt_moe_light_done = nullptr;
+    hipEvent_t evt_meta_ready = nullptr;
+    hipEvent_t evt_meta_done = nullptr;
+    hipEvent_t evt_offsets_ready = nullptr;
+    hipEvent_t evt_offsets_done = nullptr;
+    hipEvent_t evt_wq_heavy_ready = nullptr;
+    hipEvent_t evt_wq_light_ready = nullptr;
+};
+
+static thread_local StreamsAndEvents tls;
 
 void create_streams_once() {
-    if (s_compute)
+    if (tls.compute)
         return;
-    CHECK_HIP(hipStreamCreateWithFlags(&s_compute, hipStreamNonBlocking));
-    CHECK_HIP(hipStreamCreateWithFlags(&s_h2d, hipStreamNonBlocking));
-    CHECK_HIP(hipStreamCreateWithFlags(&s_d2h, hipStreamNonBlocking));
+    CHECK_HIP(hipStreamCreateWithFlags(&tls.compute, hipStreamNonBlocking));
+    CHECK_HIP(hipStreamCreateWithFlags(&tls.h2d, hipStreamNonBlocking));
+    CHECK_HIP(hipStreamCreateWithFlags(&tls.d2h, hipStreamNonBlocking));
 
     int least_priority = 0, greatest_priority = 0;
     CHECK_HIP(hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
-    CHECK_HIP(hipStreamCreateWithPriority(&s_moe_heavy, hipStreamNonBlocking, least_priority));
-    CHECK_HIP(hipStreamCreateWithPriority(&s_moe_light, hipStreamNonBlocking, greatest_priority));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_h2d_ready, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_moe_heavy_done, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_moe_light_done, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_meta_ready, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_meta_done, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_offsets_ready, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_offsets_done, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_wq_heavy_ready, hipEventDisableTiming));
-    CHECK_HIP(hipEventCreateWithFlags(&evt_wq_light_ready, hipEventDisableTiming));
+    CHECK_HIP(hipStreamCreateWithPriority(&tls.moe_heavy, hipStreamNonBlocking, least_priority));
+    CHECK_HIP(hipStreamCreateWithPriority(&tls.moe_light, hipStreamNonBlocking, greatest_priority));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_h2d_ready, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_moe_heavy_done, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_moe_light_done, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_meta_ready, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_meta_done, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_offsets_ready, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_offsets_done, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_wq_heavy_ready, hipEventDisableTiming));
+    CHECK_HIP(hipEventCreateWithFlags(&tls.evt_wq_light_ready, hipEventDisableTiming));
 }
 } // namespace
 
@@ -139,23 +148,23 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
 
     // Start H2D copies on dedicated copy stream (async thanks to persistent pinned buffers)
     CHECK_HIP(hipMemcpyAsync(s->d_tokens, s->h_tokens_staging[staging_slot], h2d_bytes,
-                             hipMemcpyHostToDevice, s_h2d));
+                             hipMemcpyHostToDevice, tls.h2d));
     CHECK_HIP(hipMemcpyAsync(s->d_pos_per_token, s->h_pos_staging[staging_slot], h2d_bytes,
-                             hipMemcpyHostToDevice, s_h2d));
+                             hipMemcpyHostToDevice, tls.h2d));
     CHECK_HIP(hipMemcpyAsync(s->d_batch_indices, s->h_batch_indices_staging[staging_slot],
-                             h2d_bytes, hipMemcpyHostToDevice, s_h2d));
-    CHECK_HIP(hipEventRecord(s->h2d_stage_copied[staging_slot], s_h2d));
-    CHECK_HIP(hipEventRecord(evt_h2d_ready, s_h2d));
+                             h2d_bytes, hipMemcpyHostToDevice, tls.h2d));
+    CHECK_HIP(hipEventRecord(s->h2d_stage_copied[staging_slot], tls.h2d));
+    CHECK_HIP(hipEventRecord(tls.evt_h2d_ready, tls.h2d));
 
     // Make compute wait only for the staged copies to finish (no global sync)
-    CHECK_HIP(hipStreamWaitEvent(s_compute, evt_h2d_ready, 0));
+    CHECK_HIP(hipStreamWaitEvent(tls.compute, tls.evt_h2d_ready, 0));
 
     // ! Embedding (on compute stream)
-    embed(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim, s_compute);
+    embed(x, w->token_embedding_table, s->d_tokens, batch_size, hidden_dim, tls.compute);
 
     for (unsigned long long l = 0; l < p->n_layers; l++) {
         // ! RMSNorm (on compute stream)
-        rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim, s_compute);
+        rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, batch_size, hidden_dim, tls.compute);
 
         // ! QKV project (on compute stream)
         __hip_bfloat16* w_qkv =
@@ -165,12 +174,12 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 
         gemm_qkv(s->qkv, s->t, w_qkv, b_qkv, batch_size, hidden_dim,
-                 (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim, s_compute);
+                 (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim, tls.compute);
 
         // ! Split QKV (on compute stream)
         split_qkv(s->qkv, s->q, s->key_cache, s->value_cache, batch_size, head_dim, p->n_attn_heads,
                   p->n_kv_heads, l, s->d_pos_per_token, p->seq_len, s->d_batch_indices, B_stride,
-                  /*stream=*/s_compute, kv_dim, s->kv_cache_is_fp16, s->d_layer_kv_off,
+                  /*stream=*/tls.compute, kv_dim, s->kv_cache_is_fp16, s->d_layer_kv_off,
                   s->d_layer_kv_cap, s->d_layer_is_local);
 
         // ! RoPE (Q and K) (on compute stream)
@@ -180,7 +189,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                 p->seq_len, kv_dim, l, s->d_pos_per_token, s->d_batch_indices, s->kv_cache_is_fp16,
                 B_stride, p->rope_theta, p->rope_scaling_factor, p->initial_context_length,
                 ntk_beta, ntk_alpha,
-                /*stream=*/s_compute, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
+                /*stream=*/tls.compute, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
 
         // ! Attention
         const int is_local_flag = s->h_layer_is_local ? s->h_layer_is_local[l] : 0;
@@ -196,46 +205,46 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
            s->tb, batch_size, /*seq_len*/ visible_len, head_dim, kv_dim, kv_mul, p->sliding_window,
            (int)l, p->n_attn_heads, s->kv_cache_is_fp16, s->d_pos_per_token, s->d_batch_indices,
            (long long)B_stride, max_pos_in_batch, s->fa_partial_O, s->fa_partial_m, s->fa_partial_l,
-           s_compute, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
+           tls.compute, s->d_layer_kv_off, s->d_layer_kv_cap, s->d_layer_is_local);
 
         // ! Output projection (on compute stream)
         __hip_bfloat16* w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
         __hip_bfloat16* b_o = w->b_o + 1ll * l * hidden_dim;
 
         gemm_o(s->tb2, s->tb, w_o, b_o, batch_size, head_dim * p->n_attn_heads, hidden_dim,
-               s_compute);
+               tls.compute);
 
         // ! Residual (on compute stream)
-        vecadd(x, s->tb2, 1.0f, batch_size, hidden_dim, s_compute);
+        vecadd(x, s->tb2, 1.0f, batch_size, hidden_dim, tls.compute);
 
         // ! RMSNorm (on compute stream)
-        rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim, s_compute);
+        rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, batch_size, hidden_dim, tls.compute);
 
         // ! MoE Router (on compute stream)
         __hip_bfloat16* w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
         __hip_bfloat16* b_router = w->b_router + 1ll * l * n_experts;
 
         gemm_router(s->router_score, s->t, w_router, b_router, batch_size, hidden_dim, n_experts,
-                    s_compute);
+                    tls.compute);
 
         // ! TopK and Softmax (on compute stream)
         topk(s->topk_v, s->topk_i, s->router_score, batch_size, n_experts, p->experts_per_token,
-             s_compute);
-        softmax(s->topk_v, batch_size, p->experts_per_token, s_compute);
+             tls.compute);
+        softmax(s->topk_v, batch_size, p->experts_per_token, tls.compute);
 
         const int BKE = batch_size * p->experts_per_token;
         dim3 blk1(256), grd1((BKE + blk1.x - 1) / blk1.x);
 
         // ! Count & Compact (on compute stream)
-        CHECK_HIP(hipMemsetAsync(s->expert_counts, 0, n_experts * sizeof(int), s_compute));
-        hipLaunchKernelGGL(count_tokens_per_expert, grd1, blk1, 0, s_compute, s->topk_i, s->topk_v,
-                           batch_size, p->experts_per_token, s->assign_expert, s->assign_token,
-                           s->assign_weight, s->expert_counts, n_experts);
-        hipLaunchKernelGGL(exclusive_scan_expert_offsets, dim3(1), dim3(1), 0, s_compute,
+        CHECK_HIP(hipMemsetAsync(s->expert_counts, 0, n_experts * sizeof(int), tls.compute));
+        hipLaunchKernelGGL(count_tokens_per_expert, grd1, blk1, 0, tls.compute, s->topk_i,
+                           s->topk_v, batch_size, p->experts_per_token, s->assign_expert,
+                           s->assign_token, s->assign_weight, s->expert_counts, n_experts);
+        hipLaunchKernelGGL(exclusive_scan_expert_offsets, dim3(1), dim3(1), 0, tls.compute,
                            s->expert_counts, s->expert_offsets, n_experts);
 
         const int sumNe = BKE;
-        hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, s_compute, s->assign_expert,
+        hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, tls.compute, s->assign_expert,
                            s->assign_token, s->assign_weight, BKE, s->expert_offsets,
                            s->expert_counts, s->tokens_flat, s->weights_flat);
 
@@ -245,11 +254,11 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (vecOK) {
             const int H4 = hidden_dim >> 2;
             dim3 blk(256, 1, 1), grd((H4 + 255) / 256, sumNe);
-            hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, s_compute, s->t,
+            hipLaunchKernelGGL(gather_rows_vec4_kernel, grd, blk, 0, tls.compute, s->t,
                                s->tokens_flat, s->x_by_expert, sumNe, H4);
         } else {
             dim3 blk(256, 1, 1), grd((hidden_dim + 255) / 256, sumNe);
-            hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, s_compute, s->t, s->tokens_flat,
+            hipLaunchKernelGGL(gather_rows_kernel, grd, blk, 0, tls.compute, s->t, s->tokens_flat,
                                s->x_by_expert, sumNe, hidden_dim);
         }
 
@@ -268,15 +277,15 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         if (!d_meta)
             CHECK_HIP(hipMalloc(&d_meta, sizeof(Int2)));
 
-        hipLaunchKernelGGL(build_expert_work_queue, dim3(1), dim3(1), 0, s_compute,
+        hipLaunchKernelGGL(build_expert_work_queue, dim3(1), dim3(1), 0, tls.compute,
                            s->expert_offsets, d_work_queue, d_meta, n_experts);
 
-        CHECK_HIP(hipEventRecord(evt_meta_ready, s_compute));
-        CHECK_HIP(hipStreamWaitEvent(s_d2h, evt_meta_ready, 0));
+        CHECK_HIP(hipEventRecord(tls.evt_meta_ready, tls.compute));
+        CHECK_HIP(hipStreamWaitEvent(tls.d2h, tls.evt_meta_ready, 0));
         Int2 h_meta;
-        CHECK_HIP(hipMemcpyAsync(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost, s_d2h));
-        CHECK_HIP(hipEventRecord(evt_meta_done, s_d2h));
-        CHECK_HIP(hipEventSynchronize(evt_meta_done));
+        CHECK_HIP(hipMemcpyAsync(&h_meta, d_meta, sizeof(Int2), hipMemcpyDeviceToHost, tls.d2h));
+        CHECK_HIP(hipEventRecord(tls.evt_meta_done, tls.d2h));
+        CHECK_HIP(hipEventSynchronize(tls.evt_meta_done));
         const int active_experts_all = h_meta.x;
         const int max_Ne_all = h_meta.y;
 
@@ -284,14 +293,14 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         // Adaptive heavy/light 2-bucket scheduler
         // ---------------------------------------------------------------------
         // Copy expert offsets to host and compute stats
-        CHECK_HIP(hipEventRecord(evt_offsets_ready, s_compute));
-        CHECK_HIP(hipStreamWaitEvent(s_d2h, evt_offsets_ready, 0));
+        CHECK_HIP(hipEventRecord(tls.evt_offsets_ready, tls.compute));
+        CHECK_HIP(hipStreamWaitEvent(tls.d2h, tls.evt_offsets_ready, 0));
         std::vector<int> h_offsets(n_experts + 1);
         CHECK_HIP(hipMemcpyAsync(h_offsets.data(), s->expert_offsets,
                                  (size_t)(n_experts + 1) * sizeof(int), hipMemcpyDeviceToHost,
-                                 s_d2h));
-        CHECK_HIP(hipEventRecord(evt_offsets_done, s_d2h));
-        CHECK_HIP(hipEventSynchronize(evt_offsets_done));
+                                 tls.d2h));
+        CHECK_HIP(hipEventRecord(tls.evt_offsets_done, tls.d2h));
+        CHECK_HIP(hipEventSynchronize(tls.evt_offsets_done));
         // compute per-expert counts, active list, avg and max
         int active_experts = 0;
         long long sumNe_ll = 0;
@@ -306,7 +315,7 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             }
         }
         if (active_experts == 0) {
-            vecadd_and_zero(x, s->e_agg, 1.0f, batch_size, hidden_dim, s_compute);
+            vecadd_and_zero(x, s->e_agg, 1.0f, batch_size, hidden_dim, tls.compute);
             continue;
         }
         const float avgNe = float(sumNe_ll) / float(active_experts);
@@ -413,17 +422,17 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             assert(d_wq_heavy && (size_t)wq_heavy_h.size() <= (size_t)s->d_wq_heavy_capacity);
             CHECK_HIP(hipMemcpyAsync(d_wq_heavy, wq_heavy_h.data(),
                                      (size_t)wq_heavy_h.size() * sizeof(int), hipMemcpyHostToDevice,
-                                     s_h2d));
-            CHECK_HIP(hipEventRecord(evt_wq_heavy_ready, s_h2d));
-            CHECK_HIP(hipStreamWaitEvent(s_moe_heavy, evt_wq_heavy_ready, 0));
+                                     tls.h2d));
+            CHECK_HIP(hipEventRecord(tls.evt_wq_heavy_ready, tls.h2d));
+            CHECK_HIP(hipStreamWaitEvent(tls.moe_heavy, tls.evt_wq_heavy_ready, 0));
         }
         if (!wq_light_h.empty()) {
             assert(d_wq_light && (size_t)wq_light_h.size() <= (size_t)s->d_wq_light_capacity);
             CHECK_HIP(hipMemcpyAsync(d_wq_light, wq_light_h.data(),
                                      (size_t)wq_light_h.size() * sizeof(int), hipMemcpyHostToDevice,
-                                     s_h2d));
-            CHECK_HIP(hipEventRecord(evt_wq_light_ready, s_h2d));
-            CHECK_HIP(hipStreamWaitEvent(s_moe_light, evt_wq_light_ready, 0));
+                                     tls.h2d));
+            CHECK_HIP(hipEventRecord(tls.evt_wq_light_ready, tls.h2d));
+            CHECK_HIP(hipStreamWaitEvent(tls.moe_light, tls.evt_wq_light_ready, 0));
         }
 
         // Launch parameters shared with your kernels
@@ -442,15 +451,15 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                             w->w_mlp1 + 1ll * l * p->n_experts * mlp1_weight_stride,
                             w->b_mlp1 + 1ll * l * p->n_experts * mlp1_bias_stride, hidden_dim,
                             p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, alpha,
-                            p->swiglu_limit, rh_light_mlp1, grid_cap_light, s_moe_light);
+                            p->swiglu_limit, rh_light_mlp1, grid_cap_light, tls.moe_light);
 
             moe_mlp2_scatter(d_wq_light, /*work_start*/ 0, /*work_count*/ light_count,
                              s->gate_by_expert, s->tokens_flat, s->weights_flat, s->e_agg,
                              w->w_mlp2 + 1ll * l * p->n_experts * mlp2_weight_stride,
                              w->b_mlp2 + 1ll * l * p->n_experts * mlp2_bias_stride,
                              p->intermediate_dim, hidden_dim, mlp2_weight_stride, mlp2_bias_stride,
-                             rh_light_mlp2, grid_cap_light, s_moe_light);
-            CHECK_HIP(hipEventRecord(evt_moe_light_done, s_moe_light));
+                             rh_light_mlp2, grid_cap_light, tls.moe_light);
+            CHECK_HIP(hipEventRecord(tls.evt_moe_light_done, tls.moe_light));
         }
 
         // ---- Heavy bucket (throttled grid to leave SM headroom) ----
@@ -460,31 +469,31 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                             w->w_mlp1 + 1ll * l * p->n_experts * mlp1_weight_stride,
                             w->b_mlp1 + 1ll * l * p->n_experts * mlp1_bias_stride, hidden_dim,
                             p->intermediate_dim, mlp1_weight_stride, mlp1_bias_stride, alpha,
-                            p->swiglu_limit, rh_heavy_mlp1, grid_cap_heavy, s_moe_heavy);
+                            p->swiglu_limit, rh_heavy_mlp1, grid_cap_heavy, tls.moe_heavy);
 
             moe_mlp2_scatter(d_wq_heavy, /*work_start*/ 0, /*work_count*/ heavy_count,
                              s->gate_by_expert, s->tokens_flat, s->weights_flat, s->e_agg,
                              w->w_mlp2 + 1ll * l * p->n_experts * mlp2_weight_stride,
                              w->b_mlp2 + 1ll * l * p->n_experts * mlp2_bias_stride,
                              p->intermediate_dim, hidden_dim, mlp2_weight_stride, mlp2_bias_stride,
-                             rh_heavy_mlp2, grid_cap_heavy, s_moe_heavy);
-            CHECK_HIP(hipEventRecord(evt_moe_heavy_done, s_moe_heavy));
+                             rh_heavy_mlp2, grid_cap_heavy, tls.moe_heavy);
+            CHECK_HIP(hipEventRecord(tls.evt_moe_heavy_done, tls.moe_heavy));
         }
 
         // Wait for both MoE buckets to complete before using e_agg
         if (heavy_count > 0)
-            CHECK_HIP(hipStreamWaitEvent(s_compute, evt_moe_heavy_done, 0));
+            CHECK_HIP(hipStreamWaitEvent(tls.compute, tls.evt_moe_heavy_done, 0));
         if (light_count > 0)
-            CHECK_HIP(hipStreamWaitEvent(s_compute, evt_moe_light_done, 0));
+            CHECK_HIP(hipStreamWaitEvent(tls.compute, tls.evt_moe_light_done, 0));
 
         // ! Residual (on compute stream)
-        vecadd_and_zero(x, s->e_agg, 1.0f, batch_size, hidden_dim, s_compute);
+        vecadd_and_zero(x, s->e_agg, 1.0f, batch_size, hidden_dim, tls.compute);
     }
 
     auto launch_output_stage = [&](bool use_graph) {
         if (!use_graph) {
-            rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim, s_compute);
-            gemm_logits(s->logits, x, w->out, batch_size, hidden_dim, p->vocab_size, s_compute);
+            rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim, tls.compute);
+            gemm_logits(s->logits, x, w->out, batch_size, hidden_dim, p->vocab_size, tls.compute);
             return;
         }
 
@@ -498,25 +507,25 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                 s->forward_graph = nullptr;
             }
 
-            CHECK_HIP(hipStreamBeginCapture(s_compute, hipStreamCaptureModeThreadLocal));
-            rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim, s_compute);
-            gemm_logits(s->logits, x, w->out, batch_size, hidden_dim, p->vocab_size, s_compute);
+            CHECK_HIP(hipStreamBeginCapture(tls.compute, hipStreamCaptureModeThreadLocal));
+            rmsnorm(x, x, w->rms_out_w, batch_size, hidden_dim, tls.compute);
+            gemm_logits(s->logits, x, w->out, batch_size, hidden_dim, p->vocab_size, tls.compute);
             hipGraph_t graph = nullptr;
-            CHECK_HIP(hipStreamEndCapture(s_compute, &graph));
+            CHECK_HIP(hipStreamEndCapture(tls.compute, &graph));
             CHECK_HIP(hipGraphInstantiate(&s->forward_graph_exec, graph, nullptr, nullptr, 0));
             s->forward_graph = graph;
             s->forward_graph_ready = true;
             s->forward_graph_batch_size = batch_size;
         }
 
-        CHECK_HIP(hipGraphLaunch(s->forward_graph_exec, s_compute));
+        CHECK_HIP(hipGraphLaunch(s->forward_graph_exec, tls.compute));
     };
 
     launch_output_stage(s->forward_graph_enabled);
 
     // **CRITICAL**: Synchronize compute stream before returning results!
     // Without this, the host returns before GPU work completes, causing wrong/incomplete results
-    CHECK_HIP(hipStreamSynchronize(s_compute));
+    CHECK_HIP(hipStreamSynchronize(tls.compute));
 
     return s->logits;
 }
