@@ -61,6 +61,19 @@ static thread_local int kGridCap = [] {
     return prop.multiProcessorCount * 2;
 }();
 
+// Pinned host buffer for expert_offsets (for async D2H overlap)
+thread_local static int* h_expert_offsets = nullptr;
+thread_local static int h_expert_offsets_capacity = 0;
+
+static inline void ensure_h_expert_offsets(int need) {
+    if (need <= h_expert_offsets_capacity)
+        return;
+    if (h_expert_offsets)
+        CHECK_HIP(hipHostFree(h_expert_offsets));
+    CHECK_HIP(hipHostMalloc((void**)&h_expert_offsets, need * sizeof(int), hipHostMallocDefault));
+    h_expert_offsets_capacity = need;
+}
+
 // --- Stream scaffolding for async execution and overlap ---
 namespace {
 struct StreamsAndEvents {
@@ -243,6 +256,15 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
         hipLaunchKernelGGL(exclusive_scan_expert_offsets, dim3(1), dim3(1), 0, tls.compute,
                            s->expert_counts, s->expert_offsets, n_experts);
 
+        // Start copying offsets[E+1] early, in parallel with compact/gather
+        ensure_h_expert_offsets(n_experts + 1);
+        CHECK_HIP(hipEventRecord(tls.evt_offsets_ready, tls.compute));
+        CHECK_HIP(hipStreamWaitEvent(tls.d2h, tls.evt_offsets_ready, 0));
+        CHECK_HIP(hipMemcpyAsync(h_expert_offsets,  // host-pinned buffer
+                                 s->expert_offsets, // device source
+                                 (n_experts + 1) * sizeof(int), hipMemcpyDeviceToHost, tls.d2h));
+        CHECK_HIP(hipEventRecord(tls.evt_offsets_done, tls.d2h));
+
         const int sumNe = BKE;
         hipLaunchKernelGGL(compact_by_expert_kernel, grd1, blk1, 0, tls.compute, s->assign_expert,
                            s->assign_token, s->assign_weight, BKE, s->expert_offsets,
@@ -291,26 +313,52 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
                            ADAPT_HEAVY_FACTOR_SPARSE, ADAPT_HEAVY_FACTOR_DEFAULT, s->d_wq_heavy,
                            s->d_wq_light, d_moe_stats);
 
-        // Fence compute -> make d2h and the MoE streams wait until queues/stats are ready.
+        // Fence compute -> make MoE streams wait until queues are ready
         CHECK_HIP(hipEventRecord(tls.evt_meta_ready, tls.compute));
-        CHECK_HIP(hipStreamWaitEvent(tls.d2h, tls.evt_meta_ready, 0));
         CHECK_HIP(hipStreamWaitEvent(tls.moe_heavy, tls.evt_meta_ready, 0));
         CHECK_HIP(hipStreamWaitEvent(tls.moe_light, tls.evt_meta_ready, 0));
 
-        // Pull back tiny stats (few ints) to compute rows_hint on host
-        MoEStats stats_h{};
-        CHECK_HIP(hipMemcpyAsync(&stats_h, d_moe_stats, sizeof(MoEStats), hipMemcpyDeviceToHost,
-                                 tls.d2h));
-        CHECK_HIP(hipStreamSynchronize(tls.d2h));
+        // Ensure the early offsets copy finished (this is tiny and already overlapped)
+        CHECK_HIP(hipEventSynchronize(tls.evt_offsets_done));
 
-        if (stats_h.active_experts == 0) {
+        // Rebuild stats on host from offsets (exact same logic the device uses)
+        int active = 0, heavy_count = 0, light_count = 0, heavy_maxNe = 0;
+        long long total_assigned = 0;
+        for (int e = 0; e < n_experts; ++e) {
+            int off = h_expert_offsets[e];
+            int ne = h_expert_offsets[e + 1] - off;
+            if (ne > 0) {
+                ++active;
+                total_assigned += ne;
+                if (ne > heavy_maxNe)
+                    heavy_maxNe = ne;
+            }
+        }
+
+        if (active == 0) {
             vecadd_and_zero(x, s->e_agg, 1.0f, batch_size, hidden_dim, tls.compute);
             continue;
         }
-        const int heavy_count = stats_h.heavy_count;
-        const int light_count = stats_h.light_count;
-        const int heavy_maxNe = stats_h.heavy_maxNe;
-        const float avgNe = float(stats_h.sumNe) / float(stats_h.active_experts);
+
+        float avgNe = float(total_assigned) / float(active);
+        float heavy_factor = ADAPT_HEAVY_FACTOR_DEFAULT;
+        if (active <= ADAPT_VERY_SPARSE_CUTOFF) {
+            heavy_factor = 1.0f;
+        } else if (active <= 12) {
+            heavy_factor = ADAPT_HEAVY_FACTOR_SPARSE;
+        }
+        const int heavy_thresh = int(ceilf(heavy_factor * avgNe));
+
+        for (int e = 0; e < n_experts; ++e) {
+            int off = h_expert_offsets[e];
+            int ne = h_expert_offsets[e + 1] - off;
+            if (ne <= 0)
+                continue;
+            if (active <= ADAPT_VERY_SPARSE_CUTOFF || ne >= heavy_thresh)
+                ++heavy_count;
+            else
+                ++light_count;
+        }
 
         // device info (reuse once-computed cap)
         const int sms = std::max(1, kGridCap / 2);
@@ -347,7 +395,8 @@ float* forward(OssTransformerHybrid* transformer, int* tokens, const int* pos_pe
             rh_heavy_mlp2 = std::max(rh_heavy_mlp2, cover_heavy);
         }
         if (light_count > 0) {
-            const int light_cap = std::max(ADAPT_MT_N, int(std::ceil(avgNe)));
+            const float avgNe_f = float(total_assigned) / float(active);
+            const int light_cap = std::max(ADAPT_MT_N, int(std::ceil(avgNe_f)));
             rh_light_mlp1 = std::min(rh_light_mlp1, light_cap);
             rh_light_mlp2 = std::min(rh_light_mlp2, light_cap);
         } else {
