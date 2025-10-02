@@ -359,13 +359,13 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     state_d->d_wq_heavy_capacity = (int)wq_ints;
     state_d->d_wq_light_capacity = (int)wq_ints;
 
-    int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
-    size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
-    size_t fa_ml_size = (size_t)batch_size * n_attn_heads * max_chunks * sizeof(float);
+    // int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
+    // size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
+    // size_t fa_ml_size = (size_t)batch_size * n_attn_heads * max_chunks * sizeof(float);
 
-    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_O, fa_O_size));
-    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_m, fa_ml_size));
-    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_l, fa_ml_size));
+    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_O, fa_O_size));
+    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_m, fa_ml_size));
+    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_l, fa_ml_size));
 
     printf("Converting and transferring weights...\n");
 
@@ -587,9 +587,9 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
         t_d->state.d_wq_light = nullptr;
         t_d->state.d_wq_light_capacity = 0;
     }
-    CHECK_HIP(hipFree(t_d->state.fa_partial_O));
-    CHECK_HIP(hipFree(t_d->state.fa_partial_m));
-    CHECK_HIP(hipFree(t_d->state.fa_partial_l));
+    // CHECK_HIP(hipFree(t_d->state.fa_partial_O));
+    // CHECK_HIP(hipFree(t_d->state.fa_partial_m));
+    // CHECK_HIP(hipFree(t_d->state.fa_partial_l));
     if (t_d->ep_aggregate_streams) {
         for (int i = 0; i < t_d->ep_size; ++i) {
             if (t_d->ep_aggregate_streams[i])
