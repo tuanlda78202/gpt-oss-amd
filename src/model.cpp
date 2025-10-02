@@ -9,7 +9,7 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
 
-    bool show_progress = total_size > 1024 * 1024;
+    bool show_progress = total_size > 1024 * 1024 * 1024;
 
     if (show_progress) {
         printf("  %s (%.1f GB)...", tensor_name, total_size / (1024.0 * 1024.0 * 1024.0));
@@ -59,8 +59,9 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
 }
 
 // ! Hybrid precision (BF16 weights + FP32 activations)
-void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int use_kv16,
-                                int odd_window) {
+void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int device_id,
+                                int dp_rank, int ep_size, int ep_rank, int use_kv16,
+                                bool replicate_experts, int odd_window) {
     memcpy(&t_d->config, &t_fp32->config, sizeof(OssConfig));
 
     OssConfig* conf = &t_fp32->config;
@@ -104,6 +105,29 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     int n_kv_heads = conf->n_kv_heads;
     int seq_len = conf->seq_len;
 
+    int local_experts = 0;
+    int expert_offset = 0;
+    if (replicate_experts) {
+        local_experts = n_experts;
+        expert_offset = 0;
+    } else if (ep_size > 0 && ep_rank >= 0) {
+        int base_local = n_experts / ep_size;
+        int rem = n_experts % ep_size;
+        local_experts = base_local + (ep_rank < rem ? 1 : 0);
+        expert_offset = ep_rank * base_local + (ep_rank < rem ? ep_rank : rem);
+    }
+
+    t_d->device_id = device_id;
+    t_d->dp_rank = dp_rank;
+    t_d->ep_size = replicate_experts ? 1 : ep_size;
+    t_d->ep_rank = ep_rank;
+    t_d->ep_local_experts = local_experts;
+    t_d->ep_expert_offset = expert_offset;
+    t_d->ep_aggregate_streams = nullptr;
+    t_d->ep_aggregate_events = nullptr;
+    t_d->ep_remote_buffers = nullptr;
+    t_d->ep_remote_buffer_bytes = 0;
+
     // printf("\nConverting model to hybrid precision...\n");
 
     // ! GPU Check
@@ -120,10 +144,10 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     // ! Allocate BF16 weights on GPU
     size_t token_emb_size = (size_t)vocab_size * hidden_dim * sizeof(__hip_bfloat16);
-    size_t mlp1_size =
-        1ll * n_layers * n_experts * 2 * intermediate_dim * hidden_dim * sizeof(__hip_bfloat16);
-    size_t mlp2_size =
-        1ll * n_layers * n_experts * hidden_dim * intermediate_dim * sizeof(__hip_bfloat16);
+    size_t mlp1_local_size = (size_t)n_layers * (size_t)local_experts * 2 * intermediate_dim *
+                             hidden_dim * sizeof(__hip_bfloat16);
+    size_t mlp2_local_size = (size_t)n_layers * (size_t)local_experts * hidden_dim *
+                             intermediate_dim * sizeof(__hip_bfloat16);
 
     CHECK_HIP(hipMalloc(&t_d->weights.token_embedding_table, token_emb_size));
     CHECK_HIP(hipMalloc(&t_d->weights.rms_attn_w,
@@ -151,14 +175,21 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(
         hipMalloc(&t_d->weights.b_router, (size_t)n_layers * n_experts * sizeof(__hip_bfloat16)));
 
-    CHECK_HIP(hipMalloc(&t_d->weights.w_mlp1, mlp1_size));
-    CHECK_HIP(hipMalloc(&t_d->weights.w_mlp2, mlp2_size));
-
-    size_t b_mlp1_size =
-        (size_t)n_layers * n_experts * 2 * intermediate_dim * sizeof(__hip_bfloat16);
-    size_t b_mlp2_size = (size_t)n_layers * n_experts * hidden_dim * sizeof(__hip_bfloat16);
-    CHECK_HIP(hipMalloc(&t_d->weights.b_mlp1, b_mlp1_size));
-    CHECK_HIP(hipMalloc(&t_d->weights.b_mlp2, b_mlp2_size));
+    size_t b_mlp1_local_size =
+        (size_t)n_layers * (size_t)local_experts * 2 * intermediate_dim * sizeof(__hip_bfloat16);
+    size_t b_mlp2_local_size =
+        (size_t)n_layers * (size_t)local_experts * hidden_dim * sizeof(__hip_bfloat16);
+    if (local_experts > 0) {
+        CHECK_HIP(hipMalloc(&t_d->weights.w_mlp1, mlp1_local_size));
+        CHECK_HIP(hipMalloc(&t_d->weights.w_mlp2, mlp2_local_size));
+        CHECK_HIP(hipMalloc(&t_d->weights.b_mlp1, b_mlp1_local_size));
+        CHECK_HIP(hipMalloc(&t_d->weights.b_mlp2, b_mlp2_local_size));
+    } else {
+        t_d->weights.w_mlp1 = nullptr;
+        t_d->weights.w_mlp2 = nullptr;
+        t_d->weights.b_mlp1 = nullptr;
+        t_d->weights.b_mlp2 = nullptr;
+    }
 
     CHECK_HIP(hipMalloc(&t_d->weights.rms_out_w, (size_t)hidden_dim * sizeof(__hip_bfloat16)));
     size_t out_size = (size_t)vocab_size * hidden_dim * sizeof(__hip_bfloat16);
@@ -191,6 +222,32 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(
         hipMalloc(&t_d->state.att, (size_t)batch_size * n_attn_heads * seq_len * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.logits, (size_t)batch_size * vocab_size * sizeof(float)));
+
+    if (t_d->ep_size > 0) {
+        size_t stream_count = static_cast<size_t>(t_d->ep_size);
+        t_d->ep_aggregate_streams =
+            reinterpret_cast<hipStream_t*>(malloc(stream_count * sizeof(hipStream_t)));
+        t_d->ep_aggregate_events =
+            reinterpret_cast<hipEvent_t*>(malloc(stream_count * sizeof(hipEvent_t)));
+        t_d->ep_remote_buffers = reinterpret_cast<float**>(malloc(stream_count * sizeof(float*)));
+        if (!t_d->ep_aggregate_streams || !t_d->ep_aggregate_events || !t_d->ep_remote_buffers) {
+            fprintf(stderr, "Failed to allocate expert aggregation metadata\n");
+            exit(EXIT_FAILURE);
+        }
+
+        for (size_t i = 0; i < stream_count; ++i)
+            t_d->ep_remote_buffers[i] = nullptr;
+
+        const size_t scratch_bytes = (size_t)batch_size * hidden_dim * sizeof(float);
+        for (size_t i = 0; i < stream_count; ++i) {
+            CHECK_HIP(
+                hipStreamCreateWithFlags(&t_d->ep_aggregate_streams[i], hipStreamNonBlocking));
+            CHECK_HIP(hipEventCreateWithFlags(&t_d->ep_aggregate_events[i], hipEventDisableTiming));
+            if (scratch_bytes > 0)
+                CHECK_HIP(hipMalloc(&t_d->ep_remote_buffers[i], scratch_bytes));
+        }
+        t_d->ep_remote_buffer_bytes = scratch_bytes;
+    }
 
     // Compact KV allocation with per-layer capacities for cyclic cache
     const int kv_dim = n_kv_heads * head_dim;
@@ -318,10 +375,43 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     copy_large_tensor_streaming(&t_d->weights.w_qkv, weights->w_qkv, qkv_size, "w_qkv");
     copy_large_tensor_streaming(&t_d->weights.w_o, weights->w_o, w_o_size, "w_o");
     copy_large_tensor_streaming(&t_d->weights.w_router, weights->w_router, router_size, "w_router");
-    copy_large_tensor_streaming(&t_d->weights.w_mlp1, weights->w_mlp1, mlp1_size, "w_mlp1");
-    copy_large_tensor_streaming(&t_d->weights.w_mlp2, weights->w_mlp2, mlp2_size, "w_mlp2");
-    copy_large_tensor_streaming(&t_d->weights.b_mlp1, weights->b_mlp1, b_mlp1_size, "b_mlp1");
-    copy_large_tensor_streaming(&t_d->weights.b_mlp2, weights->b_mlp2, b_mlp2_size, "b_mlp2");
+
+    if (local_experts > 0) {
+        const long long mlp1_stride = 2ll * intermediate_dim * hidden_dim;
+        const long long mlp2_stride = (long long)hidden_dim * intermediate_dim;
+        const long long b_mlp1_stride = 2ll * intermediate_dim;
+        const long long b_mlp2_stride = (long long)hidden_dim;
+
+        for (int l = 0; l < n_layers; ++l) {
+            __hip_bfloat16* dst_w1 =
+                t_d->weights.w_mlp1 + (long long)l * local_experts * mlp1_stride;
+            float* src_w1 =
+                weights->w_mlp1 + ((long long)l * n_experts + expert_offset) * mlp1_stride;
+            size_t bytes_w1 = (size_t)local_experts * mlp1_stride * sizeof(__hip_bfloat16);
+            copy_large_tensor_streaming(&dst_w1, src_w1, bytes_w1, "w_mlp1_shard");
+
+            __hip_bfloat16* dst_w2 =
+                t_d->weights.w_mlp2 + (long long)l * local_experts * mlp2_stride;
+            float* src_w2 =
+                weights->w_mlp2 + ((long long)l * n_experts + expert_offset) * mlp2_stride;
+            size_t bytes_w2 = (size_t)local_experts * mlp2_stride * sizeof(__hip_bfloat16);
+            copy_large_tensor_streaming(&dst_w2, src_w2, bytes_w2, "w_mlp2_shard");
+
+            __hip_bfloat16* dst_b1 =
+                t_d->weights.b_mlp1 + (long long)l * local_experts * b_mlp1_stride;
+            float* src_b1 =
+                weights->b_mlp1 + ((long long)l * n_experts + expert_offset) * b_mlp1_stride;
+            size_t bytes_b1 = (size_t)local_experts * b_mlp1_stride * sizeof(__hip_bfloat16);
+            copy_large_tensor_streaming(&dst_b1, src_b1, bytes_b1, "b_mlp1_shard");
+
+            __hip_bfloat16* dst_b2 =
+                t_d->weights.b_mlp2 + (long long)l * local_experts * b_mlp2_stride;
+            float* src_b2 =
+                weights->b_mlp2 + ((long long)l * n_experts + expert_offset) * b_mlp2_stride;
+            size_t bytes_b2 = (size_t)local_experts * b_mlp2_stride * sizeof(__hip_bfloat16);
+            copy_large_tensor_streaming(&dst_b2, src_b2, bytes_b2, "b_mlp2_shard");
+        }
+    }
     copy_large_tensor_streaming(&t_d->weights.out, weights->out, out_size, "out");
 
     // Convert small tensors directly
@@ -438,10 +528,14 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->weights.attn_sinks));
     CHECK_HIP(hipFree(t_d->weights.w_router));
     CHECK_HIP(hipFree(t_d->weights.b_router));
-    CHECK_HIP(hipFree(t_d->weights.w_mlp1));
-    CHECK_HIP(hipFree(t_d->weights.w_mlp2));
-    CHECK_HIP(hipFree(t_d->weights.b_mlp1));
-    CHECK_HIP(hipFree(t_d->weights.b_mlp2));
+    if (t_d->weights.w_mlp1)
+        CHECK_HIP(hipFree(t_d->weights.w_mlp1));
+    if (t_d->weights.w_mlp2)
+        CHECK_HIP(hipFree(t_d->weights.w_mlp2));
+    if (t_d->weights.b_mlp1)
+        CHECK_HIP(hipFree(t_d->weights.b_mlp1));
+    if (t_d->weights.b_mlp2)
+        CHECK_HIP(hipFree(t_d->weights.b_mlp2));
     CHECK_HIP(hipFree(t_d->weights.rms_out_w));
     CHECK_HIP(hipFree(t_d->weights.out));
 
@@ -496,6 +590,31 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.fa_partial_O));
     CHECK_HIP(hipFree(t_d->state.fa_partial_m));
     CHECK_HIP(hipFree(t_d->state.fa_partial_l));
+    if (t_d->ep_aggregate_streams) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_aggregate_streams[i])
+                CHECK_HIP(hipStreamDestroy(t_d->ep_aggregate_streams[i]));
+        }
+        free(t_d->ep_aggregate_streams);
+        t_d->ep_aggregate_streams = nullptr;
+    }
+    if (t_d->ep_aggregate_events) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_aggregate_events[i])
+                CHECK_HIP(hipEventDestroy(t_d->ep_aggregate_events[i]));
+        }
+        free(t_d->ep_aggregate_events);
+        t_d->ep_aggregate_events = nullptr;
+    }
+    if (t_d->ep_remote_buffers) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_remote_buffers[i])
+                CHECK_HIP(hipFree(t_d->ep_remote_buffers[i]));
+        }
+        free(t_d->ep_remote_buffers);
+        t_d->ep_remote_buffers = nullptr;
+        t_d->ep_remote_buffer_bytes = 0;
+    }
 
     for (int i = 0; i < 2; ++i) {
         if (t_d->state.h_tokens_staging[i]) {
