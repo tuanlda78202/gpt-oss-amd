@@ -78,11 +78,19 @@ __device__ __forceinline__ bool is_aligned_4(const void* p) {
     return ((uintptr_t)p & 3) == 0;
 }
 
+__device__ __forceinline__ short to_bf16_bits(float v) {
+    return bf16_bits(__float2bfloat16(v));
+}
+
+__device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) {
+    return bf16_bits(v);
+}
+
 // ======================================================================
 // FlashAttention-2 decode kernel with MFMA tiling (head_dim == 64)
-// - One wave (64 threads) computes a Br x Bc tile with MFMA (Br=Bc=16).
-// - Processes all attention heads that share the same KV head (kv_mul).
-// - Performs online softmax and O update in-place while streaming V once.
+// - One wave (64 threads) computes a Br x Bc tile (Br=Bc=16) using MFMA.
+// - K and V tiles are staged in LDS as bf16 to amortize global memory.
+// - Online softmax is performed per tile with register reductions.
 // ======================================================================
 template<typename KV_T, bool USE_MASK, int BR_TILE = 16, int BC_TILE = 16>
 __global__ void fa2_decode_mfma_head64(
@@ -111,19 +119,24 @@ __global__ void fa2_decode_mfma_head64(
 
     const int lane_id = threadIdx.x;
     const int lane_x = lane_id % BC_TILE; // column within tile
-    const int lane_y = lane_id / BC_TILE; // row-group (4 rows) within tile
+    const int lane_y = lane_id / BC_TILE; // K-slice group (0..3)
 
-    const int kv_head = blockIdx.x; // which KV head this wave handles
-    const int b = blockIdx.y;       // batch index
+    const int kv_head = blockIdx.x;
+    const int b = blockIdx.y;
+
     if (lane_id >= 64 || b >= B) {
         return;
     }
 
-    if (kv_mul > BR_TILE) {
-        return; // unsupported configuration for this kernel
+    if (kv_mul <= 0) {
+        return;
     }
 
-    const int rows_active = kv_mul;
+    const int rows_active = min(kv_mul, BR_TILE);
+    if (rows_active <= 0) {
+        return;
+    }
+
     const int h_base = kv_head * kv_mul;
     if (h_base >= n_attn_heads) {
         return;
@@ -162,12 +175,10 @@ __global__ void fa2_decode_mfma_head64(
     __shared__ float row_prev_m[BR_TILE];
     __shared__ float row_scale[BR_TILE];
     __shared__ float row_inv_l[BR_TILE];
-    __shared__ float tile_max[BR_TILE];
-    __shared__ float tile_sum[BR_TILE];
-    __shared__ float score_tile[BR_TILE * BC_TILE];
-    __shared__ float prob_tile[BR_TILE * BC_TILE];
     __shared__ int   tile_rt[BC_TILE];
+    __shared__ short k_tile[BC_TILE][HEAD_DIM];
     __shared__ short v_tile[HEAD_DIM][BC_TILE];
+    __shared__ short w_tile[BR_TILE][BC_TILE];
 
     if (lane_id < BR_TILE) {
         row_m[lane_id] = NEG_INF;
@@ -175,7 +186,7 @@ __global__ void fa2_decode_mfma_head64(
     }
     __syncthreads();
 
-    // Preload Q fragments (bf16) for each row handled by the wave
+    // Preload Q fragments (bf16) for each row handled by the wave.
     i16x4 q_frag[HEAD_DIM / MFMA_K];
 #pragma unroll
     for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
@@ -192,7 +203,7 @@ __global__ void fa2_decode_mfma_head64(
                 if (k_idx < HEAD_DIM) {
                     qv = q_row[k_idx] * inv_sqrt_d;
                 }
-                frag[i] = bf16_bits(__float2bfloat16(qv));
+                frag[i] = to_bf16_bits(qv);
             }
         }
         q_frag[frag_idx] = frag;
@@ -211,55 +222,75 @@ __global__ void fa2_decode_mfma_head64(
         if (bc > BC_TILE) bc = BC_TILE;
 
         const int col = lane_x;
-        bool col_active = (col < bc);
+        const bool col_active = (col < bc);
         const int t = t0 + col;
 
         int rt = 0;
         if (col_active) {
             if (local != 0) {
-                rt = cap_pow2 ? (t & (cap - 1)) : (t % cap);
+                rt = cap_pow2 ? ring_index<true>(t, cap) : ring_index<false>(t, cap);
             } else {
                 rt = t;
             }
             if (lane_y == 0) {
                 tile_rt[col] = rt;
             }
+        } else if (lane_y == 0 && col < BC_TILE) {
+            tile_rt[col] = 0;
         }
         __syncthreads();
 
-        const long long col_off = static_cast<long long>(rt) * step_bytes + head_off_bytes;
-        const KV_T* k_col_ptr = col_active ? reinterpret_cast<const KV_T*>(k_layer_base + col_off) : nullptr;
+        // Stage K and V tiles in LDS as bf16 bits.
+        const int total_tile_elems = bc * HEAD_DIM;
+        for (int idx = lane_id; idx < total_tile_elems; idx += 64) {
+            const int c = idx / HEAD_DIM;
+            const int dim = idx % HEAD_DIM;
+            const int rt_col = tile_rt[c];
+            const long long base_offset = static_cast<long long>(rt_col) * step_bytes + head_off_bytes;
+            const char* __restrict__ kp_bytes = k_layer_base + base_offset;
+            const char* __restrict__ vp_bytes = v_layer_base + base_offset;
 
-        auto load_k_fragment = [&](const KV_T* ptr, int k_off, bool valid) {
-            i16x4 frag = {0, 0, 0, 0};
-            if (!valid) {
-                return frag;
+            short k_bits = 0;
+            short v_bits = 0;
+            if constexpr (std::is_same<KV_T, float>::value) {
+                const float* __restrict__ k_ptr = reinterpret_cast<const float*>(kp_bytes);
+                const float* __restrict__ v_ptr = reinterpret_cast<const float*>(vp_bytes);
+                float k_val = ld_global_cond(k_ptr + dim);
+                float v_val = ld_global_cond(v_ptr + dim);
+                k_bits = to_bf16_bits(k_val);
+                v_bits = to_bf16_bits(v_val);
+            } else {
+                const __hip_bfloat16* __restrict__ k_ptr = reinterpret_cast<const __hip_bfloat16*>(kp_bytes);
+                const __hip_bfloat16* __restrict__ v_ptr = reinterpret_cast<const __hip_bfloat16*>(vp_bytes);
+                k_bits = to_bf16_bits(k_ptr[dim]);
+                v_bits = to_bf16_bits(v_ptr[dim]);
             }
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int idx = k_off + i;
-                float val = 0.0f;
-                if (idx < HEAD_DIM) {
-                    if constexpr (std::is_same<KV_T, float>::value) {
-                        val = reinterpret_cast<const float*>(ptr)[idx];
-                    } else {
-                        val = bf16_to_f32_intr(reinterpret_cast<const __hip_bfloat16*>(ptr)[idx]);
-                    }
-                }
-                frag[i] = bf16_bits(__float2bfloat16(val));
-            }
-            return frag;
-        };
+            k_tile[c][dim] = k_bits;
+            v_tile[dim][c] = v_bits;
+        }
+        __syncthreads();
 
+        // Compute Q · K^T tile with MFMA.
         f4 score_frag = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
             const int frag_idx = kk / MFMA_K;
             const int k_base = kk + lane_y * 4;
-            const bool valid = col_active;
-            i16x4 b_frag = load_k_fragment(k_col_ptr, k_base, valid);
+            i16x4 b_frag = {0, 0, 0, 0};
+            if (col_active) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int dim = k_base + i;
+                    if (dim < HEAD_DIM) {
+                        b_frag[i] = k_tile[col][dim];
+                    }
+                }
+            }
             score_frag = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(q_frag[frag_idx], b_frag, score_frag, 0, 0, 0);
         }
+
+        float score_reg[4];
+        float prob_reg[4];
 
         float mask_val = 0.0f;
         if constexpr (USE_MASK) {
@@ -278,58 +309,52 @@ __global__ void fa2_decode_mfma_head64(
             if (!(col_active && row < rows_active)) {
                 val = NEG_INF;
             }
-            score_frag[i] = val;
-            if (row < BR_TILE) {
-                score_tile[row * BC_TILE + col] = val;
-            }
+            score_reg[i] = val;
         }
-        __syncthreads();
 
+        // Row-wise maxima reduction.
+        float row_max[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            float v = score_frag[i];
+            float v = score_reg[i];
 #pragma unroll
-            for (int offset = BC_TILE >> 1; offset > 0; offset >>= 1) {
-                v = fmaxf(v, __shfl_down(v, offset, BC_TILE));
+            for (int off = BC_TILE >> 1; off > 0; off >>= 1) {
+                v = fmaxf(v, __shfl_down(v, off, BC_TILE));
             }
-            if (lane_x == 0) {
-                tile_max[lane_y * 4 + i] = v;
-            }
+            row_max[i] = __shfl(v, 0, BC_TILE);
         }
-        __syncthreads();
 
         if (lane_x == 0) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int row = lane_y * 4 + i;
-                const float prev_m = row_m[row];
-                row_prev_m[row] = prev_m;
-                const float new_m = fmaxf(prev_m, tile_max[row]);
-                row_m[row] = new_m;
+                if (row < BR_TILE) {
+                    const float prev_m = row_m[row];
+                    row_prev_m[row] = prev_m;
+                    row_m[row] = fmaxf(prev_m, row_max[i]);
+                }
             }
         }
         __syncthreads();
 
+        // Compute normalized probabilities and update LSE.
+        float row_sum[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int row = lane_y * 4 + i;
-            float val = 0.0f;
-            if (row < rows_active && col_active) {
-                const float new_m = row_m[row];
-                const float s = score_tile[row * BC_TILE + col];
-                val = __expf(s - new_m);
+            const float new_m = (row < BR_TILE) ? row_m[row] : NEG_INF;
+            float p = 0.0f;
+            if (col_active && row < rows_active && new_m > NEG_INF / 2) {
+                p = __expf(score_reg[i] - new_m);
             }
-            prob_tile[row * BC_TILE + col] = val;
-            float sum_v = val;
+            prob_reg[i] = p;
+            float sum = p;
 #pragma unroll
-            for (int offset = BC_TILE >> 1; offset > 0; offset >>= 1) {
-                sum_v += __shfl_down(sum_v, offset, BC_TILE);
+            for (int off = BC_TILE >> 1; off > 0; off >>= 1) {
+                sum += __shfl_down(sum, off, BC_TILE);
             }
-            if (lane_x == 0) {
-                tile_sum[row] = sum_v;
-            }
+            row_sum[i] = __shfl(sum, 0, BC_TILE);
         }
-        __syncthreads();
 
         if (lane_x == 0) {
 #pragma unroll
@@ -337,18 +362,17 @@ __global__ void fa2_decode_mfma_head64(
                 const int row = lane_y * 4 + i;
                 if (row < rows_active) {
                     const float prev_m = row_prev_m[row];
-                    const float new_m = row_m[row];
                     const float prev_l = row_l[row];
-                    const float sum = tile_sum[row];
+                    const float new_m = row_m[row];
                     const float a = (prev_m == NEG_INF) ? 0.0f : __expf(prev_m - new_m);
                     const float weighted_prev = a * prev_l;
-                    const float ln = weighted_prev + sum;
+                    const float ln = weighted_prev + row_sum[i];
                     const float scale = (ln > 0.0f) ? (weighted_prev / ln) : 0.0f;
                     const float inv_l = (ln > 0.0f) ? (1.0f / ln) : 0.0f;
                     row_scale[row] = scale;
                     row_inv_l[row] = inv_l;
                     row_l[row] = ln;
-                } else {
+                } else if (row < BR_TILE) {
                     row_scale[row] = 0.0f;
                     row_inv_l[row] = 0.0f;
                 }
@@ -364,68 +388,29 @@ __global__ void fa2_decode_mfma_head64(
             o_frag1[i] *= scale;
             o_frag2[i] *= scale;
             o_frag3[i] *= scale;
-        }
 
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int row = lane_y * 4 + i;
-            float val = prob_tile[row * BC_TILE + col];
-            if (row < rows_active) {
-                val *= row_inv_l[row];
-            } else {
-                val = 0.0f;
+            float weight = 0.0f;
+            if (col_active && row < rows_active) {
+                weight = prob_reg[i] * row_inv_l[row];
             }
-            if (!col_active) {
-                val = 0.0f;
+            if (row < BR_TILE) {
+                w_tile[row][col] = to_bf16_bits(weight);
             }
-            prob_tile[row * BC_TILE + col] = val;
         }
         __syncthreads();
 
-        // Stage V tile (Bc x 64) into shared memory as bf16 (transposed)
-        const int total_entries = HEAD_DIM * BC_TILE;
-        for (int idx = lane_id; idx < total_entries; idx += 64) {
-            const int dim = idx / BC_TILE;
-            const int k = idx % BC_TILE;
-            v_tile[dim][k] = 0;
-        }
-        __syncthreads();
-
-        const int total_fills = HEAD_DIM * bc;
-        for (int idx = lane_id; idx < total_fills; idx += 64) {
-            const int dim = idx / bc;
-            const int k = idx % bc;
-            const int rt_col = tile_rt[k];
-            const long long v_off = static_cast<long long>(rt_col) * step_bytes + head_off_bytes;
-            const char* __restrict__ vp_bytes = v_layer_base + v_off;
-            float val = 0.0f;
-            if constexpr (std::is_same<KV_T, float>::value) {
-                val = reinterpret_cast<const float*>(vp_bytes)[dim];
-            } else {
-                val = bf16_to_f32_intr(reinterpret_cast<const __hip_bfloat16*>(vp_bytes)[dim]);
-            }
-            v_tile[dim][k] = bf16_bits(__float2bfloat16(val));
-        }
-        __syncthreads();
-
+        // Accumulate O += P_tile · V_tile via MFMA.
         const int k_base = lane_y * 4;
         i16x4 w_frag = {0, 0, 0, 0};
         if (lane_x < rows_active) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int k_idx = k_base + i;
-                float val = 0.0f;
-                if (k_idx < BC_TILE) {
-                    val = prob_tile[lane_x * BC_TILE + k_idx];
+                if (k_idx < bc) {
+                    w_frag[i] = w_tile[lane_x][k_idx];
                 }
-                w_frag[i] = bf16_bits(__float2bfloat16(val));
             }
         }
-
-        const int n_col0 = lane_x;
-        const int n_col1 = lane_x + 16;
-        const int n_col2 = lane_x + 32;
-        const int n_col3 = lane_x + 48;
 
         auto load_v_fragment = [&](int n_col) {
             i16x4 frag = {0, 0, 0, 0};
@@ -441,6 +426,11 @@ __global__ void fa2_decode_mfma_head64(
             return frag;
         };
 
+        const int n_col0 = lane_x;
+        const int n_col1 = lane_x + 16;
+        const int n_col2 = lane_x + 32;
+        const int n_col3 = lane_x + 48;
+
         i16x4 vb0 = load_v_fragment(n_col0);
         i16x4 vb1 = load_v_fragment(n_col1);
         i16x4 vb2 = load_v_fragment(n_col2);
@@ -450,6 +440,7 @@ __global__ void fa2_decode_mfma_head64(
         o_frag1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb1, o_frag1, 0, 0, 0);
         o_frag2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb2, o_frag2, 0, 0, 0);
         o_frag3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb3, o_frag3, 0, 0, 0);
+        __syncthreads();
     }
 
     if (attn_sinks_half != nullptr) {
@@ -465,8 +456,8 @@ __global__ void fa2_decode_mfma_head64(
                         const float lp = row_l[row];
                         const float mn = fmaxf(mp, sink_val);
                         const float a = (mp == NEG_INF) ? 0.0f : __expf(mp - mn);
-                        const float b = __expf(sink_val - mn);
-                        const float d = a * lp + b;
+                        const float b_val = __expf(sink_val - mn);
+                        const float d = a * lp + b_val;
                         const float scale = (d > 0.0f) ? (a * lp) / d : 1.0f;
                         row_scale[row] = scale;
                         row_m[row] = mn;
@@ -474,7 +465,7 @@ __global__ void fa2_decode_mfma_head64(
                     } else {
                         row_scale[row] = 1.0f;
                     }
-                } else {
+                } else if (row < BR_TILE) {
                     row_scale[row] = 1.0f;
                 }
             }
@@ -483,7 +474,7 @@ __global__ void fa2_decode_mfma_head64(
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int row = lane_y * 4 + i;
-            const float scale = row_scale[row];
+            const float scale = (row < BR_TILE) ? row_scale[row] : 1.0f;
             o_frag0[i] *= scale;
             o_frag1[i] *= scale;
             o_frag2[i] *= scale;
@@ -503,10 +494,10 @@ __global__ void fa2_decode_mfma_head64(
             continue;
         }
         float* __restrict__ o_row = o_block + static_cast<long long>(h_base + row) * HEAD_DIM;
-        o_row[col0] = o_frag0[i];
-        o_row[col1] = o_frag1[i];
-        o_row[col2] = o_frag2[i];
-        o_row[col3] = o_frag3[i];
+        if (col0 < HEAD_DIM) o_row[col0] = o_frag0[i];
+        if (col1 < HEAD_DIM) o_row[col1] = o_frag1[i];
+        if (col2 < HEAD_DIM) o_row[col2] = o_frag2[i];
+        if (col3 < HEAD_DIM) o_row[col3] = o_frag3[i];
     }
 }
 
@@ -537,8 +528,7 @@ void fa(
         return;
     }
 
-    if (kv_mul > 16 || (n_attn_heads % kv_mul) != 0) {
-        // Unsupported configuration for this specialized kernel
+    if (kv_mul <= 0 || (n_attn_heads % kv_mul) != 0 || kv_mul > 16) {
         return;
     }
 
