@@ -127,6 +127,8 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     t_d->ep_aggregate_events = nullptr;
     t_d->ep_remote_buffers = nullptr;
     t_d->ep_remote_buffer_bytes = 0;
+    t_d->ep_remote_weight_buffers = nullptr;
+    t_d->ep_remote_weight_bytes = 0;
 
     // printf("\nConverting model to hybrid precision...\n");
 
@@ -230,24 +232,33 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         t_d->ep_aggregate_events =
             reinterpret_cast<hipEvent_t*>(malloc(stream_count * sizeof(hipEvent_t)));
         t_d->ep_remote_buffers = reinterpret_cast<float**>(malloc(stream_count * sizeof(float*)));
-        if (!t_d->ep_aggregate_streams || !t_d->ep_aggregate_events || !t_d->ep_remote_buffers) {
+        t_d->ep_remote_weight_buffers =
+            reinterpret_cast<float**>(malloc(stream_count * sizeof(float*)));
+        if (!t_d->ep_aggregate_streams || !t_d->ep_aggregate_events || !t_d->ep_remote_buffers ||
+            !t_d->ep_remote_weight_buffers) {
             fprintf(stderr, "Failed to allocate expert aggregation metadata\n");
             exit(EXIT_FAILURE);
         }
 
         for (size_t i = 0; i < stream_count; ++i)
             t_d->ep_remote_buffers[i] = nullptr;
+        for (size_t i = 0; i < stream_count; ++i)
+            t_d->ep_remote_weight_buffers[i] = nullptr;
 
         const size_t scratch_bytes =
             (size_t)batch_size * experts_per_token * hidden_dim * sizeof(float);
+        const size_t weight_bytes = (size_t)batch_size * experts_per_token * sizeof(float);
         for (size_t i = 0; i < stream_count; ++i) {
             CHECK_HIP(
                 hipStreamCreateWithFlags(&t_d->ep_aggregate_streams[i], hipStreamNonBlocking));
             CHECK_HIP(hipEventCreateWithFlags(&t_d->ep_aggregate_events[i], hipEventDisableTiming));
             if (scratch_bytes > 0)
                 CHECK_HIP(hipMalloc(&t_d->ep_remote_buffers[i], scratch_bytes));
+            if (weight_bytes > 0)
+                CHECK_HIP(hipMalloc(&t_d->ep_remote_weight_buffers[i], weight_bytes));
         }
         t_d->ep_remote_buffer_bytes = scratch_bytes;
+        t_d->ep_remote_weight_bytes = weight_bytes;
     }
 
     // Compact KV allocation with per-layer capacities for cyclic cache
@@ -615,6 +626,15 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
         free(t_d->ep_remote_buffers);
         t_d->ep_remote_buffers = nullptr;
         t_d->ep_remote_buffer_bytes = 0;
+    }
+    if (t_d->ep_remote_weight_buffers) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_remote_weight_buffers[i])
+                CHECK_HIP(hipFree(t_d->ep_remote_weight_buffers[i]));
+        }
+        free(t_d->ep_remote_weight_buffers);
+        t_d->ep_remote_weight_buffers = nullptr;
+        t_d->ep_remote_weight_bytes = 0;
     }
 
     for (int i = 0; i < 2; ++i) {

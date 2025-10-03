@@ -676,6 +676,9 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
             hipStream_t* agg_streams = transformer->ep_aggregate_streams;
             hipEvent_t* agg_events = transformer->ep_aggregate_events;
             float** agg_buffers = transformer->ep_remote_buffers;
+            float** weight_buffers = transformer->ep_remote_weight_buffers;
+            const size_t agg_capacity_bytes = transformer->ep_remote_buffer_bytes;
+            const size_t weight_capacity_bytes = transformer->ep_remote_weight_bytes;
 
             // Schedule remote shards first so their execution can overlap the local shard.
             for (int shard_idx = 0; shard_idx < ep_size; ++shard_idx) {
@@ -761,23 +764,73 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
                 }
 
                 if (work.total > 0) {
-                    remote_local_offset = 0;
+                    float* dispatch_tokens = nullptr;
+                    if (agg_buffers && shard_idx < transformer->ep_size)
+                        dispatch_tokens = agg_buffers[shard_idx];
+                    float* dispatch_weights = nullptr;
+                    if (weight_buffers && shard_idx < transformer->ep_size)
+                        dispatch_weights = weight_buffers[shard_idx];
+
+                    const size_t tokens_total_bytes =
+                        (size_t)work.total * hidden_dim * sizeof(float);
+                    const size_t weights_total_bytes = (size_t)work.total * sizeof(float);
+
+                    if (!dispatch_tokens || tokens_total_bytes > agg_capacity_bytes) {
+                        fprintf(
+                            stderr,
+                            "Remote dispatch scratch buffer unavailable or too small (need %zu, "
+                            "have %zu)\n",
+                            tokens_total_bytes, agg_capacity_bytes);
+                        exit(EXIT_FAILURE);
+                    }
+                    if ((!dispatch_weights && weights_total_bytes > 0) ||
+                        weights_total_bytes > weight_capacity_bytes) {
+                        fprintf(stderr,
+                                "Remote weight scratch buffer unavailable or too small (need %zu, "
+                                "have %zu)\n",
+                                weights_total_bytes, weight_capacity_bytes);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    // Pack per-remote payload locally so cross-GPU transfer is a single all-to-all
+                    // hop
+                    hipStream_t pack_stream = tls.compute;
+                    size_t token_elem_offset = 0;
+                    size_t weight_elem_offset = 0;
                     for (size_t i = 0; i < work.experts.size(); ++i) {
                         const int cnt = work.counts[i];
+                        if (cnt <= 0)
+                            continue;
                         const int goff = work.offsets[i];
-                        const size_t tokens_bytes = (size_t)cnt * hidden_dim * sizeof(float);
+                        const size_t token_elem_count = (size_t)cnt * hidden_dim;
+                        const size_t token_bytes = token_elem_count * sizeof(float);
                         const size_t weight_bytes = (size_t)cnt * sizeof(float);
 
-                        CHECK_HIP(hipMemcpyPeerAsync(
-                            workspace->x_by_expert + (long long)remote_local_offset * hidden_dim,
-                            remote_device, s->x_by_expert + (long long)goff * hidden_dim,
-                            primary_device, tokens_bytes, remote_stream));
+                        CHECK_HIP(hipMemcpyAsync(dispatch_tokens + token_elem_offset,
+                                                 s->x_by_expert + (size_t)goff * hidden_dim,
+                                                 token_bytes, hipMemcpyDeviceToDevice,
+                                                 pack_stream));
 
-                        CHECK_HIP(hipMemcpyPeerAsync(
-                            workspace->weights_by_expert + remote_local_offset, remote_device,
-                            s->weights_flat + goff, primary_device, weight_bytes, remote_stream));
+                        if (weight_bytes > 0) {
+                            CHECK_HIP(hipMemcpyAsync(dispatch_weights + weight_elem_offset,
+                                                     s->weights_flat + goff, weight_bytes,
+                                                     hipMemcpyDeviceToDevice, pack_stream));
+                        }
 
-                        remote_local_offset += cnt;
+                        token_elem_offset += token_elem_count;
+                        weight_elem_offset += (size_t)cnt;
+                    }
+                    CHECK_HIP(hipStreamSynchronize(pack_stream));
+
+                    if (tokens_total_bytes > 0) {
+                        CHECK_HIP(hipMemcpyPeerAsync(workspace->x_by_expert, remote_device,
+                                                     dispatch_tokens, primary_device,
+                                                     tokens_total_bytes, remote_stream));
+                    }
+                    if (weights_total_bytes > 0) {
+                        CHECK_HIP(hipMemcpyPeerAsync(workspace->weights_by_expert, remote_device,
+                                                     dispatch_weights, primary_device,
+                                                     weights_total_bytes, remote_stream));
                     }
                 }
 

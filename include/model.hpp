@@ -241,6 +241,8 @@ typedef struct {
     hipEvent_t* ep_aggregate_events;   // per-stream completion events for fan-in to stream 0
     float** ep_remote_buffers;         // per-shard scratch buffers for remote contributions
     size_t ep_remote_buffer_bytes;     // size in bytes of each per-shard scratch buffer
+    float** ep_remote_weight_buffers;  // per-shard scratch buffers for dispatch weights
+    size_t ep_remote_weight_bytes;     // size in bytes of each weight scratch buffer
 } OssTransformerHybrid;
 
 typedef struct {
