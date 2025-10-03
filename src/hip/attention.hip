@@ -76,6 +76,14 @@ __device__ __forceinline__ short to_bf16_bits(float v) { return bf16_bits(__floa
 
 __device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) { return bf16_bits(v); }
 
+__device__ __forceinline__ short to_bf16_bits(float v) {
+    return bf16_bits(__float2bfloat16(v));
+}
+
+__device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) {
+    return bf16_bits(v);
+}
+
 // ======================================================================
 // FlashAttention-2 decode kernel with MFMA tiling (head_dim == 64)
 // - One wave (64 threads) computes a Br x Bc tile (Br=Bc=16) using MFMA.
