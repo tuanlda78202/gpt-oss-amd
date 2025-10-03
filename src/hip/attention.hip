@@ -1,13 +1,13 @@
 #pragma once
 #include "BLAS.hip"
-#include <hip/hip_runtime.h>
-#include <vector>
 #include <cmath>
+#include <hip/hip_runtime.h>
 #include <limits>
 #include <stdint.h>
 #include <type_traits>
+#include <vector>
 
-template<typename T>
+template <typename T>
 __device__ __forceinline__ T ld_global_cond(const T* p) {
 #if defined(__HIP_DEVICE_COMPILE__)
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
@@ -25,7 +25,7 @@ __device__ __forceinline__ uint32_t ld_global_u32_cond(const uint32_t* p) {
     return *p;
 }
 
-template<int WIDTH>
+template <int WIDTH>
 __device__ __forceinline__ float wave_reduce_sum_width(float v) {
 #pragma unroll
     for (int off = WIDTH >> 1; off > 0; off >>= 1) {
@@ -42,11 +42,9 @@ static __device__ __forceinline__ void wave_sync() {
 #endif
 }
 
-static __device__ __forceinline__ bool is_pow2_int(int x) {
-    return (x & (x - 1)) == 0;
-}
+static __device__ __forceinline__ bool is_pow2_int(int x) { return (x & (x - 1)) == 0; }
 
-template<bool POW2>
+template <bool POW2>
 static __device__ __forceinline__ int ring_index(int t, int cap) {
     if constexpr (POW2)
         return t & (cap - 1);
@@ -54,9 +52,7 @@ static __device__ __forceinline__ int ring_index(int t, int cap) {
         return (t >= cap) ? (t % cap) : t;
 }
 
-static inline __device__ float bf16_to_f32_intr(__hip_bfloat16 x) {
-    return __bfloat162float(x);
-}
+static inline __device__ float bf16_to_f32_intr(__hip_bfloat16 x) { return __bfloat162float(x); }
 
 static __device__ __forceinline__ __hip_bfloat16 raw_to_bf16(uint16_t bits) {
     union {
@@ -74,17 +70,11 @@ __device__ __forceinline__ void unpack_bf16x2(uint32_t packed, float& lo, float&
     hi = bf16_to_f32_intr(bf_hi);
 }
 
-__device__ __forceinline__ bool is_aligned_4(const void* p) {
-    return ((uintptr_t)p & 3) == 0;
-}
+__device__ __forceinline__ bool is_aligned_4(const void* p) { return ((uintptr_t)p & 3) == 0; }
 
-__device__ __forceinline__ short to_bf16_bits(float v) {
-    return bf16_bits(__float2bfloat16(v));
-}
+__device__ __forceinline__ short to_bf16_bits(float v) { return bf16_bits(__float2bfloat16(v)); }
 
-__device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) {
-    return bf16_bits(v);
-}
+__device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) { return bf16_bits(v); }
 
 // ======================================================================
 // FlashAttention-2 decode kernel with MFMA tiling (head_dim == 64)
@@ -92,24 +82,22 @@ __device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) {
 // - K and V tiles are staged in LDS as bf16 to amortize global memory.
 // - Online softmax is performed per tile with register reductions.
 // ======================================================================
-template<typename KV_T, bool USE_MASK, int BR_TILE = 16, int BC_TILE = 16>
-__global__ void fa2_decode_mfma_head64(
-    const float* __restrict__ q_batch,      // (B, H*64)
-    const void*  __restrict__ k_cache_base, // base (byte addr)
-    const void*  __restrict__ v_cache_base, // base (byte addr)
-    const float* __restrict__ mask,         // (T,T) if USE_MASK
-    const __hip_bfloat16* __restrict__ attn_sinks_half, // (H) or nullptr
-    float* __restrict__ tb_batch,           // (B, H*64)  [OUTPUT]
-    int B, int seq_len, int /*head_dim == 64*/, int kv_dim, int kv_mul,
-    int sliding_window, int layer_idx, int n_attn_heads,
-    const int* __restrict__ d_pos_per_token,  // (B)
-    const int* __restrict__ d_batch_indices,  // (B)
-    long long /*B_stride*/,                   // unused (layer offsets used)
-    const long long* __restrict__ d_layer_kv_off,
-    const int*       __restrict__ d_layer_kv_cap,
-    const int*       __restrict__ d_layer_is_local,
-    int bc_tile_hint)
-{
+template <typename KV_T, bool USE_MASK, int BR_TILE = 16, int BC_TILE = 16>
+__global__ void
+fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B, H*64)
+                       const void* __restrict__ k_cache_base,              // base (byte addr)
+                       const void* __restrict__ v_cache_base,              // base (byte addr)
+                       const float* __restrict__ mask,                     // (T,T) if USE_MASK
+                       const __hip_bfloat16* __restrict__ attn_sinks_half, // (H) or nullptr
+                       float* __restrict__ tb_batch,                       // (B, H*64)  [OUTPUT]
+                       int B, int seq_len, int /*head_dim == 64*/, int kv_dim, int kv_mul,
+                       int sliding_window, int layer_idx, int n_attn_heads,
+                       const int* __restrict__ d_pos_per_token, // (B)
+                       const int* __restrict__ d_batch_indices, // (B)
+                       long long /*B_stride*/,                  // unused (layer offsets used)
+                       const long long* __restrict__ d_layer_kv_off,
+                       const int* __restrict__ d_layer_kv_cap,
+                       const int* __restrict__ d_layer_is_local, int bc_tile_hint) {
     static_assert(BR_TILE == 16, "This kernel assumes BR_TILE == 16");
     static_assert(BC_TILE == 16, "This kernel assumes BC_TILE == 16");
 
@@ -159,13 +147,16 @@ __global__ void fa2_decode_mfma_head64(
     const long long batch_off_elems = kv_base + static_cast<long long>(gb) * cap * kv_dim;
 
     const size_t elem_size = sizeof(KV_T);
-    const char* __restrict__ k_layer_base = reinterpret_cast<const char*>(k_cache_base) + batch_off_elems * elem_size;
-    const char* __restrict__ v_layer_base = reinterpret_cast<const char*>(v_cache_base) + batch_off_elems * elem_size;
+    const char* __restrict__ k_layer_base =
+        reinterpret_cast<const char*>(k_cache_base) + batch_off_elems * elem_size;
+    const char* __restrict__ v_layer_base =
+        reinterpret_cast<const char*>(v_cache_base) + batch_off_elems * elem_size;
 
     const long long head_off_bytes = static_cast<long long>(kv_head) * HEAD_DIM * elem_size;
     const long long step_bytes = static_cast<long long>(kv_dim) * elem_size;
 
-    const float* __restrict__ q_block = q_batch + static_cast<long long>(b) * n_attn_heads * HEAD_DIM;
+    const float* __restrict__ q_block =
+        q_batch + static_cast<long long>(b) * n_attn_heads * HEAD_DIM;
     float* __restrict__ o_block = tb_batch + static_cast<long long>(b) * n_attn_heads * HEAD_DIM;
 
     const float inv_sqrt_d = rsqrtf(static_cast<float>(HEAD_DIM));
@@ -175,7 +166,7 @@ __global__ void fa2_decode_mfma_head64(
     __shared__ float row_prev_m[BR_TILE];
     __shared__ float row_scale[BR_TILE];
     __shared__ float row_inv_l[BR_TILE];
-    __shared__ int   tile_rt[BC_TILE];
+    __shared__ int tile_rt[BC_TILE];
     __shared__ short k_tile[BC_TILE][HEAD_DIM];
     __shared__ short v_tile[HEAD_DIM][BC_TILE];
     __shared__ short w_tile[BR_TILE][BC_TILE];
@@ -194,7 +185,8 @@ __global__ void fa2_decode_mfma_head64(
         i16x4 frag = {0, 0, 0, 0};
         const int row = lane_x;
         if (row < rows_active) {
-            const float* __restrict__ q_row = q_block + static_cast<long long>(h_base + row) * HEAD_DIM;
+            const float* __restrict__ q_row =
+                q_block + static_cast<long long>(h_base + row) * HEAD_DIM;
             const int k_base = kk + lane_y * 4;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -218,8 +210,10 @@ __global__ void fa2_decode_mfma_head64(
 
     for (int t0 = t_start; t0 < t_end; t0 += bc_try) {
         int bc = t_end - t0;
-        if (bc > bc_try) bc = bc_try;
-        if (bc > BC_TILE) bc = BC_TILE;
+        if (bc > bc_try)
+            bc = bc_try;
+        if (bc > BC_TILE)
+            bc = BC_TILE;
 
         const int col = lane_x;
         const bool col_active = (col < bc);
@@ -246,7 +240,8 @@ __global__ void fa2_decode_mfma_head64(
             const int c = idx / HEAD_DIM;
             const int dim = idx % HEAD_DIM;
             const int rt_col = tile_rt[c];
-            const long long base_offset = static_cast<long long>(rt_col) * step_bytes + head_off_bytes;
+            const long long base_offset =
+                static_cast<long long>(rt_col) * step_bytes + head_off_bytes;
             const char* __restrict__ kp_bytes = k_layer_base + base_offset;
             const char* __restrict__ vp_bytes = v_layer_base + base_offset;
 
@@ -260,8 +255,10 @@ __global__ void fa2_decode_mfma_head64(
                 k_bits = to_bf16_bits(k_val);
                 v_bits = to_bf16_bits(v_val);
             } else {
-                const __hip_bfloat16* __restrict__ k_ptr = reinterpret_cast<const __hip_bfloat16*>(kp_bytes);
-                const __hip_bfloat16* __restrict__ v_ptr = reinterpret_cast<const __hip_bfloat16*>(vp_bytes);
+                const __hip_bfloat16* __restrict__ k_ptr =
+                    reinterpret_cast<const __hip_bfloat16*>(kp_bytes);
+                const __hip_bfloat16* __restrict__ v_ptr =
+                    reinterpret_cast<const __hip_bfloat16*>(vp_bytes);
                 k_bits = to_bf16_bits(k_ptr[dim]);
                 v_bits = to_bf16_bits(v_ptr[dim]);
             }
@@ -286,7 +283,8 @@ __global__ void fa2_decode_mfma_head64(
                     }
                 }
             }
-            score_frag = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(q_frag[frag_idx], b_frag, score_frag, 0, 0, 0);
+            score_frag = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(q_frag[frag_idx], b_frag,
+                                                                   score_frag, 0, 0, 0);
         }
 
         float score_reg[4];
@@ -494,36 +492,23 @@ __global__ void fa2_decode_mfma_head64(
             continue;
         }
         float* __restrict__ o_row = o_block + static_cast<long long>(h_base + row) * HEAD_DIM;
-        if (col0 < HEAD_DIM) o_row[col0] = o_frag0[i];
-        if (col1 < HEAD_DIM) o_row[col1] = o_frag1[i];
-        if (col2 < HEAD_DIM) o_row[col2] = o_frag2[i];
-        if (col3 < HEAD_DIM) o_row[col3] = o_frag3[i];
+        if (col0 < HEAD_DIM)
+            o_row[col0] = o_frag0[i];
+        if (col1 < HEAD_DIM)
+            o_row[col1] = o_frag1[i];
+        if (col2 < HEAD_DIM)
+            o_row[col2] = o_frag2[i];
+        if (col3 < HEAD_DIM)
+            o_row[col3] = o_frag3[i];
     }
 }
 
-void fa(
-    const float* q_batch,
-    const void*  k_cache,
-    const void*  v_cache,
-    const float* mask,
-    const __hip_bfloat16* attn_sinks,
-    float* tb_batch,
-    int B,
-    int seq_len, int head_dim, int kv_dim, int kv_mul,
-    int sliding_window, int layer_idx, int n_attn_heads,
-    int kv_cache_is_fp16,
-    const int* d_pos_per_token,
-    const int* d_batch_indices,
-    long long B_stride,
-    int /*max_pos_in_batch*/,
-    float* /*workspace_partial_O*/,
-    float* /*workspace_partial_m*/,
-    float* /*workspace_partial_l*/,
-    hipStream_t stream,
-    const long long* d_layer_kv_off,
-    const int* d_layer_kv_cap,
-    const int* d_layer_is_local)
-{
+void fa(const float* q_batch, const void* k_cache, const void* v_cache, const float* mask,
+        const __hip_bfloat16* attn_sinks, float* tb_batch, int B, int seq_len, int head_dim,
+        int kv_dim, int kv_mul, int sliding_window, int layer_idx, int n_attn_heads,
+        int kv_cache_is_fp16, const int* d_pos_per_token, const int* d_batch_indices,
+        long long B_stride, int /*max_pos_in_batch*/, hipStream_t stream,
+        const long long* d_layer_kv_off, const int* d_layer_kv_cap, const int* d_layer_is_local) {
     if (B <= 0 || n_attn_heads <= 0 || head_dim != 64) {
         return;
     }
@@ -533,7 +518,8 @@ void fa(
     }
 
     const __hip_bfloat16* attn_sinks_head =
-        (attn_sinks != nullptr) ? (attn_sinks + static_cast<long long>(layer_idx) * n_attn_heads) : nullptr;
+        (attn_sinks != nullptr) ? (attn_sinks + static_cast<long long>(layer_idx) * n_attn_heads)
+                                : nullptr;
     const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
 
     dim3 block(64);
@@ -542,43 +528,31 @@ void fa(
 
     if (kv_cache_is_fp16) {
         if (use_mask) {
-            hipLaunchKernelGGL(
-                (fa2_decode_mfma_head64<__hip_bfloat16, true>),
-                grid, block, 0, stream,
-                q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
-                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
-                d_pos_per_token, d_batch_indices, B_stride,
-                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local,
-                bc_tile_hint);
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<__hip_bfloat16, true>), grid, block, 0,
+                               stream, q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
+                               B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
+                               n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         } else {
-            hipLaunchKernelGGL(
-                (fa2_decode_mfma_head64<__hip_bfloat16, false>),
-                grid, block, 0, stream,
-                q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch,
-                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
-                d_pos_per_token, d_batch_indices, B_stride,
-                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local,
-                bc_tile_hint);
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<__hip_bfloat16, false>), grid, block, 0,
+                               stream, q_batch, k_cache, v_cache, nullptr, attn_sinks_head,
+                               tb_batch, B, seq_len, head_dim, kv_dim, kv_mul, sliding_window,
+                               layer_idx, n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         }
     } else {
         if (use_mask) {
-            hipLaunchKernelGGL(
-                (fa2_decode_mfma_head64<float, true>),
-                grid, block, 0, stream,
-                q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
-                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
-                d_pos_per_token, d_batch_indices, B_stride,
-                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local,
-                bc_tile_hint);
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<float, true>), grid, block, 0, stream,
+                               q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch, B,
+                               seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
+                               n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         } else {
-            hipLaunchKernelGGL(
-                (fa2_decode_mfma_head64<float, false>),
-                grid, block, 0, stream,
-                q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch,
-                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads,
-                d_pos_per_token, d_batch_indices, B_stride,
-                d_layer_kv_off, d_layer_kv_cap, d_layer_is_local,
-                bc_tile_hint);
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<float, false>), grid, block, 0, stream,
+                               q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch, B,
+                               seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
+                               n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         }
     }
     CHECK_HIP(hipGetLastError());
