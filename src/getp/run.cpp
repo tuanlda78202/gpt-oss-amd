@@ -152,9 +152,9 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
     int available_devices = 0;
     CHECK_HIP(hipGetDeviceCount(&available_devices));
 
-    const bool replicate_experts = transformer_oss->config.n_experts == 32;
+    g_duplicate_experts = transformer_oss->config.n_experts == 32;
     int requested_dp = 8;
-    int requested_ep = replicate_experts ? requested_dp : 8;
+    int requested_ep = g_duplicate_experts ? requested_dp : 8;
     if (requested_dp <= 0)
         requested_dp = 1;
     if (requested_ep <= 0)
@@ -219,7 +219,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
         }
 
         copy_transformer_to_device(transformer_oss, g_all_models[idx], device_id, dp_rank,
-                                   g_ep_size, ep_rank, use_kv16, replicate_experts, odd_window);
+                                   g_ep_size, ep_rank, use_kv16, g_duplicate_experts, odd_window);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
@@ -237,7 +237,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
 
     g_active_devices = required_devices;
 
-    if (g_ep_size > 0) {
+    if (g_ep_size > 0 && !g_duplicate_experts) {
         g_expert_shards = (OssExpertShard*)malloc(sizeof(OssExpertShard) * g_ep_size);
         if (!g_expert_shards) {
             fprintf(stderr, "malloc expert shards failed\n");
@@ -250,7 +250,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
             shard.workspace_count = g_dp_world_size;
             shard.workspaces =
                 (OssExpertWorkspace*)malloc(sizeof(OssExpertWorkspace) * shard.workspace_count);
-            const int streams_per_dp = 2; // TODO: increase to K for bucketized overlap
+            const int streams_per_dp = 2;
             shard.streams_per_dp = streams_per_dp;
             shard.streams = (hipStream_t*)malloc(sizeof(hipStream_t) * shard.workspace_count *
                                                  shard.streams_per_dp);
@@ -287,7 +287,7 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
     for (int dp = 0; dp < g_dp_world_size; ++dp) {
         g_dp_groups[dp].dp_rank = dp;
 
-        if (replicate_experts) {
+        if (g_duplicate_experts) {
             g_dp_groups[dp].ep_size = 1;
             g_dp_groups[dp].primary_shard_index = 0;
             g_dp_groups[dp].shards = (OssExpertShard**)malloc(sizeof(OssExpertShard*));
@@ -680,8 +680,9 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
     std::atomic<int> next_batch{0};
 
-    // Warm-up OpenMP so nested inner parallel regions in forward() can run
-    configure_openmp_warmup(g_dp_world_size);
+    if (g_ep_size > 0 && !g_duplicate_experts) {
+        configure_openmp_warmup(g_dp_world_size);
+    }
     long long total_tokens = 0;
 
 #pragma omp parallel reduction(+ : total_tokens)

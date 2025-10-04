@@ -125,27 +125,36 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
             }
 
             const short* sB_ping = &smem.sB_T[ping][0];
+            const int m_gl = m0_cta + m0_wave + lane_x;
 
-            // Compute on current tile
-#pragma unroll
-            for (int kk = 0; kk < BK; kk += 16) {
-                int m_gl = m0_cta + m0_wave + lane_x;
-                i16x4 avec = {0, 0, 0, 0};
+            auto load_avec = [&](int kk_offset) {
+                i16x4 avec_local = {0, 0, 0, 0};
                 if (m_gl < M) {
-                    int k_gl_base = k0 + kk + lane_y * 4;
+                    int k_gl_base = k0 + kk_offset + lane_y * 4;
                     const __hip_bfloat16* gA_ptr = A + (size_t)m_gl * K + k_gl_base;
                     if (k_gl_base + 3 < K) {
-                        avec = *reinterpret_cast<const i16x4*>(gA_ptr);
+                        avec_local = *reinterpret_cast<const i16x4*>(gA_ptr);
                     } else {
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
                             int k_gl = k_gl_base + i;
                             if (k_gl < K) {
-                                avec[i] = bf16_bits(gA_ptr[i]);
+                                avec_local[i] = bf16_bits(gA_ptr[i]);
                             }
                         }
                     }
                 }
+                return avec_local;
+            };
+
+            i16x4 avec_curr = load_avec(0);
+
+            // Compute on current tile
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                i16x4 avec_next = {0, 0, 0, 0};
+                if (kk + 16 < BK)
+                    avec_next = load_avec(kk + 16);
 
                 const int k_row_base = kk + lane_y * 4;
 
@@ -167,10 +176,13 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
                 if (n_col3 < MT_N)
                     b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
-                c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
-                c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
-                c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b2, c2, 0, 0, 0);
-                c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b3, c3, 0, 0, 0);
+                c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b0, c0, 0, 0, 0);
+                c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b1, c1, 0, 0, 0);
+                c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b2, c2, 0, 0, 0);
+                c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b3, c3, 0, 0, 0);
+
+                if (kk + 16 < BK)
+                    avec_curr = avec_next;
             }
             __syncthreads();
         }
@@ -368,26 +380,35 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
             }
 
             const short* sB_ping = &smem.sB_T[ping][0];
+            const int m_gl = m0_cta + m0_wave + lane_x;
 
-#pragma unroll
-            for (int kk = 0; kk < BK; kk += 16) {
-                int m_gl = m0_cta + m0_wave + lane_x;
-                i16x4 avec = {0, 0, 0, 0};
+            auto load_avec = [&](int kk_offset) {
+                i16x4 avec_local = {0, 0, 0, 0};
                 if (m_gl < M) {
-                    int k_gl_base = k0 + kk + lane_y * 4;
+                    int k_gl_base = k0 + kk_offset + lane_y * 4;
                     const __hip_bfloat16* gA_ptr = A + (size_t)m_gl * K + k_gl_base;
                     if (k_gl_base + 3 < K) {
-                        avec = *reinterpret_cast<const i16x4*>(gA_ptr);
+                        avec_local = *reinterpret_cast<const i16x4*>(gA_ptr);
                     } else {
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
                             int k_gl = k_gl_base + i;
                             if (k_gl < K) {
-                                avec[i] = bf16_bits(gA_ptr[i]);
+                                avec_local[i] = bf16_bits(gA_ptr[i]);
                             }
                         }
                     }
                 }
+                return avec_local;
+            };
+
+            i16x4 avec_curr = load_avec(0);
+
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                i16x4 avec_next = {0, 0, 0, 0};
+                if (kk + 16 < BK)
+                    avec_next = load_avec(kk + 16);
 
                 const int k_row_base = kk + lane_y * 4;
 
@@ -413,10 +434,13 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
                     b3 = *reinterpret_cast<const i16x4*>(
                         &sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
-                c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
-                c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
-                c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b2, c2, 0, 0, 0);
-                c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b3, c3, 0, 0, 0);
+                c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b0, c0, 0, 0, 0);
+                c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b1, c1, 0, 0, 0);
+                c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b2, c2, 0, 0, 0);
+                c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b3, c3, 0, 0, 0);
+
+                if (kk + 16 < BK)
+                    avec_curr = avec_next;
             }
             __syncthreads();
         }
