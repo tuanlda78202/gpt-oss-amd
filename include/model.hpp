@@ -36,8 +36,7 @@ typedef struct {
     // Attention Config
     int head_dim;               // head dimension
     int n_attn_heads;           // number of query heads
-    int n_kv_heads;             // number of key/value heads (can be < query heads because of
-                                // MQA)
+    int n_kv_heads;             // number of key/value heads
     int seq_len;                // max sequence length e.g., 1024
     int initial_context_length; // e.g., 4096
     float rope_theta;           // rope theta e.g., 150000.0
@@ -45,7 +44,7 @@ typedef struct {
     int sliding_window;         // e.g., 128
     float swiglu_limit;         // e.g., 7.0
 
-    int batch_size; // static batch size for batched inference
+    int batch_size;
 } OssConfig;
 
 // ! Learned parameters

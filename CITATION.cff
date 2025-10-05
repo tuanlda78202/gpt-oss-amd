@@ -5,8 +5,8 @@ version: 0.1.0
 type: "Software"
 authors:
   - given-names: "Tuan (Charles)"
-    family-names: "Le Duc Anh"
+    family-names: "LDA"
   - given-names: "Quan"
-    family-names: "Tran Hong"
+    family-names: "TH"
 date-released: "2025-10-10"
 repository-code: "https://github.com/tuanlda78202/gpt-oss-amd"
