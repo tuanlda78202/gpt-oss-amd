@@ -43,7 +43,7 @@
 
 # ----------------------------- Python -----------------------------------
 # Ignore files with no extension
-*
+* --exclude LICENSE, CODEOWNERS
 !*/
 !*.*
 
