@@ -254,7 +254,6 @@ typedef struct {
     int capacity_tokens;
     int* work_queue;
     int work_queue_capacity;
-    // host-pinned mirror for async H2D of per-remote work queues
     int* h_work_queue;
     int h_work_queue_capacity;
 } OssExpertWorkspace;

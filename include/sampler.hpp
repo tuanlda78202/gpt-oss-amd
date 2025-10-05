@@ -3,11 +3,11 @@
 typedef struct {
     float prob;
     int index;
-} OssProbIndex; // struct used when sorting probabilities in top-p sampling
+} OssProbIndex;
 
 typedef struct {
     int vocab_size;
-    OssProbIndex* probindex; // buffer used in top-p sampling
+    OssProbIndex* probindex;
     float temperature;
     float topp;
     unsigned long long rng_state;

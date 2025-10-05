@@ -1,5 +1,3 @@
-// ! DO NOT MODIFY THIS FILE
-
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -50,11 +48,9 @@ int read_inputfile(const char* input_filename, int max_token_len, int max_seq_le
     if (openFile.is_open()) {
         std::string line;
 
-        // Read the number of Requests
         std::getline(openFile, line);
         num_reqs = atoi(line.c_str());
 
-        // Apply truncation if requested
         if (truncate_lines > 0 && truncate_lines < num_reqs) {
             printf("truncating input from %d to %d lines\n", num_reqs, truncate_lines);
             num_reqs = truncate_lines;
@@ -83,7 +79,6 @@ int read_inputfile(const char* input_filename, int max_token_len, int max_seq_le
 int write_outputfile(const char* output_filename, Requests* reqs) {
     std::string filename = output_filename;
 
-    // write File
     std::ofstream writeFile(filename.c_str());
     if (writeFile.is_open()) {
         for (int i = 0; i < reqs->num_reqs; i++) {
@@ -144,29 +139,24 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
             break;
         }
 
-        // Skip empty lines
         if (gt_line.empty() && gen_line.empty()) {
             line_num++;
             continue;
         }
 
-        // Parse tokens from both lines
         std::vector<int> gt_tokens, gen_tokens;
 
-        // Parse ground truth tokens
         std::istringstream gt_stream(gt_line);
         int token;
         while (gt_stream >> token) {
             gt_tokens.push_back(token);
         }
 
-        // Parse generated tokens
         std::istringstream gen_stream(gen_line);
         while (gen_stream >> token) {
             gen_tokens.push_back(token);
         }
 
-        // Compare token sequences
         bool line_matches = true;
         if (gt_tokens.size() != gen_tokens.size()) {
             printf("⚠️ Request #%d: Length mismatch (GT: %zu tokens, Generated: %zu tokens)\n",
@@ -179,7 +169,7 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
                         "❌ Request %d: Token mismatch at position %zu (GT: %d, Generated: %d)\n",
                         line_num, i, gt_tokens[i], gen_tokens[i]);
                     line_matches = false;
-                    break; // Show only first mismatch per line
+                    break;
                 }
             }
         }
@@ -193,7 +183,6 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
         line_num++;
     }
 
-    // Check if output file has extra lines
     if (std::getline(generated_file, gen_line)) {
         fprintf(stderr, "❌ Output file has more lines than GT\n");
         total_mismatches++;
@@ -252,7 +241,6 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     fflush(stdout);
     long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
     end = time_in_ms();
-    // Your goal is to achieve best throughput(=reduce elapsed time)!
     fprintf(stdout,
             "\n┌─────────────────────────────┐\n│ \033[1m⌛️ Time: %-13.6f\033[0m      │\n│ "
             "\033[1m⚡️ TPS: %-13.6f\033[0m       │\n└─────────────────────────────┘\n",
@@ -264,7 +252,7 @@ void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
         exit(EXIT_FAILURE);
     }
 
-    // ! Verification with configurable ground truth file
+    // ! Verification
     const char* ground_truth_file = verify_filename ? verify_filename : "tests/gt/output_20b.txt";
     int verification_result = verify_output(output_filename, ground_truth_file);
 

@@ -118,14 +118,12 @@ static void ensure_request_buffers(int required) {
     buf.capacity = required;
 }
 
-// Configure OpenMP for nested parallelism so inner overlaps in forward() can run in parallel
 static void configure_openmp_warmup(int outer_threads) {
     omp_set_dynamic(0);
     omp_set_max_active_levels(2);
     omp_set_nested(1);
     omp_set_num_threads(outer_threads);
 
-    // Optional affinity/perf knobs for stability
     setenv("OMP_PROC_BIND", "close", 1);
     setenv("OMP_PLACES", "cores", 1);
     setenv("KMP_BLOCKTIME", "0", 1);
@@ -185,7 +183,6 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int
         exit(EXIT_FAILURE);
     }
 
-    // Enable peer access between all participating devices when possible
     for (int src = 0; src < required_devices; ++src) {
         CHECK_HIP(hipSetDevice(src));
         for (int dst = 0; dst < required_devices; ++dst) {
@@ -494,7 +491,6 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         CHECK_HIP(hipStreamCreateWithFlags(&s_sampling, hipStreamNonBlocking));
     }
 
-    // Encode all prompts in the batch
     int** prompt_tokens = (int**)malloc(batch_size * sizeof(int*));
     int* num_prompt_tokens = (int*)malloc(batch_size * sizeof(int));
     int max_prompt_len = 0;
@@ -512,13 +508,11 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
             max_prompt_len = num_prompt_tokens[b];
     }
 
-    // Batch processing variables
     int* current_tokens = (int*)malloc(batch_size * sizeof(int));
     int* pos = (int*)malloc(batch_size * sizeof(int));
     bool* finished = (bool*)malloc(batch_size * sizeof(bool));
     int active_sequences = batch_size;
 
-    // Initialize batch state
     for (int b = 0; b < batch_size; b++) {
         current_tokens[b] = prompt_tokens[b][0];
         pos[b] = 0;
@@ -536,7 +530,6 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         fflush(stdout);
     }
 
-    // Main generation loop
     int* tokens_generated = (int*)calloc(batch_size, sizeof(int));
     int* max_generation_tokens = (int*)malloc(batch_size * sizeof(int));
 
@@ -580,7 +573,6 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     while (active_sequences > 0) {
         int valid_batch_size = 0;
 
-        // Continuous batching
         for (int b = 0; b < batch_size && valid_batch_size < batch_size; b++) {
             if (!finished[b] && pos[b] + 1 < steps) {
                 batch_tokens[valid_batch_size] = current_tokens[b];
@@ -699,7 +691,6 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
         CHECK_HIP(hipSetDevice(dp_rank));
 
-        // Per-thread sampler clone
         OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
         memcpy(sampler_copy, sampler, sizeof(OssSampler));
 
@@ -709,7 +700,6 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
         // const bool is_log_device = (dp_rank == 0);
         int local_batches = 0;
 
-        // Batched on this replica
 #pragma omp critical
         {
             printf("🚀 [DP device %d] Ready with batch_size = %d\n", dp_rank,
@@ -740,7 +730,7 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
             local_batches++;
         }
         free(sampler_copy);
-    } // omp parallel
+    }
 
     return total_tokens;
 }
