@@ -82,6 +82,6 @@ note.txt
 digest.txt
 legacy.hip/
 time_log.py
-tests/data/input.txt
-tests/data/output.txt
+tests/submission/input.txt
+tests/submission/output.txt
 log*.txt
