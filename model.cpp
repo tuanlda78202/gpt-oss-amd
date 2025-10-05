@@ -1,12 +1,15 @@
 #include "include/model.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
 
-    bool show_progress = total_size > 1024 * 1024 * 1024;
+    bool show_progress = false;
 
     if (show_progress) {
         printf("  %s (%.1f GB)...", tensor_name, total_size / (1024.0 * 1024.0 * 1024.0));
@@ -58,12 +61,38 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
 // ! Hybrid precision (BF16 weights + FP32 activations)
 void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int device_id,
                                 int dp_rank, int ep_size, int ep_rank, int use_kv16,
-                                bool replicate_experts) {
+                                bool replicate_experts, int odd_window = 0) {
     memcpy(&t_d->config, &t_fp32->config, sizeof(OssConfig));
 
     OssConfig* conf = &t_fp32->config;
     OssTransformerWeights* weights = &t_fp32->weights;
     OssRunState* state = &t_fp32->state;
+    OssRunState* state_d = &t_d->state;
+
+    // Initialize extended runtime bookkeeping for the device copy
+    state_d->h_layer_kv_cap = nullptr;
+    state_d->h_layer_is_local = nullptr;
+    state_d->h2d_stage_capacity = conf->batch_size;
+    state_d->h2d_stage_cursor = 0;
+    for (int i = 0; i < 2; ++i) {
+        state_d->h_tokens_staging[i] = nullptr;
+        state_d->h_pos_staging[i] = nullptr;
+        state_d->h_batch_indices_staging[i] = nullptr;
+        state_d->h2d_stage_copied[i] = nullptr;
+    }
+    state_d->d_wq_heavy = nullptr;
+    state_d->d_wq_light = nullptr;
+    state_d->d_wq_heavy_capacity = 0;
+    state_d->d_wq_light_capacity = 0;
+    state_d->forward_graph_enabled = false;
+    state_d->forward_graph_ready = false;
+    state_d->forward_graph = nullptr;
+    state_d->forward_graph_exec = nullptr;
+    state_d->forward_graph_batch_size = 0;
+
+    if (const char* graph_env = std::getenv("OSS_ENABLE_HIP_GRAPH")) {
+        state_d->forward_graph_enabled = (std::atoi(graph_env) != 0);
+    }
 
     int vocab_size = conf->vocab_size;
     int hidden_dim = conf->hidden_dim;
@@ -94,8 +123,12 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     t_d->ep_rank = ep_rank;
     t_d->ep_local_experts = local_experts;
     t_d->ep_expert_offset = expert_offset;
-    t_d->ep_work_queue = nullptr;
-    t_d->ep_work_queue_capacity = 0;
+    t_d->ep_aggregate_streams = nullptr;
+    t_d->ep_aggregate_events = nullptr;
+    t_d->ep_remote_buffers = nullptr;
+    t_d->ep_remote_buffer_bytes = 0;
+    t_d->ep_remote_weight_buffers = nullptr;
+    t_d->ep_remote_weight_bytes = 0;
 
     // printf("\nConverting model to hybrid precision...\n");
 
@@ -192,9 +225,45 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         hipMalloc(&t_d->state.att, (size_t)batch_size * n_attn_heads * seq_len * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.logits, (size_t)batch_size * vocab_size * sizeof(float)));
 
+    if (t_d->ep_size > 0) {
+        size_t stream_count = static_cast<size_t>(t_d->ep_size);
+        t_d->ep_aggregate_streams =
+            reinterpret_cast<hipStream_t*>(malloc(stream_count * sizeof(hipStream_t)));
+        t_d->ep_aggregate_events =
+            reinterpret_cast<hipEvent_t*>(malloc(stream_count * sizeof(hipEvent_t)));
+        t_d->ep_remote_buffers = reinterpret_cast<float**>(malloc(stream_count * sizeof(float*)));
+        t_d->ep_remote_weight_buffers =
+            reinterpret_cast<float**>(malloc(stream_count * sizeof(float*)));
+        if (!t_d->ep_aggregate_streams || !t_d->ep_aggregate_events || !t_d->ep_remote_buffers ||
+            !t_d->ep_remote_weight_buffers) {
+            fprintf(stderr, "Failed to allocate expert aggregation metadata\n");
+            exit(EXIT_FAILURE);
+        }
+
+        for (size_t i = 0; i < stream_count; ++i)
+            t_d->ep_remote_buffers[i] = nullptr;
+        for (size_t i = 0; i < stream_count; ++i)
+            t_d->ep_remote_weight_buffers[i] = nullptr;
+
+        const size_t scratch_bytes =
+            (size_t)batch_size * experts_per_token * hidden_dim * sizeof(float);
+        const size_t weight_bytes = (size_t)batch_size * experts_per_token * sizeof(float);
+        for (size_t i = 0; i < stream_count; ++i) {
+            CHECK_HIP(
+                hipStreamCreateWithFlags(&t_d->ep_aggregate_streams[i], hipStreamNonBlocking));
+            CHECK_HIP(hipEventCreateWithFlags(&t_d->ep_aggregate_events[i], hipEventDisableTiming));
+            if (scratch_bytes > 0)
+                CHECK_HIP(hipMalloc(&t_d->ep_remote_buffers[i], scratch_bytes));
+            if (weight_bytes > 0)
+                CHECK_HIP(hipMalloc(&t_d->ep_remote_weight_buffers[i], weight_bytes));
+        }
+        t_d->ep_remote_buffer_bytes = scratch_bytes;
+        t_d->ep_remote_weight_bytes = weight_bytes;
+    }
+
     // Compact KV allocation with per-layer capacities for cyclic cache
     const int kv_dim = n_kv_heads * head_dim;
-    const int W = conf->sliding_window;
+    const int W_even = std::max(0, conf->sliding_window);
     const size_t elem_sz = use_kv16 ? sizeof(__hip_bfloat16) : sizeof(float);
 
     // Host arrays for layout computation
@@ -202,16 +271,39 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     std::vector<int> h_is_local(n_layers);
     std::vector<long long> h_off(n_layers + 1, 0);
 
-    // Parity rule: mirror the existing mask parity (local on even layers when sliding_window > 0)
-    auto is_local_layer = [&](int l) { return (conf->sliding_window > 0) && ((l % 2) == 0); };
-
+    // Compute per-layer capacities: even layers use W_even, odd layers use odd_window if set
     for (int l = 0; l < n_layers; ++l) {
-        h_is_local[l] = is_local_layer(l) ? 1 : 0;      // keep behavior identical to mask
-        h_cap[l] = h_is_local[l] ? std::min(W, seq_len) // local: window
-                                 : seq_len;             // dense: full
+        const bool even = (l % 2 == 0);
+        int cap = seq_len;
+        int is_local = 0;
+
+        if (even && W_even > 0) {
+            is_local = 1;
+            cap = std::min(W_even, seq_len);
+        } else if (!even && odd_window > 0 && odd_window < seq_len) {
+            is_local = 1;
+            cap = odd_window;
+        } else {
+            is_local = 0;
+            cap = seq_len; // dense (full context)
+        }
+
+        h_is_local[l] = is_local;
+        h_cap[l] = cap;
         // pack (B, T_cap, kv_dim)
-        h_off[l + 1] = h_off[l] + (long long)batch_size * h_cap[l] * kv_dim;
+        h_off[l + 1] = h_off[l] + (long long)batch_size * cap * kv_dim;
     }
+    if (n_layers > 0) {
+        state_d->h_layer_kv_cap = (int*)malloc((size_t)n_layers * sizeof(int));
+        state_d->h_layer_is_local = (int*)malloc((size_t)n_layers * sizeof(int));
+        if (!state_d->h_layer_kv_cap || !state_d->h_layer_is_local) {
+            fprintf(stderr, "Failed to allocate host layer metadata buffers\n");
+            exit(EXIT_FAILURE);
+        }
+        std::memcpy(state_d->h_layer_kv_cap, h_cap.data(), (size_t)n_layers * sizeof(int));
+        std::memcpy(state_d->h_layer_is_local, h_is_local.data(), (size_t)n_layers * sizeof(int));
+    }
+
     const size_t kv_elems_total = (size_t)h_off.back();
     const size_t kv_bytes_total = kv_elems_total * elem_sz;
 
@@ -233,16 +325,26 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     // Device arrays are passed as kernel parameters directly
 
-    if (use_kv16) {
-        printf("Using 16-bit KV cache (bfloat16) with cyclic buffers\n");
-    } else {
-        printf("Using 32-bit KV cache (float32) with cyclic buffers\n");
-    }
+    // if (use_kv16) {
+    //     printf("Using 16-bit KV cache (bfloat16) with cyclic buffers\n");
+    // } else {
+    //     printf("Using 32-bit KV cache (float32) with cyclic buffers\n");
+    // }
     CHECK_HIP(hipMalloc(&t_d->state.mask, (size_t)seq_len * seq_len * sizeof(float)));
 
     CHECK_HIP(hipMalloc(&t_d->state.d_batch_indices, (size_t)batch_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.d_tokens, (size_t)batch_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.d_pos_per_token, (size_t)batch_size * sizeof(int)));
+    for (int i = 0; i < 2; ++i) {
+        CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&state_d->h_tokens_staging[i]),
+                                (size_t)batch_size * sizeof(int), hipHostMallocDefault));
+        CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&state_d->h_pos_staging[i]),
+                                (size_t)batch_size * sizeof(int), hipHostMallocDefault));
+        CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&state_d->h_batch_indices_staging[i]),
+                                (size_t)batch_size * sizeof(int), hipHostMallocDefault));
+        CHECK_HIP(hipEventCreateWithFlags(&state_d->h2d_stage_copied[i], hipEventDisableTiming));
+        CHECK_HIP(hipEventRecord(state_d->h2d_stage_copied[i], 0));
+    }
     CHECK_HIP(hipMalloc(&t_d->state.cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
 
@@ -263,16 +365,21 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(
         hipMalloc(&t_d->state.up_by_expert, (size_t)BK_max * intermediate_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.y_by_expert, (size_t)BK_max * hidden_dim * sizeof(float)));
+    const size_t wq_ints = (size_t)n_experts * 3;
+    CHECK_HIP(hipMalloc(&state_d->d_wq_heavy, wq_ints * sizeof(int)));
+    CHECK_HIP(hipMalloc(&state_d->d_wq_light, wq_ints * sizeof(int)));
+    state_d->d_wq_heavy_capacity = (int)wq_ints;
+    state_d->d_wq_light_capacity = (int)wq_ints;
 
-    int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
-    size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
-    size_t fa_ml_size = (size_t)batch_size * n_attn_heads * max_chunks * sizeof(float);
+    // int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
+    // size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
+    // size_t fa_ml_size = (size_t)batch_size * n_attn_heads * max_chunks * sizeof(float);
 
-    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_O, fa_O_size));
-    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_m, fa_ml_size));
-    CHECK_HIP(hipMalloc(&t_d->state.fa_partial_l, fa_ml_size));
+    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_O, fa_O_size));
+    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_m, fa_ml_size));
+    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_l, fa_ml_size));
 
-    printf("Converting and transferring weights...\n");
+    // printf("Converting and transferring weights...\n");
 
     // ! Stream conversion and transfer for weights (FP32 -> FP16)
     copy_large_tensor_streaming(&t_d->weights.token_embedding_table, weights->token_embedding_table,
@@ -414,13 +521,13 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipDeviceSynchronize());
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-    printf("Hybrid precision model loaded: %.1f GB allocated\n",
-           used_mem / (1024.0 * 1024.0 * 1024.0));
+    // printf("✅ Hybrid precision model loaded: %.1f GB allocated\n",
+    //        used_mem / (1024.0 * 1024.0 * 1024.0));
 }
 
 void free_transformer_on_device(OssTransformerHybrid* t_d) {
-    printf("\033[1;92m==================================================================\033["
-           "0m\n\033[1;92m♻️  FREE GPU MEMORY...\033[0m\n");
+    // printf("\033[1;92m==================================================================\033["
+    //        "0m\n\033[1;92m♻️  FREE GPU MEMORY...\033[0m\n");
 
     // Free BF16 weights
     CHECK_HIP(hipFree(t_d->weights.token_embedding_table));
@@ -482,14 +589,93 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->state.gate_by_expert));
     CHECK_HIP(hipFree(t_d->state.up_by_expert));
     CHECK_HIP(hipFree(t_d->state.y_by_expert));
-    CHECK_HIP(hipFree(t_d->state.fa_partial_O));
-    CHECK_HIP(hipFree(t_d->state.fa_partial_m));
-    CHECK_HIP(hipFree(t_d->state.fa_partial_l));
-    if (t_d->ep_work_queue)
-        CHECK_HIP(hipFree(t_d->ep_work_queue));
+    if (t_d->state.d_wq_heavy) {
+        CHECK_HIP(hipFree(t_d->state.d_wq_heavy));
+        t_d->state.d_wq_heavy = nullptr;
+        t_d->state.d_wq_heavy_capacity = 0;
+    }
+    if (t_d->state.d_wq_light) {
+        CHECK_HIP(hipFree(t_d->state.d_wq_light));
+        t_d->state.d_wq_light = nullptr;
+        t_d->state.d_wq_light_capacity = 0;
+    }
+    // CHECK_HIP(hipFree(t_d->state.fa_partial_O));
+    // CHECK_HIP(hipFree(t_d->state.fa_partial_m));
+    // CHECK_HIP(hipFree(t_d->state.fa_partial_l));
+    if (t_d->ep_aggregate_streams) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_aggregate_streams[i])
+                CHECK_HIP(hipStreamDestroy(t_d->ep_aggregate_streams[i]));
+        }
+        free(t_d->ep_aggregate_streams);
+        t_d->ep_aggregate_streams = nullptr;
+    }
+    if (t_d->ep_aggregate_events) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_aggregate_events[i])
+                CHECK_HIP(hipEventDestroy(t_d->ep_aggregate_events[i]));
+        }
+        free(t_d->ep_aggregate_events);
+        t_d->ep_aggregate_events = nullptr;
+    }
+    if (t_d->ep_remote_buffers) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_remote_buffers[i])
+                CHECK_HIP(hipFree(t_d->ep_remote_buffers[i]));
+        }
+        free(t_d->ep_remote_buffers);
+        t_d->ep_remote_buffers = nullptr;
+        t_d->ep_remote_buffer_bytes = 0;
+    }
+    if (t_d->ep_remote_weight_buffers) {
+        for (int i = 0; i < t_d->ep_size; ++i) {
+            if (t_d->ep_remote_weight_buffers[i])
+                CHECK_HIP(hipFree(t_d->ep_remote_weight_buffers[i]));
+        }
+        free(t_d->ep_remote_weight_buffers);
+        t_d->ep_remote_weight_buffers = nullptr;
+        t_d->ep_remote_weight_bytes = 0;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (t_d->state.h_tokens_staging[i]) {
+            CHECK_HIP(hipHostFree(t_d->state.h_tokens_staging[i]));
+            t_d->state.h_tokens_staging[i] = nullptr;
+        }
+        if (t_d->state.h_pos_staging[i]) {
+            CHECK_HIP(hipHostFree(t_d->state.h_pos_staging[i]));
+            t_d->state.h_pos_staging[i] = nullptr;
+        }
+        if (t_d->state.h_batch_indices_staging[i]) {
+            CHECK_HIP(hipHostFree(t_d->state.h_batch_indices_staging[i]));
+            t_d->state.h_batch_indices_staging[i] = nullptr;
+        }
+        if (t_d->state.h2d_stage_copied[i]) {
+            CHECK_HIP(hipEventDestroy(t_d->state.h2d_stage_copied[i]));
+            t_d->state.h2d_stage_copied[i] = nullptr;
+        }
+    }
+
+    if (t_d->state.h_layer_kv_cap) {
+        free(t_d->state.h_layer_kv_cap);
+        t_d->state.h_layer_kv_cap = nullptr;
+    }
+    if (t_d->state.h_layer_is_local) {
+        free(t_d->state.h_layer_is_local);
+        t_d->state.h_layer_is_local = nullptr;
+    }
+
+    if (t_d->state.forward_graph_exec) {
+        CHECK_HIP(hipGraphExecDestroy(t_d->state.forward_graph_exec));
+        t_d->state.forward_graph_exec = nullptr;
+    }
+    if (t_d->state.forward_graph) {
+        CHECK_HIP(hipGraphDestroy(t_d->state.forward_graph));
+        t_d->state.forward_graph = nullptr;
+    }
 
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
-    printf("GPU memory: %.1f GB free / %.1f GB total\n", free_mem / (1024.0 * 1024.0 * 1024.0),
-           total_mem / (1024.0 * 1024.0 * 1024.0));
+    // printf("GPU memory: %.1f GB free / %.1f GB total\n", free_mem / (1024.0 * 1024.0 * 1024.0),
+    //        total_mem / (1024.0 * 1024.0 * 1024.0));
 }

@@ -169,23 +169,45 @@ typedef struct {
     float* sin_vals;      // (head_dim/2) - persistent RoPE sin coefficients
 
     //  MoE expert-batching scratch buffers
-    int* assign_expert;    // [B*K] - expert assignment per token
-    int* assign_token;     // [B*K] - token index per assignment
-    float* assign_weight;  // [B*K] - router weight per assignment
-    int* expert_counts;    // [E] - tokens per expert (temp/reused as counters)
-    int* expert_offsets;   // [E+1] - exclusive prefix sum of expert_counts
-    int* tokens_flat;      // [B*K] - tokens grouped by expert
-    float* weights_flat;   // [B*K] - weights grouped by expert
-    float* x_by_expert;    // [B*K, H] - gathered input by expert
-    float* mlp1_by_expert; // [B*K, 2*I] - MLP1 output by expert
-    float* gate_by_expert; // [B*K, I] - gate values by expert
-    float* up_by_expert;   // [B*K, I] - up values by expert
-    float* y_by_expert;    // [B*K, H] - final output by expert
+    int* assign_expert;      // [B*K] - expert assignment per token
+    int* assign_token;       // [B*K] - token index per assignment
+    float* assign_weight;    // [B*K] - router weight per assignment
+    int* expert_counts;      // [E] - tokens per expert (temp/reused as counters)
+    int* expert_offsets;     // [E+1] - exclusive prefix sum of expert_counts
+    int* tokens_flat;        // [B*K] - tokens grouped by expert
+    float* weights_flat;     // [B*K] - weights grouped by expert
+    float* x_by_expert;      // [B*K, H] - gathered input by expert
+    float* mlp1_by_expert;   // [B*K, 2*I] - MLP1 output by expert
+    float* gate_by_expert;   // [B*K, I] - gate values by expert
+    float* up_by_expert;     // [B*K, I] - up values by expert
+    float* y_by_expert;      // [B*K, H] - final output by expert
+    int* d_wq_heavy;         // persistent MoE heavy bucket queue buffer [3*E]
+    int* d_wq_light;         // persistent MoE light bucket queue buffer [3*E]
+    int d_wq_heavy_capacity; // number of ints allocated for heavy queue
+    int d_wq_light_capacity; // number of ints allocated for light queue
 
     // Attention workspace buffers
     float* fa_partial_O; // Workspace for flash attention partial outputs
     float* fa_partial_m; // Workspace for flash attention partial max values
     float* fa_partial_l; // Workspace for flash attention partial normalizers
+
+    // Host-side copies and staging for overlap orchestration
+    int* h_layer_kv_cap;   // host view of per-layer kv capacities (immutable)
+    int* h_layer_is_local; // host view of per-layer locality flags (immutable)
+
+    int* h_tokens_staging[2];        // double-buffered pinned H2D staging (tokens)
+    int* h_pos_staging[2];           // double-buffered pinned H2D staging (positions)
+    int* h_batch_indices_staging[2]; // double-buffered pinned H2D staging (batch indices)
+    hipEvent_t h2d_stage_copied[2];  // events signalling copy completion per staging slot
+    int h2d_stage_capacity;          // number of elements each staging buffer can hold
+    int h2d_stage_cursor;            // ping-pong slot selector for staging reuse
+
+    // HIP graph capture handles (optional execution replay)
+    bool forward_graph_enabled;        // set via env/config to request graph capture
+    bool forward_graph_ready;          // true once graph has been captured/instantiated
+    hipGraph_t forward_graph;          // captured graph for forward path
+    hipGraphExec_t forward_graph_exec; // executable graph instance
+    int forward_graph_batch_size;      // batch size used for capture (for validation)
 } OssRunState;
 
 // ! Main Transformer struct
@@ -201,22 +223,26 @@ typedef struct {
 // ! Hybrid Precision Transformer
 typedef struct {
     OssConfig config;
-    OssTransformerWeightsBFloat16 weights; // FP16 weights for memory efficiency
+    OssTransformerWeightsBFloat16 weights; // BF16 weights for memory efficiency
     OssRunState state;                     // FP32 activations for numerical stability
     int fd;                                // file descriptor for memory mapping
     float* data;                           // memory mapped data pointer
     ssize_t file_size;                     // size of the checkpoint file in bytes
 
-    // EP
-    int device_id;
-    int ep_size;
-    int ep_rank;
-    int ep_local_experts;
-    int ep_expert_offset;
-    int dp_rank;
+    // Expert-parallel metadata
+    int device_id;        // HIP device hosting this shard
+    int ep_size;          // number of shards in the expert-parallel group
+    int ep_rank;          // shard rank within the group
+    int ep_local_experts; // number of experts owned by this shard
+    int ep_expert_offset; // global expert offset for this shard
+    int dp_rank;          // data-parallel replica rank owning this shard
 
-    int* ep_work_queue;
-    int ep_work_queue_capacity;
+    hipStream_t* ep_aggregate_streams; // per-shard aggregation streams on the primary device
+    hipEvent_t* ep_aggregate_events;   // per-stream completion events for fan-in to stream 0
+    float** ep_remote_buffers;         // per-shard scratch buffers for remote contributions
+    size_t ep_remote_buffer_bytes;     // size in bytes of each per-shard scratch buffer
+    float** ep_remote_weight_buffers;  // per-shard scratch buffers for dispatch weights
+    size_t ep_remote_weight_bytes;     // size in bytes of each weight scratch buffer
 } OssTransformerHybrid;
 
 typedef struct {
@@ -226,28 +252,27 @@ typedef struct {
     float* y_by_expert;
     int* tokens_by_expert;
     float* weights_by_expert;
-    float* e_by_token;
     int capacity_tokens;
-    int capacity_batch;
+    int* work_queue;
+    int work_queue_capacity;
+    // host-pinned mirror for async H2D of per-remote work queues
+    int* h_work_queue;
+    int h_work_queue_capacity;
 } OssExpertWorkspace;
 
 typedef struct {
-    OssTransformerHybrid* model;
-    int device_id;
-    OssExpertWorkspace workspace;
-    void* mutex_handle;
+    OssTransformerHybrid* model;    // shard-local transformer instance
+    int device_id;                  // HIP device for this shard
+    OssExpertWorkspace* workspaces; // per-DP workspaces
+    hipStream_t* streams; // per-DP inbound streams (flattened: dp_rank * streams_per_dp + k)
+    int streams_per_dp;   // number of inbound streams per DP slot (>=1)
+    void** mutex_handles; // per-DP mutex guards
+    int workspace_count;  // number of per-DP workspaces
 } OssExpertShard;
 
 typedef struct {
-    OssExpertShard** shards;
-    int dp_rank;
-    int ep_size;
-    int primary_shard_index;
+    OssExpertShard** shards; // array of shard descriptors (shared across groups)
+    int dp_rank;             // owning data-parallel replica rank
+    int ep_size;             // number of shards in this group
+    int primary_shard_index; // index within shards corresponding to primary device (-1 if none)
 } OssExpertParallelGroup;
-
-void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
-                                 const char* tensor_name);
-void copy_transformer_to_device(OssTransformer* t_h, OssTransformerHybrid* t_d, int device_id,
-                                int dp_rank, int ep_size, int ep_rank, int use_kv16,
-                                bool replicate_experts);
-void free_transformer_on_device(OssTransformerHybrid* t_d);

@@ -4,6 +4,7 @@
 #include "../sampler.cpp"
 #include "../tokenizer.hpp"
 #include "getp_eval.cpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -26,6 +27,7 @@ struct ThreadLocalBatchBuffers {
     int* sample_results_h = nullptr;
     int* sample_owner = nullptr;
     int* sample_slots = nullptr;
+    int* sample_slots_d = nullptr;
 };
 
 struct ThreadLocalRequestBuffers {
@@ -53,6 +55,10 @@ static void ensure_batch_buffers(int required) {
         CHECK_HIP(hipFree(buf.sample_results_d));
         buf.sample_results_d = nullptr;
     }
+    if (buf.sample_slots_d) {
+        CHECK_HIP(hipFree(buf.sample_slots_d));
+        buf.sample_slots_d = nullptr;
+    }
     release_host(buf.tokens);
     release_host(buf.positions);
     release_host(buf.indices);
@@ -71,6 +77,7 @@ static void ensure_batch_buffers(int required) {
     CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.positions), required * sizeof(int)));
     CHECK_HIP(hipHostMalloc(reinterpret_cast<void**>(&buf.indices), required * sizeof(int)));
     CHECK_HIP(hipMalloc(&buf.sample_results_d, required * sizeof(int)));
+    CHECK_HIP(hipMalloc(&buf.sample_slots_d, required * sizeof(int)));
     CHECK_HIP(
         hipHostMalloc(reinterpret_cast<void**>(&buf.sample_results_h), required * sizeof(int)));
 
@@ -111,6 +118,20 @@ static void ensure_request_buffers(int required) {
     buf.capacity = required;
 }
 
+// Configure OpenMP for nested parallelism so inner overlaps in forward() can run in parallel
+static void configure_openmp_warmup(int outer_threads) {
+    omp_set_dynamic(0);
+    omp_set_max_active_levels(2);
+    // omp_set_nested(1);
+    omp_set_num_threads(outer_threads);
+
+    // Optional affinity/perf knobs for stability
+    setenv("OMP_PROC_BIND", "close", 1);
+    setenv("OMP_PLACES", "cores", 1);
+    setenv("KMP_BLOCKTIME", "0", 1);
+    omp_set_schedule(omp_sched_static, 0);
+}
+
 static OssTransformerHybrid** g_all_models = nullptr;   // per-GPU transformer instances
 static OssExpertShard* g_expert_shards = nullptr;       // expert shards shared across DP
 static OssExpertParallelGroup* g_dp_groups = nullptr;   // data-parallel groups
@@ -125,18 +146,17 @@ bool g_duplicate_experts = false;
 void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
 
-    int batch_size = (transformer_oss->config.n_experts == 32) ? 890 : 256;
+    int batch_size = (transformer_oss->config.n_experts == 32) ? 890 : 768;
     int use_kv16 = 1;
-
     transformer_oss->config.batch_size = batch_size;
     transformer_oss->config.seq_len = 1024;
 
     int available_devices = 0;
     CHECK_HIP(hipGetDeviceCount(&available_devices));
 
-    const bool replicate_experts = transformer_oss->config.n_experts == 32;
+    g_duplicate_experts = transformer_oss->config.n_experts == 32;
     int requested_dp = 8;
-    int requested_ep = replicate_experts ? requested_dp : 8;
+    int requested_ep = g_duplicate_experts ? requested_dp : 8;
     if (requested_dp <= 0)
         requested_dp = 1;
     if (requested_ep <= 0)
@@ -201,14 +221,14 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
         }
 
         copy_transformer_to_device(transformer_oss, g_all_models[idx], device_id, dp_rank,
-                                   g_ep_size, ep_rank, use_kv16, replicate_experts);
+                                   g_ep_size, ep_rank, use_kv16, g_duplicate_experts);
 
         size_t free_mem, total_mem;
         CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
 #pragma omp critical
         {
-            printf("\n--- HYBRID WARM-UP COMPLETE (device %d | dp=%d ep=%d) ---\n", device_id,
-                   dp_rank, ep_rank);
+            printf("\n--- WARM-UP COMPLETE (device %d | dp=%d ep=%d) ---\n", device_id, dp_rank,
+                   ep_rank);
             printf("GPU Memory Status: Total %.2f GB, Used %.2f GB, Free %.2f GB\n",
                    total_mem / (1024.0 * 1024.0 * 1024.0),
                    (total_mem - free_mem) / (1024.0 * 1024.0 * 1024.0),
@@ -219,32 +239,57 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
 
     g_active_devices = required_devices;
 
-    if (g_ep_size > 0) {
+    if (g_ep_size > 0 && !g_duplicate_experts) {
         g_expert_shards = (OssExpertShard*)malloc(sizeof(OssExpertShard) * g_ep_size);
         if (!g_expert_shards) {
             fprintf(stderr, "malloc expert shards failed\n");
             exit(EXIT_FAILURE);
         }
         for (int ep = 0; ep < g_ep_size; ++ep) {
-            g_expert_shards[ep].model = g_all_models[ep];
-            g_expert_shards[ep].device_id = ep;
-            g_expert_shards[ep].workspace.x_by_expert = nullptr;
-            g_expert_shards[ep].workspace.mlp1_by_expert = nullptr;
-            g_expert_shards[ep].workspace.gate_by_expert = nullptr;
-            g_expert_shards[ep].workspace.y_by_expert = nullptr;
-            g_expert_shards[ep].workspace.tokens_by_expert = nullptr;
-            g_expert_shards[ep].workspace.weights_by_expert = nullptr;
-            g_expert_shards[ep].workspace.e_by_token = nullptr;
-            g_expert_shards[ep].workspace.capacity_tokens = 0;
-            g_expert_shards[ep].workspace.capacity_batch = 0;
-            g_expert_shards[ep].mutex_handle = new std::mutex();
+            OssExpertShard& shard = g_expert_shards[ep];
+            shard.model = g_all_models[ep];
+            shard.device_id = ep;
+            shard.workspace_count = g_dp_world_size;
+            shard.workspaces =
+                (OssExpertWorkspace*)malloc(sizeof(OssExpertWorkspace) * shard.workspace_count);
+            const int streams_per_dp = 2;
+            shard.streams_per_dp = streams_per_dp;
+            shard.streams = (hipStream_t*)malloc(sizeof(hipStream_t) * shard.workspace_count *
+                                                 shard.streams_per_dp);
+            shard.mutex_handles = (void**)malloc(sizeof(void*) * shard.workspace_count);
+            if (!shard.workspaces || !shard.streams || !shard.mutex_handles) {
+                fprintf(stderr, "Failed to allocate per-DP workspace metadata for shard %d\n", ep);
+                exit(EXIT_FAILURE);
+            }
+
+            CHECK_HIP(hipSetDevice(ep));
+            for (int dp = 0; dp < shard.workspace_count; ++dp) {
+                OssExpertWorkspace& ws = shard.workspaces[dp];
+                ws.x_by_expert = nullptr;
+                ws.mlp1_by_expert = nullptr;
+                ws.gate_by_expert = nullptr;
+                ws.y_by_expert = nullptr;
+                ws.tokens_by_expert = nullptr;
+                ws.weights_by_expert = nullptr;
+                ws.capacity_tokens = 0;
+                ws.work_queue = nullptr;
+                ws.work_queue_capacity = 0;
+                ws.h_work_queue = nullptr;
+                ws.h_work_queue_capacity = 0;
+
+                shard.mutex_handles[dp] = new std::mutex();
+                for (int k = 0; k < shard.streams_per_dp; ++k) {
+                    CHECK_HIP(hipStreamCreateWithFlags(
+                        &shard.streams[dp * shard.streams_per_dp + k], hipStreamNonBlocking));
+                }
+            }
         }
     }
 
     for (int dp = 0; dp < g_dp_world_size; ++dp) {
         g_dp_groups[dp].dp_rank = dp;
 
-        if (replicate_experts) {
+        if (g_duplicate_experts) {
             g_dp_groups[dp].ep_size = 1;
             g_dp_groups[dp].primary_shard_index = 0;
             g_dp_groups[dp].shards = (OssExpertShard**)malloc(sizeof(OssExpertShard*));
@@ -278,13 +323,9 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer) {
     }
 
     omp_set_num_threads(g_dp_world_size);
-
-    reset_batch_timings();
 }
 
 void finish(Transformer* transformer, Tokenizer* tokenizer) {
-    print_batch_timing_summary();
-
     if (g_dp_groups) {
         for (int dp = 0; dp < g_dp_world_size; ++dp) {
             if (g_dp_groups[dp].shards) {
@@ -300,22 +341,50 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
         for (int ep = 0; ep < g_ep_size; ++ep) {
             OssExpertShard* shard = &g_expert_shards[ep];
             CHECK_HIP(hipSetDevice(shard->device_id));
-            if (shard->workspace.x_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.x_by_expert));
-            if (shard->workspace.mlp1_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.mlp1_by_expert));
-            if (shard->workspace.gate_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.gate_by_expert));
-            if (shard->workspace.y_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.y_by_expert));
-            if (shard->workspace.tokens_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.tokens_by_expert));
-            if (shard->workspace.weights_by_expert)
-                CHECK_HIP(hipFree(shard->workspace.weights_by_expert));
-            if (shard->workspace.e_by_token)
-                CHECK_HIP(hipFree(shard->workspace.e_by_token));
-            delete reinterpret_cast<std::mutex*>(shard->mutex_handle);
-            shard->mutex_handle = nullptr;
+            for (int dp = 0; dp < shard->workspace_count; ++dp) {
+                OssExpertWorkspace& ws = shard->workspaces[dp];
+                if (ws.x_by_expert)
+                    CHECK_HIP(hipFree(ws.x_by_expert));
+                if (ws.mlp1_by_expert)
+                    CHECK_HIP(hipFree(ws.mlp1_by_expert));
+                if (ws.gate_by_expert)
+                    CHECK_HIP(hipFree(ws.gate_by_expert));
+                if (ws.y_by_expert)
+                    CHECK_HIP(hipFree(ws.y_by_expert));
+                if (ws.tokens_by_expert)
+                    CHECK_HIP(hipFree(ws.tokens_by_expert));
+                if (ws.weights_by_expert)
+                    CHECK_HIP(hipFree(ws.weights_by_expert));
+                if (ws.work_queue)
+                    CHECK_HIP(hipFree(ws.work_queue));
+                if (ws.h_work_queue)
+                    CHECK_HIP(hipHostFree(ws.h_work_queue));
+
+                if (shard->streams) {
+                    for (int k = 0; k < shard->streams_per_dp; ++k) {
+                        hipStream_t s = shard->streams[dp * shard->streams_per_dp + k];
+                        if (s)
+                            CHECK_HIP(hipStreamDestroy(s));
+                    }
+                }
+
+                if (shard->mutex_handles && shard->mutex_handles[dp]) {
+                    auto* mtx = reinterpret_cast<std::mutex*>(shard->mutex_handles[dp]);
+                    delete mtx;
+                    shard->mutex_handles[dp] = nullptr;
+                }
+            }
+
+            free(shard->workspaces);
+            shard->workspaces = nullptr;
+
+            free(shard->streams);
+            shard->streams = nullptr;
+
+            free(shard->mutex_handles);
+            shard->mutex_handles = nullptr;
+
+            shard->workspace_count = 0;
         }
         free(g_expert_shards);
         g_expert_shards = nullptr;
@@ -339,61 +408,12 @@ void finish(Transformer* transformer, Tokenizer* tokenizer) {
     size_t free_mem, total_mem;
     CHECK_HIP(hipMemGetInfo(&free_mem, &total_mem));
     size_t used_mem = total_mem - free_mem;
-    printf("\n--- HYBRID FINISH COMPLETE ---\n");
+    printf("\n--- FINISH COMPLETE ---\n");
     printf("GPU Memory Status:\n");
     printf("  Total: %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Used: %.2f GB\n", used_mem / (1024.0 * 1024.0 * 1024.0));
     printf("  Free: %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
     printf("-------------------------------\n");
-}
-
-void clear_lines(int num_lines) {
-    for (int i = 0; i < num_lines; i++) {
-        printf("\033[A\033[K");
-    }
-    fflush(stdout);
-}
-
-void progress_bar(int batch_size, int* tokens_generated, int* max_tokens, bool* finished) {
-    const char* GREEN = "\033[32m";
-    const char* BLUE = "\033[34m";
-    const char* YELLOW = "\033[33m";
-    const char* RED = "\033[31m";
-    const char* RESET = "\033[0m";
-    const char* BOLD = "\033[1m";
-
-    for (int i = 0; i < batch_size; i++) {
-        if (finished[i]) {
-            printf("%s#%-2d %s●●●●●●●●●●●●●●●● %s✓ Done%s\n", BOLD, i + 1, GREEN, GREEN, RESET);
-        } else {
-            int progress = (max_tokens[i] > 0) ? (tokens_generated[i] * 16 / max_tokens[i]) : 0;
-            if (progress > 16)
-                progress = 16;
-
-            printf("%s#%-2d %s", BOLD, i + 1, RESET);
-
-            const char* progress_color;
-            if (progress <= 4) {
-                progress_color = RED;
-            } else if (progress <= 8) {
-                progress_color = YELLOW;
-            } else if (progress <= 12) {
-                progress_color = BLUE;
-            } else {
-                progress_color = GREEN;
-            }
-
-            for (int j = 0; j < 16; j++) {
-                if (j < progress) {
-                    printf("%s●%s", progress_color, RESET);
-                } else {
-                    printf("○");
-                }
-            }
-            printf(" %s(%d/%d)%s\n", progress_color, tokens_generated[i], max_tokens[i], RESET);
-        }
-    }
-    fflush(stdout);
 }
 
 long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
@@ -418,7 +438,11 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     int* sample_results_h = buffers.sample_results_h;
     int* sample_results_d = buffers.sample_results_d;
 
-    // Encode all prompts in the batch
+    static thread_local hipStream_t s_sampling = nullptr;
+    if (!s_sampling) {
+        CHECK_HIP(hipStreamCreateWithFlags(&s_sampling, hipStreamNonBlocking));
+    }
+
     int** prompt_tokens = (int**)malloc(batch_size * sizeof(int*));
     int* num_prompt_tokens = (int*)malloc(batch_size * sizeof(int));
     int max_prompt_len = 0;
@@ -436,31 +460,28 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
             max_prompt_len = num_prompt_tokens[b];
     }
 
-    // Batch processing variables
     int* current_tokens = (int*)malloc(batch_size * sizeof(int));
     int* pos = (int*)malloc(batch_size * sizeof(int));
     bool* finished = (bool*)malloc(batch_size * sizeof(bool));
     int active_sequences = batch_size;
 
-    // Initialize batch state
     for (int b = 0; b < batch_size; b++) {
         current_tokens[b] = prompt_tokens[b][0];
         pos[b] = 0;
         finished[b] = false;
     }
 
-    // if (show_progress) {
-    //     for (int b = 0; b < batch_size; b++) {
-    //         printf("#%d: ", b + 1);
-    //         const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
-    //         safe_printf(first_piece);
-    //         printf(" | ");
-    //     }
-    //     printf("\n");
-    //     fflush(stdout);
-    // }
+    if (show_progress) {
+        for (int b = 0; b < batch_size; b++) {
+            printf("#%d: ", b + 1);
+            const char* first_piece = decode_piece(tokenizer, 200006, current_tokens[b]);
+            safe_printf(first_piece);
+            printf(" | ");
+        }
+        printf("\n");
+        fflush(stdout);
+    }
 
-    // Main generation loop
     int* tokens_generated = (int*)calloc(batch_size, sizeof(int));
     int* max_generation_tokens = (int*)malloc(batch_size * sizeof(int));
 
@@ -469,7 +490,7 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         max_generation_tokens[b] = remaining > 0 ? remaining : 0;
     }
 
-    const int progress_stride = 5;
+    const int progress_stride = 50;
     int iteration = 0;
 
     // if (show_progress) {
@@ -520,6 +541,15 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         float* batch_logits = forward(t_d, t_group, batch_tokens, batch_positions, valid_batch_size,
                                       batch_indices, t_d->config.batch_size);
 
+        hipEvent_t logits_ready_event = nullptr;
+        if (use_async_sampling) {
+            static thread_local hipEvent_t thread_logits_ready = nullptr;
+            if (!thread_logits_ready)
+                CHECK_HIP(hipEventCreateWithFlags(&thread_logits_ready, hipEventDisableTiming));
+            CHECK_HIP(hipEventRecord(thread_logits_ready, 0));
+            logits_ready_event = thread_logits_ready;
+        }
+
         int pending_samples = 0;
         for (int i = 0; i < valid_batch_size; i++) {
             int b_idx = batch_indices[i];
@@ -533,7 +563,6 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
                 sample_slots[pending_samples] = i;
                 pending_samples++;
             } else {
-
                 float* seq_logits = batch_logits + i * t_d->config.vocab_size;
                 int next_token = sample_oss_gpu(sampler_oss, seq_logits);
                 commit_generation(b_idx, next_token, true);
@@ -541,13 +570,19 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
         }
 
         if (use_async_sampling && pending_samples > 0) {
-            for (int s = 0; s < pending_samples; ++s) {
-                float* seq_logits = batch_logits + sample_slots[s] * t_d->config.vocab_size;
-                sample_argmax(seq_logits, t_d->config.vocab_size, sample_results_d + s);
-            }
+            CHECK_HIP(hipMemcpyAsync(buffers.sample_slots_d, sample_slots,
+                                     pending_samples * sizeof(int), hipMemcpyHostToDevice,
+                                     s_sampling));
+
+            sample_argmax_batched(batch_logits, t_d->config.vocab_size, buffers.sample_slots_d,
+                                  pending_samples, sample_results_d, s_sampling);
+
             CHECK_HIP(hipMemcpyAsync(sample_results_h, sample_results_d,
-                                     pending_samples * sizeof(int), hipMemcpyDeviceToHost, 0));
-            CHECK_HIP(hipStreamSynchronize(0));
+                                     pending_samples * sizeof(int), hipMemcpyDeviceToHost,
+                                     s_sampling));
+
+            CHECK_HIP(hipStreamSynchronize(s_sampling));
+
             for (int s = 0; s < pending_samples; ++s) {
                 int b_idx = sample_owner[s];
                 int next_token = sample_results_h[s];
@@ -589,6 +624,10 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
         batch_starts.push_back(start);
 
     std::atomic<int> next_batch{0};
+
+    if (g_ep_size > 0 && !g_duplicate_experts) {
+        configure_openmp_warmup(g_dp_world_size);
+    }
     long long total_tokens = 0;
 
 #pragma omp parallel reduction(+ : total_tokens)
@@ -605,20 +644,19 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
 
         CHECK_HIP(hipSetDevice(dp_rank));
 
-        // Per-thread sampler clone
         OssSampler* sampler_copy = (OssSampler*)malloc(sizeof(OssSampler));
         memcpy(sampler_copy, sampler, sizeof(OssSampler));
 
         ensure_request_buffers(max_batch_size);
         ThreadLocalRequestBuffers& req_buf = g_request_buffers;
 
-        const bool is_log_device = (dp_rank == 0);
+        // const bool is_log_device = (dp_rank == 0);
         int local_batches = 0;
 
-        // Batched on this replica
 #pragma omp critical
         {
-            printf("[DP device %d] Ready with batch_size = %d\n", dp_rank, t_d->config.batch_size);
+            printf("🚀 [DP device %d] Ready with batch_size = %d\n", dp_rank,
+                   t_d->config.batch_size);
             fflush(stdout);
         }
 
@@ -639,14 +677,13 @@ long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sam
                 out_tok_ptrs[i] = get_tok_gen_ptr(requests, req_idx);
             }
 
-            const bool enable_progress = true;
-
+            const bool enable_progress = false;
             total_tokens += generate(transformer, tokenizer, (Sampler*)sampler_copy, input_seqs,
                                      out_tok_ptrs, cur_bs, requests->max_seq_len, enable_progress);
             local_batches++;
         }
         free(sampler_copy);
-    } // omp parallel
+    }
 
     return total_tokens;
 }

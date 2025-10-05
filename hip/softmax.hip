@@ -43,9 +43,9 @@ __global__ void softmax_kernel(float* x, int batch_size, int size) {
     }
 }
 
-void softmax(float* x, int batch_size, int size) {
+void softmax(float* x, int batch_size, int size, hipStream_t stream = 0) {
     dim3 blockDim(256);
     dim3 gridDim(batch_size);
-    hipLaunchKernelGGL(softmax_kernel, gridDim, blockDim, 0, 0, x, batch_size, size);
+    hipLaunchKernelGGL(softmax_kernel, gridDim, blockDim, 0, stream, x, batch_size, size);
     CHECK_HIP(hipGetLastError());
 }

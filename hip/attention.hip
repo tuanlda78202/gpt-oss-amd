@@ -7,53 +7,53 @@
 #include <type_traits>
 #include <vector>
 
+template <typename T>
+__device__ __forceinline__ T ld_global_cond(const T* p) {
 #if defined(__HIP_DEVICE_COMPILE__)
-template <typename T>
-__device__ __forceinline__ T nt_load(const T* ptr) {
-    using base_t = std::remove_cv_t<T>;
-    if constexpr (std::is_same_v<base_t, float> || std::is_same_v<base_t, double> ||
-                  std::is_same_v<base_t, int32_t> || std::is_same_v<base_t, uint32_t> ||
-                  std::is_same_v<base_t, int64_t> || std::is_same_v<base_t, uint64_t>) {
-        return __builtin_nontemporal_load(ptr);
-    } else {
-        return *ptr;
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
+                  std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t> ||
+                  std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>) {
     }
-}
-template <typename T>
-__device__ __forceinline__ void nt_store(T* ptr, T value) {
-    using base_t = std::remove_cv_t<T>;
-    if constexpr (std::is_same_v<base_t, float> || std::is_same_v<base_t, double> ||
-                  std::is_same_v<base_t, int32_t> || std::is_same_v<base_t, uint32_t> ||
-                  std::is_same_v<base_t, int64_t> || std::is_same_v<base_t, uint64_t>) {
-        __builtin_nontemporal_store(value, ptr);
-    } else {
-        *ptr = value;
-    }
-}
-#else
-template <typename T>
-__device__ __forceinline__ T nt_load(const T* ptr) {
-    return *ptr;
-}
-template <typename T>
-__device__ __forceinline__ void nt_store(T* ptr, T v) {
-    *ptr = v;
-}
 #endif
+    return *p;
+}
 
-static __device__ __forceinline__ float wave_reduce_sum(float v) {
-    for (int off = warpSize >> 1; off > 0; off >>= 1)
-        v += __shfl_down(v, off);
+__device__ __forceinline__ uint32_t ld_global_u32_cond(const uint32_t* p) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_nontemporal_load(p);
+#endif
+    return *p;
+}
+
+template <int WIDTH>
+__device__ __forceinline__ float wave_reduce_sum_width(float v) {
+#pragma unroll
+    for (int off = WIDTH >> 1; off > 0; off >>= 1) {
+        v += __shfl_down(v, off, WIDTH);
+    }
     return v;
 }
-template <typename T>
-static __device__ __forceinline__ T wave_bcast(T x, int srcLane = 0) {
-    return __shfl(x, srcLane);
+
+static __device__ __forceinline__ void wave_sync() {
+#if defined(__CUDA_ARCH__)
+    __syncwarp();
+#elif defined(__HIP_DEVICE_COMPILE__)
+    __syncthreads();
+#endif
 }
 
 static __device__ __forceinline__ bool is_pow2_int(int x) { return (x & (x - 1)) == 0; }
 
+template <bool POW2>
+static __device__ __forceinline__ int ring_index(int t, int cap) {
+    if constexpr (POW2)
+        return t & (cap - 1);
+    else
+        return (t >= cap) ? (t % cap) : t;
+}
+
 static inline __device__ float bf16_to_f32_intr(__hip_bfloat16 x) { return __bfloat162float(x); }
+
 static __device__ __forceinline__ __hip_bfloat16 raw_to_bf16(uint16_t bits) {
     union {
         uint16_t u;
@@ -63,503 +63,491 @@ static __device__ __forceinline__ __hip_bfloat16 raw_to_bf16(uint16_t bits) {
     return conv.b;
 }
 
-#ifndef MAX_TPOS
-#define MAX_TPOS 8
-#endif
-#ifndef T_TILE
-#define T_TILE 256
-#endif
+__device__ __forceinline__ void unpack_bf16x2(uint32_t packed, float& lo, float& hi) {
+    __hip_bfloat16 bf_lo = raw_to_bf16(static_cast<uint16_t>(packed & 0xFFFF));
+    __hip_bfloat16 bf_hi = raw_to_bf16(static_cast<uint16_t>(packed >> 16));
+    lo = bf16_to_f32_intr(bf_lo);
+    hi = bf16_to_f32_intr(bf_hi);
+}
 
-template <typename KV_T, bool USE_MASK>
+__device__ __forceinline__ bool is_aligned_4(const void* p) { return ((uintptr_t)p & 3) == 0; }
+
+__device__ __forceinline__ short to_bf16_bits(float v) { return bf16_bits(__float2bfloat16(v)); }
+
+__device__ __forceinline__ short to_bf16_bits(__hip_bfloat16 v) { return bf16_bits(v); }
+
+// ======================================================================
+// FlashAttention-2 decode kernel with MFMA tiling (head_dim == 64)
+// - One wave (64 threads) computes a Br x Bc tile (Br=Bc=16) using MFMA.
+// - K and V tiles are staged in LDS as bf16 to amortize global memory.
+// - Online softmax is performed per tile with register reductions.
+// ======================================================================
+template <typename KV_T, bool USE_MASK, int BR_TILE = 16, int BC_TILE = 16>
 __global__ void
-fa_decode_reg_tiled_single(const float* __restrict__ q_batch,                  // (B, H*D)
-                           const void* __restrict__ k_cache_base,              // byte addressable
-                           const void* __restrict__ v_cache_base,              // byte addressable
-                           const float* __restrict__ mask,                     // (T,T) if USE_MASK
-                           const __hip_bfloat16* __restrict__ attn_sinks_half, // (H) or nullptr
-                           float* __restrict__ tb_batch,                       // (B, H*D)  [OUTPUT]
-                           int B, int seq_len, int head_dim, int kv_dim, int kv_mul,
-                           int sliding_window, int layer_idx, int n_attn_heads,
-                           const int* __restrict__ d_pos_per_token, // (B)
-                           const int* __restrict__ d_batch_indices, // (B)
-                           const long long* __restrict__ d_layer_kv_off,
-                           const int* __restrict__ d_layer_kv_cap,
-                           const int* __restrict__ d_layer_is_local) {
-    const int h = blockIdx.x;
+fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B, H*64)
+                       const void* __restrict__ k_cache_base,              // base (byte addr)
+                       const void* __restrict__ v_cache_base,              // base (byte addr)
+                       const float* __restrict__ mask,                     // (T,T) if USE_MASK
+                       const __hip_bfloat16* __restrict__ attn_sinks_half, // (H) or nullptr
+                       float* __restrict__ tb_batch,                       // (B, H*64)  [OUTPUT]
+                       int B, int seq_len, int /*head_dim == 64*/, int kv_dim, int kv_mul,
+                       int sliding_window, int layer_idx, int n_attn_heads,
+                       const int* __restrict__ d_pos_per_token, // (B)
+                       const int* __restrict__ d_batch_indices, // (B)
+                       long long /*B_stride*/,                  // unused (layer offsets used)
+                       const long long* __restrict__ d_layer_kv_off,
+                       const int* __restrict__ d_layer_kv_cap,
+                       const int* __restrict__ d_layer_is_local, int bc_tile_hint) {
+    static_assert(BR_TILE == 16, "This kernel assumes BR_TILE == 16");
+    static_assert(BC_TILE == 16, "This kernel assumes BC_TILE == 16");
+
+    constexpr int HEAD_DIM = 64;
+    constexpr int MFMA_K = 16;
+    constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
+
+    const int lane_id = threadIdx.x;
+    const int lane_x = lane_id % BC_TILE; // column within tile
+    const int lane_y = lane_id / BC_TILE; // K-slice group (0..3)
+
+    const int kv_head = blockIdx.x;
     const int b = blockIdx.y;
-    const int lane = threadIdx.x;
 
-    if (h >= n_attn_heads || b >= B)
+    if (lane_id >= 64 || b >= B) {
         return;
-
-    const int g = h / kv_mul;
-    const int pos_b = d_pos_per_token[b];
-    const int Lb = pos_b + 1;
-    const float inv_sqrt_d = rsqrtf((float)head_dim);
-
-    const float* __restrict__ q_head =
-        q_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
-    float* __restrict__ o_out =
-        tb_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
-
-    const int W = warpSize;
-    const int POS = (head_dim + W - 1) / W;
-    float q_reg[MAX_TPOS];
-    float o_reg[MAX_TPOS];
-
-#pragma unroll
-    for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-        int j = tpos * W + lane;
-        float qj = (tpos < POS && j < head_dim) ? q_head[j] * inv_sqrt_d : 0.0f;
-        q_reg[tpos] = qj;
-        o_reg[tpos] = 0.0f;
     }
 
+    if (kv_mul <= 0) {
+        return;
+    }
+
+    const int rows_active = min(kv_mul, BR_TILE);
+    if (rows_active <= 0) {
+        return;
+    }
+
+    const int h_base = kv_head * kv_mul;
+    if (h_base >= n_attn_heads) {
+        return;
+    }
+
+    const int pos_b = d_pos_per_token[b];
+    const int Lb = pos_b + 1;
+
+    const int local = d_layer_is_local[layer_idx];
     const long long kv_base = d_layer_kv_off[layer_idx];
     const int cap = d_layer_kv_cap[layer_idx];
-    const int local = d_layer_is_local[layer_idx];
     const bool cap_pow2 = is_pow2_int(cap);
 
-    const int gb = d_batch_indices[b];
-    const long long batch_off_elems = kv_base + (long long)gb * (long long)cap * kv_dim;
-
-    const size_t elem_size = sizeof(KV_T);
-    const char* __restrict__ k_layer_base = (const char*)k_cache_base + batch_off_elems * elem_size;
-    const char* __restrict__ v_layer_base = (const char*)v_cache_base + batch_off_elems * elem_size;
-
-    const bool local_and_nomask =
-        (local != 0) && !USE_MASK && (sliding_window > 0) && ((layer_idx & 1) == 0);
-    const int t_window_start = local_and_nomask ? max(0, pos_b - sliding_window + 1) : 0;
-    const int t_start = local_and_nomask ? t_window_start : 0;
+    const bool local_nomask = (local != 0) && !USE_MASK;
+    const int t_window_start = local_nomask ? max(0, pos_b - cap + 1) : 0;
+    const int t_start = local_nomask ? t_window_start : 0;
     const int t_end = Lb;
 
-    const long long head_off_bytes = ((long long)g * head_dim) * elem_size;
-    const long long step_bytes = ((long long)kv_dim) * elem_size;
-
-    float m_shared = -INFINITY;
-    float l_shared = 0.0f;
-
-    for (int t = t_start; t < t_end; ++t) {
-        const int rt = (local != 0) ? (cap_pow2 ? (t & (cap - 1)) : (t % cap)) : t;
-        const char* __restrict__ kp_bytes =
-            k_layer_base + (long long)rt * step_bytes + head_off_bytes;
-        const char* __restrict__ vp_bytes =
-            v_layer_base + (long long)rt * step_bytes + head_off_bytes;
-        const KV_T* __restrict__ k_head = reinterpret_cast<const KV_T*>(kp_bytes);
-        const KV_T* __restrict__ v_head = reinterpret_cast<const KV_T*>(vp_bytes);
-
-        float partial = 0.0f;
-#pragma unroll
-        for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-            int j = tpos * W + lane;
-            if (tpos < POS && j < head_dim) {
-                float kj = std::is_same<KV_T, float>::value
-                               ? nt_load(reinterpret_cast<const float*>(k_head) + j)
-                               : bf16_to_f32_intr(
-                                     nt_load(reinterpret_cast<const __hip_bfloat16*>(k_head) + j));
-                partial += q_reg[tpos] * kj;
-            }
-        }
-        float s = wave_reduce_sum(partial);
-        if constexpr (USE_MASK) {
-            if (lane == 0)
-                s += mask[(long long)pos_b * seq_len + t];
-        }
-        s = wave_bcast(s, 0);
-        if (!isfinite(s))
-            continue;
-
-        float scale_old, scale_new;
-        if (lane == 0) {
-            const float m_prev = m_shared;
-            const float l_prev = l_shared;
-            const float m_new = fmaxf(m_prev, s);
-            const float alpha = __expf(m_prev - m_new);
-            const float p = __expf(s - m_new);
-            const float l_new = alpha * l_prev + p;
-            scale_old = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
-            scale_new = (l_new > 0.0f) ? p / l_new : 0.0f;
-            m_shared = m_new;
-            l_shared = l_new;
-        }
-        scale_old = wave_bcast(scale_old, 0);
-        scale_new = wave_bcast(scale_new, 0);
-
-#pragma unroll
-        for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-            int j = tpos * W + lane;
-            if (tpos < POS && j < head_dim) {
-                float vj = std::is_same<KV_T, float>::value
-                               ? nt_load(reinterpret_cast<const float*>(v_head) + j)
-                               : bf16_to_f32_intr(
-                                     nt_load(reinterpret_cast<const __hip_bfloat16*>(v_head) + j));
-                o_reg[tpos] = scale_old * o_reg[tpos] + scale_new * vj;
-            }
-        }
-    }
-
-    if (attn_sinks_half != nullptr) {
-        float sink_s = __bfloat162float(attn_sinks_half[h]);
-        if (isfinite(sink_s)) {
-            const float m_prev = m_shared, l_prev = l_shared;
-            const float m_new = fmaxf(m_prev, sink_s);
-            const float a = __expf(m_prev - m_new) * l_prev;
-            const float b = __expf(sink_s - m_new);
-            const float denom = a + b;
-            const float r = (denom > 0.0f) ? (a / denom) : 1.0f;
-            float ren = wave_bcast((lane == 0) ? r : 0.0f, 0);
-#pragma unroll
-            for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-                int j = tpos * warpSize + lane;
-                if (tpos < POS && j < head_dim)
-                    o_reg[tpos] *= ren;
-            }
-        }
-    }
-
-#pragma unroll
-    for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-        int j = tpos * warpSize + lane;
-        if (tpos < POS && j < head_dim)
-            nt_store(o_out + j, o_reg[tpos]);
-    }
-}
-
-template <typename KV_T, bool USE_MASK>
-__global__ void fa_decode_reg_tiled_split_stage1(
-    const float* __restrict__ q_batch, const void* __restrict__ k_cache_base,
-    const void* __restrict__ v_cache_base, const float* __restrict__ mask,
-    float* __restrict__ O_partials, // [B*H*Smax, head_dim]
-    float* __restrict__ m_partials, // [B*H*Smax]
-    float* __restrict__ l_partials, // [B*H*Smax]
-    int B, int seq_len, int head_dim, int kv_dim, int kv_mul, int sliding_window, int layer_idx,
-    int n_attn_heads,
-    int Smax, // ceil(seq_len / T_TILE)
-    const int* __restrict__ d_pos_per_token, const int* __restrict__ d_batch_indices,
-    const long long* __restrict__ d_layer_kv_off, const int* __restrict__ d_layer_kv_cap,
-    const int* __restrict__ d_layer_is_local) {
-    const int h = blockIdx.x;
-    const int b = blockIdx.y;
-    const int sidx = blockIdx.z; // split index
-    const int lane = threadIdx.x;
-    if (h >= n_attn_heads || b >= B || sidx >= Smax)
-        return;
-
-    const int g = h / kv_mul;
-    const int pos_b = d_pos_per_token[b];
-    const int Lb = pos_b + 1;
-    const float inv_sqrt_d = rsqrtf((float)head_dim);
-
-    const int W = warpSize;
-    const int POS = (head_dim + W - 1) / W;
-
-    const float* __restrict__ q_head =
-        q_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
-
-    const long long kv_base = d_layer_kv_off[layer_idx];
-    const int cap = d_layer_kv_cap[layer_idx];
-    const int local = d_layer_is_local[layer_idx];
-    const bool cap_pow2 = is_pow2_int(cap);
-
     const int gb = d_batch_indices[b];
-    const long long batch_off_elems = kv_base + (long long)gb * (long long)cap * kv_dim;
+    const long long batch_off_elems = kv_base + static_cast<long long>(gb) * cap * kv_dim;
 
     const size_t elem_size = sizeof(KV_T);
-    const char* __restrict__ k_layer_base = (const char*)k_cache_base + batch_off_elems * elem_size;
-    const char* __restrict__ v_layer_base = (const char*)v_cache_base + batch_off_elems * elem_size;
+    const char* __restrict__ k_layer_base =
+        reinterpret_cast<const char*>(k_cache_base) + batch_off_elems * elem_size;
+    const char* __restrict__ v_layer_base =
+        reinterpret_cast<const char*>(v_cache_base) + batch_off_elems * elem_size;
 
-    const bool local_and_nomask =
-        (local != 0) && !USE_MASK && (sliding_window > 0) && ((layer_idx & 1) == 0);
-    const int t_window_start = local_and_nomask ? max(0, pos_b - sliding_window + 1) : 0;
-    const int t_start_full = local_and_nomask ? t_window_start : 0;
-    const int t_end_full = Lb;
+    const long long head_off_bytes = static_cast<long long>(kv_head) * HEAD_DIM * elem_size;
+    const long long step_bytes = static_cast<long long>(kv_dim) * elem_size;
 
-    const int t0 = t_start_full + sidx * T_TILE;
-    if (t0 >= t_end_full)
-        return;
-    const int t1 = min(t0 + T_TILE, t_end_full);
+    const float* __restrict__ q_block =
+        q_batch + static_cast<long long>(b) * n_attn_heads * HEAD_DIM;
+    float* __restrict__ o_block = tb_batch + static_cast<long long>(b) * n_attn_heads * HEAD_DIM;
 
-    float q_reg[MAX_TPOS], o_reg[MAX_TPOS];
-#pragma unroll
-    for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-        int j = tpos * W + lane;
-        float qj = (tpos < POS && j < head_dim) ? q_head[j] * inv_sqrt_d : 0.0f;
-        q_reg[tpos] = qj;
-        o_reg[tpos] = 0.0f;
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(HEAD_DIM));
+
+    __shared__ float row_m[BR_TILE];
+    __shared__ float row_l[BR_TILE];
+    __shared__ float row_prev_m[BR_TILE];
+    __shared__ float row_scale[BR_TILE];
+    __shared__ float row_inv_l[BR_TILE];
+    __shared__ int tile_rt[BC_TILE];
+    __shared__ short k_tile[BC_TILE][HEAD_DIM];
+    __shared__ short v_tile[HEAD_DIM][BC_TILE];
+    __shared__ short w_tile[BR_TILE][BC_TILE];
+
+    if (lane_id < BR_TILE) {
+        row_m[lane_id] = NEG_INF;
+        row_l[lane_id] = 0.0f;
     }
+    __syncthreads();
 
-    const long long head_off_bytes = ((long long)g * head_dim) * elem_size;
-    const long long step_bytes = ((long long)kv_dim) * elem_size;
-
-    float m_local = -INFINITY;
-    float l_local = 0.0f;
-
-    for (int t = t0; t < t1; ++t) {
-        const int rt = (local != 0) ? (cap_pow2 ? (t & (cap - 1)) : (t % cap)) : t;
-        const char* __restrict__ kp_bytes =
-            k_layer_base + (long long)rt * step_bytes + head_off_bytes;
-        const char* __restrict__ vp_bytes =
-            v_layer_base + (long long)rt * step_bytes + head_off_bytes;
-        const KV_T* __restrict__ k_head = reinterpret_cast<const KV_T*>(kp_bytes);
-        const KV_T* __restrict__ v_head = reinterpret_cast<const KV_T*>(vp_bytes);
-
-        float partial = 0.0f;
+    i16x4 q_frag[HEAD_DIM / MFMA_K];
 #pragma unroll
-        for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-            int j = tpos * W + lane;
-            if (tpos < POS && j < head_dim) {
-                float kj = std::is_same<KV_T, float>::value
-                               ? nt_load(reinterpret_cast<const float*>(k_head) + j)
-                               : bf16_to_f32_intr(
-                                     nt_load(reinterpret_cast<const __hip_bfloat16*>(k_head) + j));
-                partial += q_reg[tpos] * kj;
+    for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
+        const int frag_idx = kk / MFMA_K;
+        i16x4 frag = {0, 0, 0, 0};
+        const int row = lane_x;
+        if (row < rows_active) {
+            const float* __restrict__ q_row =
+                q_block + static_cast<long long>(h_base + row) * HEAD_DIM;
+            const int k_base = kk + lane_y * 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int k_idx = k_base + i;
+                float qv = 0.0f;
+                if (k_idx < HEAD_DIM) {
+                    qv = q_row[k_idx] * inv_sqrt_d;
+                }
+                frag[i] = to_bf16_bits(qv);
             }
         }
-        float s = wave_reduce_sum(partial);
+        q_frag[frag_idx] = frag;
+    }
+
+    f4 o_frag0 = {0.f, 0.f, 0.f, 0.f};
+    f4 o_frag1 = {0.f, 0.f, 0.f, 0.f};
+    f4 o_frag2 = {0.f, 0.f, 0.f, 0.f};
+    f4 o_frag3 = {0.f, 0.f, 0.f, 0.f};
+
+    const int bc_try = (bc_tile_hint > 0 && bc_tile_hint <= BC_TILE) ? bc_tile_hint : BC_TILE;
+
+    for (int t0 = t_start; t0 < t_end; t0 += bc_try) {
+        int bc = t_end - t0;
+        if (bc > bc_try)
+            bc = bc_try;
+        if (bc > BC_TILE)
+            bc = BC_TILE;
+
+        const int col = lane_x;
+        const bool col_active = (col < bc);
+        const int t = t0 + col;
+
+        int rt = 0;
+        if (col_active) {
+            if (local != 0) {
+                rt = cap_pow2 ? ring_index<true>(t, cap) : ring_index<false>(t, cap);
+            } else {
+                rt = t;
+            }
+            if (lane_y == 0) {
+                tile_rt[col] = rt;
+            }
+        } else if (lane_y == 0 && col < BC_TILE) {
+            tile_rt[col] = 0;
+        }
+        __syncthreads();
+
+        const int total_tile_elems = bc * HEAD_DIM;
+        for (int idx = lane_id; idx < total_tile_elems; idx += 64) {
+            const int c = idx / HEAD_DIM;
+            const int dim = idx % HEAD_DIM;
+            const int rt_col = tile_rt[c];
+            const long long base_offset =
+                static_cast<long long>(rt_col) * step_bytes + head_off_bytes;
+            const char* __restrict__ kp_bytes = k_layer_base + base_offset;
+            const char* __restrict__ vp_bytes = v_layer_base + base_offset;
+
+            short k_bits = 0;
+            short v_bits = 0;
+            if constexpr (std::is_same<KV_T, float>::value) {
+                const float* __restrict__ k_ptr = reinterpret_cast<const float*>(kp_bytes);
+                const float* __restrict__ v_ptr = reinterpret_cast<const float*>(vp_bytes);
+                float k_val = ld_global_cond(k_ptr + dim);
+                float v_val = ld_global_cond(v_ptr + dim);
+                k_bits = to_bf16_bits(k_val);
+                v_bits = to_bf16_bits(v_val);
+            } else {
+                const __hip_bfloat16* __restrict__ k_ptr =
+                    reinterpret_cast<const __hip_bfloat16*>(kp_bytes);
+                const __hip_bfloat16* __restrict__ v_ptr =
+                    reinterpret_cast<const __hip_bfloat16*>(vp_bytes);
+                k_bits = to_bf16_bits(k_ptr[dim]);
+                v_bits = to_bf16_bits(v_ptr[dim]);
+            }
+            k_tile[c][dim] = k_bits;
+            v_tile[dim][c] = v_bits;
+        }
+        __syncthreads();
+
+        // Compute Q · K^T tile with MFMA.
+        f4 score_frag = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
+            const int frag_idx = kk / MFMA_K;
+            const int k_base = kk + lane_y * 4;
+            i16x4 b_frag = {0, 0, 0, 0};
+            if (col_active) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int dim = k_base + i;
+                    if (dim < HEAD_DIM) {
+                        b_frag[i] = k_tile[col][dim];
+                    }
+                }
+            }
+            score_frag = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(q_frag[frag_idx], b_frag,
+                                                                   score_frag, 0, 0, 0);
+        }
+
+        float score_reg[4];
+        float prob_reg[4];
+
+        float mask_val = 0.0f;
         if constexpr (USE_MASK) {
-            if (lane == 0)
-                s += mask[(long long)pos_b * seq_len + t];
-        }
-        s = wave_bcast(s, 0);
-        if (!isfinite(s))
-            continue;
-
-        float scale_old, scale_new;
-        if (lane == 0) {
-            const float m_prev = m_local;
-            const float l_prev = l_local;
-            const float m_new = fmaxf(m_prev, s);
-            const float alpha = __expf(m_prev - m_new);
-            const float p = __expf(s - m_new);
-            const float l_new = alpha * l_prev + p;
-            scale_old = (l_new > 0.0f) ? (alpha * l_prev) / l_new : 0.0f;
-            scale_new = (l_new > 0.0f) ? p / l_new : 0.0f;
-            m_local = m_new;
-            l_local = l_new;
-        }
-        scale_old = wave_bcast(scale_old, 0);
-        scale_new = wave_bcast(scale_new, 0);
-
-#pragma unroll
-        for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-            int j = tpos * W + lane;
-            if (tpos < POS && j < head_dim) {
-                float vj = std::is_same<KV_T, float>::value
-                               ? nt_load(reinterpret_cast<const float*>(v_head) + j)
-                               : bf16_to_f32_intr(
-                                     nt_load(reinterpret_cast<const __hip_bfloat16*>(v_head) + j));
-                o_reg[tpos] = scale_old * o_reg[tpos] + scale_new * vj;
+            if (col_active) {
+                mask_val = mask[static_cast<long long>(pos_b) * seq_len + t];
             }
         }
-    }
 
-    const long long base_idx = ((long long)b * n_attn_heads + h) * Smax + sidx;
-    float* O_dst = O_partials + base_idx * (long long)head_dim;
-    if (lane == 0) {
-        m_partials[base_idx] = m_local;
-        l_partials[base_idx] = l_local;
-    }
 #pragma unroll
-    for (int tpos = 0; tpos < MAX_TPOS; ++tpos) {
-        int j = tpos * W + lane;
-        if (tpos < POS && j < head_dim)
-            nt_store(O_dst + j, o_reg[tpos]);
-    }
-}
-
-__global__ void
-fa_decode_split_merge(const float* __restrict__ O_partials,               // [B*H*Smax, D]
-                      const float* __restrict__ m_partials,               // [B*H*Smax]
-                      const float* __restrict__ l_partials,               // [B*H*Smax]
-                      const __hip_bfloat16* __restrict__ attn_sinks_half, // (H) or nullptr
-                      float* __restrict__ tb_batch,                       // (B, H*D)
-                      int B, int head_dim, int n_attn_heads, int Smax, int b,
-                      int layer_idx) // pass b/layer for sink indexing compatibility
-{
-    const int h = blockIdx.x;
-    const int lane = threadIdx.x;
-    if (h >= n_attn_heads)
-        return;
-
-    const int W = warpSize;
-    const int POS = (head_dim + W - 1) / W;
-
-    float m_global = -INFINITY;
-    for (int s = lane; s < Smax; s += W) {
-        const long long idx = ((long long)b * n_attn_heads + h) * Smax + s;
-        float m_i = m_partials[idx];
-        m_global = fmaxf(m_global, m_i);
-    }
-    m_global = wave_reduce_sum(
-        m_global);
-    float mg = m_global;
-    for (int off = W >> 1; off > 0; off >>= 1) {
-        float other = __shfl_down(mg, off);
-        mg = fmaxf(mg, other);
-    }
-    m_global = wave_bcast(mg, 0);
-
-    float L_partial = 0.0f;
-    for (int s = lane; s < Smax; s += W) {
-        const long long idx = ((long long)b * n_attn_heads + h) * Smax + s;
-        float m_i = m_partials[idx];
-        float l_i = l_partials[idx];
-        if (isfinite(m_i) && l_i > 0.0f) {
-            L_partial += __expf(m_i - m_global) * l_i;
-        }
-    }
-    for (int off = W >> 1; off > 0; off >>= 1)
-        L_partial += __shfl_down(L_partial, off);
-    float L = wave_bcast(L_partial, 0);
-    L = L > 0.0f ? L : 1.0f;
-
-    float* __restrict__ o_out =
-        tb_batch + (long long)b * (n_attn_heads * head_dim) + (long long)h * head_dim;
-
-    for (int tpos = 0; tpos < POS; ++tpos) {
-        int j = tpos * W + lane;
-        float Oj = 0.0f;
-        if (j < head_dim) {
-            for (int s = 0; s < Smax; ++s) {
-                const long long base = ((long long)b * n_attn_heads + h) * Smax + s;
-                const float m_i = m_partials[base];
-                const float l_i = l_partials[base];
-                if (!isfinite(m_i) || l_i <= 0.0f)
-                    continue;
-                const float w = __expf(m_i - m_global) * l_i;
-                Oj += w * O_partials[base * (long long)head_dim + j];
+        for (int i = 0; i < 4; ++i) {
+            const int row = lane_y * 4 + i;
+            float val = score_frag[i];
+            if constexpr (USE_MASK) {
+                val += mask_val;
             }
-            Oj /= L;
-            nt_store(o_out + j, Oj);
+            if (!(col_active && row < rows_active)) {
+                val = NEG_INF;
+            }
+            score_reg[i] = val;
         }
+
+        float row_max[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float v = score_reg[i];
+#pragma unroll
+            for (int off = BC_TILE >> 1; off > 0; off >>= 1) {
+                v = fmaxf(v, __shfl_down(v, off, BC_TILE));
+            }
+            row_max[i] = __shfl(v, 0, BC_TILE);
+        }
+
+        if (lane_x == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = lane_y * 4 + i;
+                if (row < BR_TILE) {
+                    const float prev_m = row_m[row];
+                    row_prev_m[row] = prev_m;
+                    row_m[row] = fmaxf(prev_m, row_max[i]);
+                }
+            }
+        }
+        __syncthreads();
+
+        float row_sum[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = lane_y * 4 + i;
+            const float new_m = (row < BR_TILE) ? row_m[row] : NEG_INF;
+            float p = 0.0f;
+            if (col_active && row < rows_active && new_m > NEG_INF / 2) {
+                p = __expf(score_reg[i] - new_m);
+            }
+            prob_reg[i] = p;
+            float sum = p;
+#pragma unroll
+            for (int off = BC_TILE >> 1; off > 0; off >>= 1) {
+                sum += __shfl_down(sum, off, BC_TILE);
+            }
+            row_sum[i] = __shfl(sum, 0, BC_TILE);
+        }
+
+        if (lane_x == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = lane_y * 4 + i;
+                if (row < rows_active) {
+                    const float prev_m = row_prev_m[row];
+                    const float prev_l = row_l[row];
+                    const float new_m = row_m[row];
+                    const float a = (prev_m == NEG_INF) ? 0.0f : __expf(prev_m - new_m);
+                    const float weighted_prev = a * prev_l;
+                    const float ln = weighted_prev + row_sum[i];
+                    const float scale = (ln > 0.0f) ? (weighted_prev / ln) : 0.0f;
+                    const float inv_l = (ln > 0.0f) ? (1.0f / ln) : 0.0f;
+                    row_scale[row] = scale;
+                    row_inv_l[row] = inv_l;
+                    row_l[row] = ln;
+                } else if (row < BR_TILE) {
+                    row_scale[row] = 0.0f;
+                    row_inv_l[row] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = lane_y * 4 + i;
+            const float scale = (row < rows_active) ? row_scale[row] : 0.0f;
+            o_frag0[i] *= scale;
+            o_frag1[i] *= scale;
+            o_frag2[i] *= scale;
+            o_frag3[i] *= scale;
+
+            float weight = 0.0f;
+            if (col_active && row < rows_active) {
+                weight = prob_reg[i] * row_inv_l[row];
+            }
+            if (row < BR_TILE) {
+                w_tile[row][col] = to_bf16_bits(weight);
+            }
+        }
+        __syncthreads();
+
+        const int k_base = lane_y * 4;
+        i16x4 w_frag = {0, 0, 0, 0};
+        if (lane_x < rows_active) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int k_idx = k_base + i;
+                if (k_idx < bc) {
+                    w_frag[i] = w_tile[lane_x][k_idx];
+                }
+            }
+        }
+
+        auto load_v_fragment = [&](int n_col) {
+            i16x4 frag = {0, 0, 0, 0};
+            if (n_col < HEAD_DIM) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int k_idx = k_base + i;
+                    if (k_idx < bc) {
+                        frag[i] = v_tile[n_col][k_idx];
+                    }
+                }
+            }
+            return frag;
+        };
+
+        const int n_col0 = lane_x;
+        const int n_col1 = lane_x + 16;
+        const int n_col2 = lane_x + 32;
+        const int n_col3 = lane_x + 48;
+
+        i16x4 vb0 = load_v_fragment(n_col0);
+        i16x4 vb1 = load_v_fragment(n_col1);
+        i16x4 vb2 = load_v_fragment(n_col2);
+        i16x4 vb3 = load_v_fragment(n_col3);
+
+        o_frag0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb0, o_frag0, 0, 0, 0);
+        o_frag1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb1, o_frag1, 0, 0, 0);
+        o_frag2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb2, o_frag2, 0, 0, 0);
+        o_frag3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb3, o_frag3, 0, 0, 0);
+        __syncthreads();
     }
 
     if (attn_sinks_half != nullptr) {
-        float sink_s = __bfloat162float(attn_sinks_half[h]);
-        if (isfinite(sink_s)) {
-            const float m_new = fmaxf(m_global, sink_s);
-            const float a = __expf(m_global - m_new) * L;
-            const float b2 = __expf(sink_s - m_new);
-            const float denom = a + b2;
-            const float r = (denom > 0.0f) ? (a / denom) : 1.0f;
-            float ren = wave_bcast((lane == 0) ? r : 0.0f, 0);
-
-            for (int tpos = 0; tpos < POS; ++tpos) {
-                int j = tpos * W + lane;
-                if (j < head_dim)
-                    o_out[j] *= ren;
+        if (lane_x == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = lane_y * 4 + i;
+                if (row < rows_active) {
+                    const int h = h_base + row;
+                    const float sink_val = __bfloat162float(attn_sinks_half[h]);
+                    if (isfinite(sink_val)) {
+                        const float mp = row_m[row];
+                        const float lp = row_l[row];
+                        const float mn = fmaxf(mp, sink_val);
+                        const float a = (mp == NEG_INF) ? 0.0f : __expf(mp - mn);
+                        const float b_val = __expf(sink_val - mn);
+                        const float d = a * lp + b_val;
+                        const float scale = (d > 0.0f) ? (a * lp) / d : 1.0f;
+                        row_scale[row] = scale;
+                        row_m[row] = mn;
+                        row_l[row] = d;
+                    } else {
+                        row_scale[row] = 1.0f;
+                    }
+                } else if (row < BR_TILE) {
+                    row_scale[row] = 1.0f;
+                }
             }
         }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = lane_y * 4 + i;
+            const float scale = (row < BR_TILE) ? row_scale[row] : 1.0f;
+            o_frag0[i] *= scale;
+            o_frag1[i] *= scale;
+            o_frag2[i] *= scale;
+            o_frag3[i] *= scale;
+        }
+    }
+
+    const int col0 = lane_x;
+    const int col1 = lane_x + 16;
+    const int col2 = lane_x + 32;
+    const int col3 = lane_x + 48;
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = lane_y * 4 + i;
+        if (row >= rows_active) {
+            continue;
+        }
+        float* __restrict__ o_row = o_block + static_cast<long long>(h_base + row) * HEAD_DIM;
+        if (col0 < HEAD_DIM)
+            o_row[col0] = o_frag0[i];
+        if (col1 < HEAD_DIM)
+            o_row[col1] = o_frag1[i];
+        if (col2 < HEAD_DIM)
+            o_row[col2] = o_frag2[i];
+        if (col3 < HEAD_DIM)
+            o_row[col3] = o_frag3[i];
     }
 }
 
-void fa(const float* q_batch,             // (B, H*D)
-        const void* k_cache,              // base pointer
-        const void* v_cache,              // base pointer
-        const float* mask,                // (T, T)
-        const __hip_bfloat16* attn_sinks, // (L, H) — pass attn_sinks + layer_idx*H
-        float* tb_batch,                  // (B, H*D)
-        int B, int seq_len, int head_dim, int kv_dim, int kv_mul, int sliding_window, int layer_idx,
-        int n_attn_heads, int kv_cache_is_fp16,
-        const int* d_pos_per_token, // (B)
-        const int* d_batch_indices, // (B)
-        long long /*B_stride*/,     // not needed
-        int /*max_pos_in_batch*/,   // unused
-        float* workspace_partial_O,
-        float* workspace_partial_m, float* workspace_partial_l, hipStream_t stream,
+void fa(const float* q_batch, const void* k_cache, const void* v_cache, const float* mask,
+        const __hip_bfloat16* attn_sinks, float* tb_batch, int B, int seq_len, int head_dim,
+        int kv_dim, int kv_mul, int sliding_window, int layer_idx, int n_attn_heads,
+        int kv_cache_is_fp16, const int* d_pos_per_token, const int* d_batch_indices,
+        long long B_stride, int /*max_pos_in_batch*/, hipStream_t stream,
         const long long* d_layer_kv_off, const int* d_layer_kv_cap, const int* d_layer_is_local) {
-    if (B <= 0 || n_attn_heads <= 0 || head_dim <= 0)
-        return;
-
-    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
-    const __hip_bfloat16* attn_sinks_head =
-        (attn_sinks != nullptr) ? (attn_sinks + (long long)layer_idx * n_attn_heads) : nullptr;
-
-    const bool want_split = (seq_len >= T_TILE * 2);
-    const bool have_ws = (workspace_partial_O && workspace_partial_m && workspace_partial_l);
-    const bool do_split = want_split && have_ws;
-
-    const int tpb = 64;
-
-    if (do_split) {
-        const int Smax = (seq_len + T_TILE - 1) / T_TILE;
-
-        dim3 grid1(n_attn_heads, B, Smax), block1(tpb);
-
-        if (kv_cache_is_fp16) {
-            if (use_mask) {
-                hipLaunchKernelGGL((fa_decode_reg_tiled_split_stage1<__hip_bfloat16, true>), grid1,
-                                   block1, 0, stream, q_batch, k_cache, v_cache, mask,
-                                   workspace_partial_O, workspace_partial_m, workspace_partial_l, B,
-                                   seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
-                                   n_attn_heads, Smax, d_pos_per_token, d_batch_indices,
-                                   d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
-            } else {
-                hipLaunchKernelGGL((fa_decode_reg_tiled_split_stage1<__hip_bfloat16, false>), grid1,
-                                   block1, 0, stream, q_batch, k_cache, v_cache, nullptr,
-                                   workspace_partial_O, workspace_partial_m, workspace_partial_l, B,
-                                   seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
-                                   n_attn_heads, Smax, d_pos_per_token, d_batch_indices,
-                                   d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
-            }
-        } else {
-            if (use_mask) {
-                hipLaunchKernelGGL((fa_decode_reg_tiled_split_stage1<float, true>), grid1, block1,
-                                   0, stream, q_batch, k_cache, v_cache, mask, workspace_partial_O,
-                                   workspace_partial_m, workspace_partial_l, B, seq_len, head_dim,
-                                   kv_dim, kv_mul, sliding_window, layer_idx, n_attn_heads, Smax,
-                                   d_pos_per_token, d_batch_indices, d_layer_kv_off, d_layer_kv_cap,
-                                   d_layer_is_local);
-            } else {
-                hipLaunchKernelGGL((fa_decode_reg_tiled_split_stage1<float, false>), grid1, block1,
-                                   0, stream, q_batch, k_cache, v_cache, nullptr,
-                                   workspace_partial_O, workspace_partial_m, workspace_partial_l, B,
-                                   seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
-                                   n_attn_heads, Smax, d_pos_per_token, d_batch_indices,
-                                   d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
-            }
-        }
-        CHECK_HIP(hipGetLastError());
-
-        for (int b = 0; b < B; ++b) {
-            dim3 grid2(n_attn_heads, 1, 1), block2(tpb);
-            hipLaunchKernelGGL((fa_decode_split_merge), grid2, block2, 0, stream,
-                               workspace_partial_O, workspace_partial_m, workspace_partial_l,
-                               attn_sinks_head, tb_batch, B, head_dim, n_attn_heads, Smax, b,
-                               layer_idx);
-            CHECK_HIP(hipGetLastError());
-        }
+    if (B <= 0 || n_attn_heads <= 0 || head_dim != 64) {
         return;
     }
 
-    dim3 grid(n_attn_heads, B), block(tpb);
+    if (kv_mul <= 0 || (n_attn_heads % kv_mul) != 0 || kv_mul > 16) {
+        return;
+    }
+
+    const __hip_bfloat16* attn_sinks_head =
+        (attn_sinks != nullptr) ? (attn_sinks + static_cast<long long>(layer_idx) * n_attn_heads)
+                                : nullptr;
+    const bool use_mask = (sliding_window > 0) && ((layer_idx & 1) == 0) && (mask != nullptr);
+
+    dim3 block(64);
+    dim3 grid(n_attn_heads / kv_mul, B);
+    const int bc_tile_hint = min(16, seq_len);
+
     if (kv_cache_is_fp16) {
         if (use_mask) {
-            hipLaunchKernelGGL((fa_decode_reg_tiled_single<__hip_bfloat16, true>), grid, block, 0,
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<__hip_bfloat16, true>), grid, block, 0,
                                stream, q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch,
                                B, seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
-                               n_attn_heads, d_pos_per_token, d_batch_indices, d_layer_kv_off,
-                               d_layer_kv_cap, d_layer_is_local);
+                               n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         } else {
-            hipLaunchKernelGGL((fa_decode_reg_tiled_single<__hip_bfloat16, false>), grid, block, 0,
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<__hip_bfloat16, false>), grid, block, 0,
                                stream, q_batch, k_cache, v_cache, nullptr, attn_sinks_head,
                                tb_batch, B, seq_len, head_dim, kv_dim, kv_mul, sliding_window,
-                               layer_idx, n_attn_heads, d_pos_per_token, d_batch_indices,
-                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local);
+                               layer_idx, n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         }
     } else {
         if (use_mask) {
-            hipLaunchKernelGGL((fa_decode_reg_tiled_single<float, true>), grid, block, 0, stream,
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<float, true>), grid, block, 0, stream,
                                q_batch, k_cache, v_cache, mask, attn_sinks_head, tb_batch, B,
                                seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
-                               n_attn_heads, d_pos_per_token, d_batch_indices, d_layer_kv_off,
-                               d_layer_kv_cap, d_layer_is_local);
+                               n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         } else {
-            hipLaunchKernelGGL((fa_decode_reg_tiled_single<float, false>), grid, block, 0, stream,
+            hipLaunchKernelGGL((fa2_decode_mfma_head64<float, false>), grid, block, 0, stream,
                                q_batch, k_cache, v_cache, nullptr, attn_sinks_head, tb_batch, B,
                                seq_len, head_dim, kv_dim, kv_mul, sliding_window, layer_idx,
-                               n_attn_heads, d_pos_per_token, d_batch_indices, d_layer_kv_off,
-                               d_layer_kv_cap, d_layer_is_local);
+                               n_attn_heads, d_pos_per_token, d_batch_indices, B_stride,
+                               d_layer_kv_off, d_layer_kv_cap, d_layer_is_local, bc_tile_hint);
         }
     }
     CHECK_HIP(hipGetLastError());
