@@ -63,6 +63,15 @@ static thread_local int kGridCap = [] {
 thread_local static int* h_expert_offsets = nullptr;
 thread_local static int h_expert_offsets_capacity = 0;
 
+/**
+ * @brief Ensure the thread-local host expert-offsets array can hold at least the specified number of entries.
+ *
+ * Allocates or re-allocates a pinned host array for expert offsets and updates the recorded capacity if the
+ * current capacity is smaller than the requested size. If a previous allocation exists it is freed before
+ * allocating the new buffer.
+ *
+ * @param need Required minimum number of `int` entries for the host expert-offsets array.
+ */
 static inline void ensure_h_expert_offsets(int need) {
     if (need <= h_expert_offsets_capacity)
         return;
@@ -91,6 +100,14 @@ struct StreamsAndEvents {
 
 static thread_local StreamsAndEvents tls;
 
+/**
+ * @brief Initialize thread-local GPU streams and synchronization events on first use.
+ *
+ * Creates the compute, host-to-device, and device-to-host non-blocking streams, two
+ * MoE streams with device-determined priorities, and a set of events used to
+ * coordinate transfers and MoE work. Calling this function when streams are already
+ * initialized is a no-op.
+ */
 void create_streams_once() {
     if (tls.compute)
         return;
@@ -114,6 +131,15 @@ void create_streams_once() {
 }
 
 template <class T>
+/**
+ * @brief Clamps a value between the provided lower and upper bounds.
+ *
+ * @tparam T Type of the value; must support comparison operations.
+ * @param v Value to clamp.
+ * @param lo Lower bound; returned if `v` is less than `lo`.
+ * @param hi Upper bound; returned if `v` is greater than `hi`.
+ * @return T `v` constrained to be greater than or equal to `lo` and less than or equal to `hi`.
+ */
 static inline T clamp_val(T v, T lo, T hi) {
     return std::max(lo, std::min(hi, v));
 }
@@ -199,6 +225,23 @@ class HipDeviceGuard {
     bool restore_;
 };
 
+/**
+ * @brief Runs a forward pass of the hybrid transformer with MoE across the configured devices and streams.
+ *
+ * Performs embedding, per-layer transformer blocks (RMSNorm, QKV, RoPE, attention, FFN/MoE routing and execution),
+ * and the final output projection, updating run-time state in the transformer's run state and writing final
+ * logits into the transformer's state buffer.
+ *
+ * @param transformer Pointer to the transformer model containing configuration, weights, and run state.
+ * @param ep_group Expert-parallel group describing shard layout and per-shard metadata (must be valid for MoE).
+ * @param tokens Host array of input token ids, length equal to batch_size.
+ * @param pos_per_token_h Host array of token positions (one position per token), length equal to batch_size.
+ * @param batch_size Number of input tokens in this forward call.
+ * @param batch_indices_h Host array of batch indices mapping tokens to batch rows, length equal to batch_size.
+ * @param B_stride Stride parameter used for batched KV/position indexing across buffers.
+ *
+ * @return float* Pointer to the logits buffer containing final vocabulary scores (same pointer as transformer->state.logits).
+ */
 float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_group, int* tokens,
                const int* pos_per_token_h, int batch_size, const int* batch_indices_h,
                int B_stride) {

@@ -31,6 +31,17 @@ int hex_nibble(int c) {
     return -1;
 }
 
+/**
+ * @brief Parse a token of the form "<0xXX>" and produce its single-byte value.
+ *
+ * Parses the input string only if it exactly matches the pattern '<', '0', 'x', two hexadecimal
+ * digits, and '>' (total length 6). Hex digits may be uppercase or lowercase.
+ *
+ * @param s Pointer to the token string to parse.
+ * @param len Length of the token string; must be 6 to succeed.
+ * @param out Pointer to the output byte where the parsed value will be stored on success.
+ * @return int `1` on successful parse and write to `out`, `0` on failure.
+ */
 int parse_hex_byte_token(const char* s, int len, unsigned char* out) {
     if (len != 6)
         return 0;

@@ -26,6 +26,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def paths_for_size(size: str):
+    """
+    Derives default source and destination checkpoint paths for a given model size.
+    
+    Parameters:
+        size (str): Model size identifier, must be "20b" or "120b" (case-insensitive).
+    
+    Returns:
+        tuple[str, str]: (src, dst) where `src` is MODELS_ROOT/gpt-oss-{size} and `dst` is MODELS_ROOT/gpt-oss-{size}-bf16.
+    
+    Raises:
+        ValueError: If `size` is not "20b" or "120b".
+        TypeError: If the environment variable `MODELS_ROOT` is not set, causing path construction to fail.
+    """
     size = size.lower()
     if size not in {"20b", "120b"}:
         raise ValueError("size must be one of: 20b, 120b")
@@ -36,6 +49,11 @@ def paths_for_size(size: str):
 
 
 def main():
+    """
+    Create a bfloat16 copy of a local GPT-OSS checkpoint and save it using safe-serialized format.
+    
+    Parses command-line arguments for a required model size ("20b" or "120b") and optional --src/--dst overrides. Determines source and destination paths (defaults derived from MODELS_ROOT and the requested size), validates the source directory (exits with code 1 if missing), loads the tokenizer and model from the source with the model cast to bfloat16, and writes the tokenizer and model to the destination with safetensors serialization enabled. Prints progress messages to stdout.
+    """
     p = argparse.ArgumentParser(
         description="Load a local GPT-OSS model and resave it as bf16 (safe-serialized)."
     )

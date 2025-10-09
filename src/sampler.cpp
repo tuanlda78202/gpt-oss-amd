@@ -82,6 +82,21 @@ int sample_topp_oss(float* probabilities, int n, float topp, OssProbIndex* probi
     return probindex[last_idx].index; // in case of rounding errors
 }
 
+/**
+ * @brief Initialize an OssSampler instance with sampler parameters and allocate working buffers.
+ *
+ * Sets the sampler's vocabulary size, temperature, top-p cutoff, and RNG state, and allocates
+ * an array of OssProbIndex structures sized to the vocabulary for use by sampling routines.
+ *
+ * @param sampler Pointer to the OssSampler to initialize; its fields will be overwritten.
+ * @param vocab_size Number of entries in the model vocabulary; determines the size of the allocated buffer.
+ * @param temperature Sampling temperature; stored for use by sampling methods.
+ * @param topp Nucleus (top-p) probability cutoff; stored for use by sampling methods.
+ * @param rng_seed Initial RNG state seed stored in the sampler.
+ *
+ * @note The allocation uses malloc and assigns the result to sampler->probindex. If allocation fails,
+ * sampler->probindex will be NULL. Call free_sampler_oss to release the allocated buffer when no longer needed.
+ */
 void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, float topp,
                        unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;

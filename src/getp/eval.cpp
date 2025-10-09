@@ -39,6 +39,23 @@ int* get_tok_gen_ptr(Requests* reqs, int idx) {
     return reqs->tok_gens + idx * (reqs->max_seq_len + 1);
 }
 
+/**
+ * @brief Reads requests from a text file and populates a Requests buffer.
+ *
+ * Reads the first line of the file as the number of requests, optionally truncates
+ * that count to |truncate_lines|, allocates request and token buffers via
+ * build_requests, and copies up to that many subsequent lines into the request
+ * string buffers.
+ *
+ * @param input_filename Path to the input text file. The file's first line must be an integer count.
+ * @param max_token_len Maximum token length allocated per request string.
+ * @param max_seq_len Maximum sequence length used for token generation buffers.
+ * @param reqs Pointer to a Requests struct that will be initialized and populated.
+ * @param truncate_lines If >0 and less than the file's declared count, limits the number of requests read.
+ * @return int 0 on success.
+ *
+ * @note If the input file cannot be opened, the function prints an error message and exits the process with failure.
+ */
 int read_inputfile(const char* input_filename, int max_token_len, int max_seq_len, Requests* reqs,
                    int truncate_lines) {
     std::string filename = input_filename;
@@ -76,6 +93,19 @@ int read_inputfile(const char* input_filename, int max_token_len, int max_seq_le
     return 0;
 }
 
+/**
+ * @brief Writes generated token sequences for each request to a file, one sequence per line.
+ *
+ * Each request's generated tokens are written as space-separated integers on a single line.
+ * For each request the sequence is written up to (but not including) the first negative value,
+ * which acts as a sentinel terminating that sequence.
+ *
+ * @param output_filename Path to the file to create or overwrite.
+ * @param reqs Pointer to a Requests structure containing generated token buffers and count.
+ * @return int `0` on success.
+ *
+ * @note If the file cannot be opened for writing, the function prints an error message and exits the process with a failure status.
+ */
 int write_outputfile(const char* output_filename, Requests* reqs) {
     std::string filename = output_filename;
 
@@ -106,6 +136,17 @@ void finish(Transformer* transformer, Tokenizer* tokenizer);
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sample,
                     Requests* requests);
 
+/**
+ * @brief Verifies that a generated output file matches a ground-truth file token-for-token.
+ *
+ * Compares the two files line-by-line, parsing each line into integer tokens, reports per-line
+ * mismatches and a summary, and returns a status code indicating success, failure, or I/O error.
+ *
+ * @param generated_filename Path to the generated output file to verify.
+ * @param ground_truth_filename Path to the ground-truth file to compare against.
+ * @return int `0` if all requests match exactly; `1` if one or more requests have mismatches;
+ * `-1` if either file cannot be opened.
+ */
 int verify_output(const char* generated_filename, const char* ground_truth_filename) {
     printf("\033[1;92m==================================================================\033["
            "0m\n\033[1;92m🔍 VERIFYING "
@@ -205,6 +246,24 @@ int verify_output(const char* generated_filename, const char* ground_truth_filen
     }
 }
 
+/**
+ * @brief Orchestrates end-to-end model evaluation: reads inputs, warms up the model, runs inference,
+ * writes generated outputs, performs optional verification against a ground-truth file, and finalizes resources.
+ *
+ * Reads requests from input_filename, allocates request buffers, runs a warm-up routine and inference
+ * (measuring and printing timings and throughput), writes generated tokens to output_filename, verifies
+ * the output against verify_filename (or a default ground-truth file if NULL), and calls finish().
+ * Exits the process on fatal I/O errors.
+ *
+ * @param input_filename Path to the input file containing requests.
+ * @param output_filename Path where generated outputs will be written.
+ * @param steps Maximum sequence length to use for tokenization and generation; if 0 or larger than the transformer's configured sequence length, the transformer's sequence length is used.
+ * @param batch_size Number of requests processed per batch during warm-up and inference.
+ * @param verify_filename Optional path to a ground-truth file for verification; if NULL a default ground-truth file is used.
+ * @param truncate_lines If greater than 0 and less than the number of requests in the input file, limits processing to this many lines.
+ * @param use_kv16 Configuration flag forwarded to warm_up indicating whether to use 16-key/value optimization.
+ * @param odd_window Configuration parameter forwarded to warm_up that controls an odd-window behavior.
+ */
 void getp(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* input_filename,
           char* output_filename, int steps, int batch_size, char* verify_filename,
           int truncate_lines, int use_kv16, int odd_window) {

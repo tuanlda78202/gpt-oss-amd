@@ -19,6 +19,23 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+/**
+ * @brief Program entry that decodes token IDs from an input file using a tokenizer.
+ *
+ * Decodes either a single specified line or all lines from a tokenized input file and prints
+ * the reconstructed pieces to standard output. Command-line usage requires a positional
+ * integer specifying the line to decode (use a negative value to decode all lines). Optional
+ * flags:
+ *  - -i <path> : path to the input file (default: "data/output.txt")
+ *  - -z <path> : path to the tokenizer binary (default: "build/tokenizer.bin")
+ *
+ * Calling error_usage() on invalid arguments will print usage and terminate the process with
+ * a failure exit code.
+ *
+ * @param argc Number of command-line arguments.
+ * @param argv Command-line arguments vector.
+ * @return int 0 on successful completion.
+ */
 int main(int argc, char** argv) {
     int line_to_decode;
     std::string input_path = "data/output.txt";

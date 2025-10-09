@@ -92,6 +92,16 @@ static void ensure_batch_buffers(int required) {
     buf.capacity = required;
 }
 
+/**
+ * @brief Ensure thread-local request pointer buffers have at least the given capacity.
+ *
+ * Expands the per-thread input and output pointer arrays to hold at least `required`
+ * entries; frees previous arrays if present and updates the stored capacity.
+ *
+ * @param required Minimum number of entries to allocate for input and output pointer arrays.
+ *
+ * On allocation failure this function prints an error message to stderr and exits the process.
+ */
 static void ensure_request_buffers(int required) {
     ThreadLocalRequestBuffers& buf = g_request_buffers;
     if (required <= buf.capacity)
@@ -118,6 +128,15 @@ static void ensure_request_buffers(int required) {
     buf.capacity = required;
 }
 
+/**
+ * @brief Configure OpenMP and related environment settings for warm-up threading.
+ *
+ * Sets OpenMP runtime to use a fixed outer thread count, enables nested parallelism,
+ * disables dynamic adjustments, limits active levels, and applies a static schedule.
+ * Also sets process-level environment variables to prefer core binding and zero block time.
+ *
+ * @param outer_threads Number of threads to use for the outer OpenMP region.
+ */
 static void configure_openmp_warmup(int outer_threads) {
     omp_set_dynamic(0);
     omp_set_max_active_levels(2);
@@ -141,6 +160,27 @@ static int g_ep_size = 1;
 static int g_active_devices = 0;
 bool g_duplicate_experts = false;
 
+/**
+ * @brief Initialize devices and prepare model shards and expert groups for parallel inference.
+ *
+ * Configures the transformer for the requested batch size and sequence length, detects available
+ * HIP devices, establishes peer access, allocates per-device hybrid transformer instances,
+ * and constructs data-parallel (DP) and expert-parallel (EP) group/shard structures used by the
+ * runtime during inference.
+ *
+ * This function sets global state used by the inference harness (g_all_models, g_dp_groups,
+ * g_expert_shards, g_active_devices, g_dp_world_size, g_ep_size, g_duplicate_experts) and
+ * initializes per-shard workspaces, streams, and mutexes when EPs are enabled.
+ *
+ * @param transformer Pointer to the host Transformer object to copy/configure on devices.
+ * @param tokenizer Unused by warm-up but accepted for API consistency.
+ * @param batch_size Batch size to configure on device copies of the transformer.
+ * @param use_kv16 If nonzero, select 16-bit KV cache layout on device copies.
+ * @param odd_window Hardware/model-specific flag forwarded to device copy routine.
+ *
+ * @note On allocation or HIP setup failures this function prints an error message and exits
+ *       the process.
+ */
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, int batch_size, int use_kv16,
              int odd_window) {
     OssTransformer* transformer_oss = (OssTransformer*)transformer;
@@ -464,6 +504,23 @@ void progress_bar(int batch_size, int* tokens_generated, int* max_tokens, bool* 
     fflush(stdout);
 }
 
+/**
+ * @brief Generate tokens for a batch of input sequences using the provided model, tokenizer, and sampler.
+ *
+ * Encodes each input sequence, runs autoregressive forward passes and sampling until all sequences finish
+ * or the maximum number of steps is reached, and writes generated token ids into the provided output buffers.
+ *
+ * @param transformer Pointer to the Transformer model used for forward computation.
+ * @param tokenizer Pointer to the Tokenizer used to encode prompts and decode pieces for display.
+ * @param sampler Pointer to the Sampler that controls sampling behavior.
+ * @param input_seqs Array of C-strings containing the input prompt for each batch element; null or empty string is treated as empty prompt.
+ * @param output_tokens_batch Array of int* buffers (one per batch element) where generated token ids will be stored; an element may be `nullptr` to discard outputs.
+ * @param batch_size Number of sequences in the batch (length of input_seqs and output_tokens_batch).
+ * @param steps Maximum sequence length (prompt tokens plus generated tokens); generation stops when position reaches this limit or end-of-sequence tokens are produced.
+ * @param show_progress If true, display a textual progress bar and per-item prefix output to stdout.
+ *
+ * @return long long Total number of generated tokens that were counted and (if buffers provided) written to output_tokens_batch (does not include prompt tokens).
+ */
 long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                    const char** input_seqs, int** output_tokens_batch, int batch_size, int steps,
                    bool show_progress) {
@@ -658,6 +715,20 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     return total_tokens_out;
 }
 
+/**
+ * @brief Process a Requests object in parallel batches and generate tokens for each request.
+ *
+ * Splits the requests into batches sized by the configured model batch size, distributes work
+ * across data-parallel workers, runs generation for each batch, and accumulates the total
+ * number of tokens produced.
+ *
+ * @param transformer Pointer to the Transformer configuration used for generation.
+ * @param tokenizer Pointer to the Tokenizer used to encode prompts and decode output tokens.
+ * @param sampler Pointer to the Sampler that determines token sampling behavior.
+ * @param requests Pointer to the Requests structure containing input sequences, output buffers,
+ *                 and metadata (e.g., num_reqs, max_seq_len).
+ * @return long long Total number of tokens generated across all requests.
+ */
 long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
                     Requests* requests) {
     const int total_requests = requests->num_reqs;

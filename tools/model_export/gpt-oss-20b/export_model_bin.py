@@ -98,7 +98,18 @@ def dequantize_fp4(
     dtype: torch.dtype = torch.bfloat16,
     rows_per_chunk: int = 16384 * 512,
 ) -> torch.Tensor:
-    """Dequantize MXFP4 blocks/scales into `dtype` (default bfloat16)"""
+    """
+    Dequantize tensors stored in MXFP4 packed `blocks` with per-row `scales` into a full tensor of the requested `dtype`.
+    
+    Parameters:
+        blocks (torch.Tensor): Packed FP4 data with shape (..., G, B) where each element contains two 4-bit values per output element.
+        scales (torch.Tensor): Per-row scale bytes with shape matching `blocks.shape[:-1]`; values are interpreted as int32 and centered by subtracting 127.
+        dtype (torch.dtype): Target tensor dtype for the dequantized output (default: `torch.bfloat16`).
+        rows_per_chunk (int): Maximum number of rows processed at once to limit peak memory usage.
+    
+    Returns:
+        torch.Tensor: Dequantized tensor with the same prefix dimensions as `blocks` but with the last two dimensions expanded so the embedding dimension equals G * B * 2, and elements cast to `dtype`.
+    """
     scales = scales.to(torch.int32) - 127
     assert blocks.shape[:-1] == scales.shape, (
         f"{blocks.shape=} does not match {scales.shape=}"
@@ -140,21 +151,38 @@ class TensorProvider:
     """Holds a callable to load (and optionally dequantize) a tensor on demand."""
 
     def __init__(self, loader: Callable[[], torch.Tensor]):
+        """
+        Create a TensorProvider that will load a tensor on demand using the given callable.
+        
+        Parameters:
+            loader (Callable[[], torch.Tensor]): A zero-argument callable that, when invoked by `load()`, returns the requested `torch.Tensor`.
+        """
         self._loader = loader
 
     def load(self) -> torch.Tensor:
+        """
+        Load and return the tensor produced by this provider's loader.
+        
+        Returns:
+            torch.Tensor: The tensor produced by the stored loader callable.
+        """
         return self._loader()
 
 
 def collect_effective_keys(f) -> Dict[str, TensorProvider]:
     """
-    Build a mapping:
-      effective_name -> TensorProvider
-    where:
-      - If we see "X.blocks" and "X.scales", we expose "X" that returns
-        dequantized tensor.
-      - We skip publishing ".scales" keys themselves.
-      - All other keys are exposed as-is.
+    Collect effective tensor names and create lazy providers, pairing FP4 ".blocks" with ".scales" into dequantized providers.
+    
+    For each key:
+    - If both "X.blocks" and "X.scales" exist, exposes "X" with a TensorProvider that dequantizes on demand.
+    - Keys ending with ".scales" are not exposed.
+    - Other keys are exposed as passthrough TensorProviders that load the tensor as-is.
+    
+    Parameters:
+        f: An opened safetensors-like object that supports `.keys()` and `.get_tensor(key)`.
+    
+    Returns:
+        dict: Mapping from effective tensor name (str) to TensorProvider that lazily loads or dequantizes the tensor.
     """
     keys = set(f.keys())
     effective: Dict[str, TensorProvider] = {}
@@ -167,6 +195,16 @@ def collect_effective_keys(f) -> Dict[str, TensorProvider]:
             if scales in keys:
                 # Create a provider that dequantizes on demand
                 def make_loader(blocks_key=key, scales_key=scales):
+                    """
+                    Create a zero-argument loader that fetches FP4 `blocks` and `scales` tensors from the safetensors and returns their dequantized tensor.
+                    
+                    Parameters:
+                        blocks_key (str): Key name of the FP4 blocks tensor in the safetensors.
+                        scales_key (str): Key name of the corresponding FP4 scales tensor in the safetensors.
+                    
+                    Returns:
+                        callable: A zero-argument callable that loads the tensors identified by `blocks_key` and `scales_key` and returns the dequantized tensor in bfloat16.
+                    """
                     def _ld():
                         blk = f.get_tensor(blocks_key)
                         scl = f.get_tensor(scales_key)
@@ -187,6 +225,15 @@ def collect_effective_keys(f) -> Dict[str, TensorProvider]:
         if key not in effective:
             # Plain tensor passthrough
             def make_plain_loader(k=key):
+                """
+                Create a zero-argument loader that fetches a tensor by key from the surrounding safetensors handle.
+                
+                Parameters:
+                    k (str): Name of the tensor key to load from the `f` safetensors mapping.
+                
+                Returns:
+                    loader (Callable[[], torch.Tensor]): A callable that, when invoked, returns the tensor for `k` from `f`.
+                """
                 def _ld():
                     return f.get_tensor(k)
 
@@ -203,7 +250,14 @@ _BLOCK_RE = re.compile(r"block\.(\d+)\.")
 
 
 def reorder_keys_for_write(all_keys: List[str]) -> List[str]:
-    """Return keys ordered by CATEGORIES suffix + block index, then the rest sorted."""
+    """
+    Produce a deterministic ordering of tensor keys for binary output.
+    
+    The returned list places keys that end with any suffix from CATEGORIES first, iterating categories in CATEGORIES order and sorting keys within each category by the numeric block index extracted from "block.<n>." in the key (missing index sorts before numbered blocks). Keys that do not match any category are appended in lexicographic order.
+    
+    Returns:
+        List[str]: Keys ordered by category suffix and block index, followed by remaining keys sorted alphabetically.
+    """
     buckets = {cat: [] for cat in CATEGORIES}
     others: List[str] = []
 
@@ -232,7 +286,20 @@ def reorder_keys_for_write(all_keys: List[str]) -> List[str]:
 
 
 def write_config_header(config: dict, fout) -> None:
-    """Write config keys in fixed order as <i or <f little-endian."""
+    """
+    Write the values from `config` into `fout` in the fixed order defined by `KEYS`.
+    
+    For each key in `KEYS`, writes the corresponding value from `config` as:
+    - a 4-byte little-endian signed integer if the value is an `int`,
+    - a 4-byte little-endian IEEE 754 float if the value is a `float`.
+    
+    Parameters:
+        config (dict): Mapping containing all keys listed in `KEYS` with integer or float values.
+        fout: Binary file-like object with a writable `write(bytes)` method.
+    
+    Raises:
+        TypeError: If a value for a key in `KEYS` is not an `int` or `float`.
+    """
     for key in KEYS:
         val = config[key]
         if isinstance(val, int):
@@ -250,8 +317,13 @@ def write_weights_streaming(
     out_dtype: str = "float32",
 ) -> None:
     """
-    Stream tensors to file in the specified order.
-    out_dtype: "float32" (default) or "bfloat16"
+    Write tensors from providers to the given binary file in the specified order and numeric format.
+    
+    Parameters:
+        providers (Dict[str, TensorProvider]): Mapping from effective tensor name to a provider that supplies the tensor when loaded.
+        ordered_keys (List[str]): Sequence of provider keys that determines the write order.
+        fout: Binary file-like object with a write(bytes) method where tensor payloads will be written.
+        out_dtype (str): Output numeric format; either "float32" or "bfloat16". When "bfloat16", the raw 16-bit bf16 payload is written as uint16 to preserve bit-level representation.
     """
     # np_dtype = (
     # np.float32 if out_dtype == "float32" else np.uint16
@@ -275,6 +347,16 @@ def write_weights_streaming(
 
 
 def parse_args():
+    """
+    Parse command-line arguments for the exporter.
+    
+    Returns:
+        args (argparse.Namespace): Parsed arguments with attributes:
+            - input (str): Path to the input .safetensors (may contain .blocks/.scales).
+            - config (str): Path to the model config.json.
+            - output (str): Path to the output .bin file.
+            - dtype (str): Output weights dtype, either "float32" or "bfloat16".
+    """
     p = argparse.ArgumentParser(
         description="Export GPT-OSS to single .bin (config + weights) in one step."
     )
@@ -295,6 +377,11 @@ def parse_args():
 
 
 def main():
+    """
+    Execute the export pipeline: parse CLI arguments, load the config and input safetensors, and write a single .bin containing the fixed config header followed by ordered weight tensors.
+    
+    The input path, config JSON, output path, and output dtype are taken from the command-line arguments. Tensors are streamed (dequantizing FP4 on the fly when present) into the output file, and a completion message with the output path is printed.
+    """
     args = parse_args()
 
     # Load config JSON

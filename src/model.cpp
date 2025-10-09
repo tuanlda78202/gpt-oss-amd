@@ -5,6 +5,20 @@
 #include <cstring>
 #include <vector>
 
+/**
+ * @brief Stream-converts a host FP32 tensor to BF16 and copies it into device memory in fixed-size chunks.
+ *
+ * Converts the host float array to BF16 in a temporary buffer and transfers it to the device in sequential chunks,
+ * optionally printing progress for large tensors.
+ *
+ * @param d_ptr Pointer to the device buffer pointer to receive BF16 data; bytes are written starting at this address.
+ * @param h_ptr Pointer to the host FP32 source tensor.
+ * @param total_size Total size in bytes to convert and copy (must match the intended BF16 byte length).
+ * @param tensor_name Human-readable tensor name used in progress/error messages.
+ *
+ * @note Progress dots and summary are printed when total_size is greater than 1 GB.
+ * @note The function exits the process if the temporary conversion buffer cannot be allocated, and HIP errors are handled via the CHECK_HIP macro (which may terminate on error).
+ */
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
@@ -55,7 +69,21 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
     }
 }
 
-// ! Hybrid precision (BF16 weights + FP32 activations)
+/**
+ * @brief Prepare a hybrid-precision Transformer on the GPU by converting weights to BF16 and allocating device state.
+ *
+ * Copies configuration from a host FP32 transformer, allocates and initializes BF16 weight buffers and FP32 runtime buffers on the specified GPU, converts/transfers large weight tensors (streaming where needed), sets up KV-cache layout and expert-parallel resources, and initializes device-side state and attention mask.
+ *
+ * @param t_fp32 Pointer to the source Transformer with FP32 weights on the host.
+ * @param t_d Pointer to the destination hybrid Transformer structure to populate for device use (BF16 weights, FP32 activations).
+ * @param device_id Device index to assign to the destination transformer (stored in the structure).
+ * @param dp_rank Data-parallel rank of this process.
+ * @param ep_size Expert-parallel size (number of expert partitions); 0 disables expert parallel transfers.
+ * @param ep_rank Expert-parallel rank for this process; used to compute expert shards when not replicating experts.
+ * @param use_kv16 If nonzero, KV caches are allocated as BF16 otherwise as FP32.
+ * @param replicate_experts If true, all experts are replicated locally instead of sharded by ep_size/ep_rank.
+ * @param odd_window Sliding-window size to apply to odd layers' KV locality (0 or >= seq_len disables odd-layer windowing).
+ */
 void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_d, int device_id,
                                 int dp_rank, int ep_size, int ep_rank, int use_kv16,
                                 bool replicate_experts, int odd_window) {
@@ -497,6 +525,15 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
            used_mem / (1024.0 * 1024.0 * 1024.0));
 }
 
+/**
+ * @brief Release all device and associated host resources owned by the hybrid transformer and report GPU memory.
+ *
+ * Frees GPU-allocated weight and state buffers, per-expert and staging buffers, remote buffers and weight buffers,
+ * destroys per-expert streams/events and any HIP graph objects, resets related pointer and capacity fields, and
+ * prints current GPU free/total memory.
+ *
+ * @param t_d Pointer to the OssTransformerHybrid whose device and related host resources will be released.
+ */
 void free_transformer_on_device(OssTransformerHybrid* t_d) {
     printf("\033[1;92m==================================================================\033["
            "0m\n\033[1;92m♻️  FREE GPU MEMORY...\033[0m\n");

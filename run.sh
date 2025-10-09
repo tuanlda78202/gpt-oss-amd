@@ -19,6 +19,7 @@ FOREST3='\033[38;5;34m'
 FOREST4='\033[38;5;40m'
 FOREST5='\033[38;5;46m'
 
+# print_fancy_header prints a multi-line, colored ASCII art header displaying the project name and repository URL.
 print_fancy_header() {
   echo -e "${FOREST1}                      __"
   echo -e "${FOREST2}                     |  \\"
@@ -39,6 +40,8 @@ print_fancy_header() {
   echo -e "${NC}"
 }
 
+# print_header prints a colored separator and a header line containing the given title in brackets followed by the current timestamp.
+# color is an ANSI escape sequence used for the header color; title is the text displayed inside brackets.
 print_header() {
   local color="$1"
   local title="$2"
@@ -200,8 +203,10 @@ usage() {
   echo -e "  ${WHITE}python3${NC}   - For tokenizer verification tests"
 }
 
+# now prints the current date and time in the format YYYY-MM-DD HH:MM:SS.
 now() { date +"%Y-%m-%d %H:%M:%S"; }
 
+# print_kv prints a formatted key-value pair with the key left-aligned and, if provided, an optional third value appended as extra annotation.
 print_kv() {
   if [[ -n "${3-}" ]]; then
     printf "  %-14s: %s %s\n" "$1" "$2" "$3"
@@ -210,6 +215,7 @@ print_kv() {
   fi
 }
 
+# find_checkpoint returns the provided checkpoint path if given; otherwise returns "$MODELBIN_ROOT/gpt-oss-20b.bin".
 find_checkpoint() {
   local ckpt="${1:-}"
 
@@ -250,6 +256,7 @@ cmd_build() {
   esac
 }
 
+# cmd_run parses run-related flags, prepares and displays a run configuration, resolves the checkpoint, builds the argument list, and executes the build/run binary via srun (optionally teeing output to log.txt).
 cmd_run() {
   local ckpt=""
   local mode=""
@@ -398,6 +405,7 @@ cmd_run() {
   fi
 }
 
+# cmd_all orchestrates a full build-and-run workflow; accepts -c to run `make clean` before building with the `omp` flavor and passes remaining arguments through to cmd_run.
 cmd_all() {
   local clean_flag=""
   local run_args=()
