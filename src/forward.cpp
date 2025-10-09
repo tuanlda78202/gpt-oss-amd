@@ -111,7 +111,7 @@ void create_streams_once() {
     CHECK_HIP(hipEventCreateWithFlags(&tls.evt_wq_heavy_ready, hipEventDisableTiming));
     CHECK_HIP(hipEventCreateWithFlags(&tls.evt_wq_light_ready, hipEventDisableTiming));
 }
-}
+} // namespace
 
 template <class T>
 static inline T clamp_val(T v, T lo, T hi) {
@@ -290,8 +290,7 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
         const int is_local_flag = s->h_layer_is_local ? s->h_layer_is_local[l] : 0;
         const int kv_cap = s->h_layer_kv_cap ? s->h_layer_kv_cap[l] : p->seq_len;
         const int is_local = (is_local_flag != 0);
-        const float* mask_ptr =
-            is_local ? nullptr : s->mask;
+        const float* mask_ptr = is_local ? nullptr : s->mask;
 
         const int steps_so_far = max_pos_in_batch + 1;
         const int visible_len = is_local ? std::min(kv_cap, steps_so_far) : steps_so_far;
@@ -341,9 +340,8 @@ float* forward(OssTransformerHybrid* transformer, OssExpertParallelGroup* ep_gro
         ensure_h_expert_offsets(n_experts + 1);
         CHECK_HIP(hipEventRecord(tls.evt_offsets_ready, tls.compute));
         CHECK_HIP(hipStreamWaitEvent(tls.d2h, tls.evt_offsets_ready, 0));
-        CHECK_HIP(hipMemcpyAsync(h_expert_offsets,
-                                 s->expert_offsets,
-                                 (n_experts + 1) * sizeof(int), hipMemcpyDeviceToHost, tls.d2h));
+        CHECK_HIP(hipMemcpyAsync(h_expert_offsets, s->expert_offsets, (n_experts + 1) * sizeof(int),
+                                 hipMemcpyDeviceToHost, tls.d2h));
         CHECK_HIP(hipEventRecord(tls.evt_offsets_done, tls.d2h));
 
         const int sumNe = BKE;

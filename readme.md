@@ -12,7 +12,6 @@
 
 <img width="1696" height="980" alt="image" src="https://github.com/user-attachments/assets/efd81a09-5299-4bac-b382-66e576a48b1f" />
 
-
 </div>
 
 ## Abstract
@@ -27,8 +26,8 @@ Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation
 
 ## Roadmap
 
-* [x] Release codebase
-* [ ] Publish worklog blog post
+- [x] Release codebase
+- [ ] Publish worklog blog post
 
 ## Build and Run
 
@@ -48,11 +47,11 @@ gpt-oss-amd/
 
 ### Resources
 
-* Download GPT-OSS 20/120B model `safetensors` files from [here](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) and convert them to `bin` using the provided script in `tools/model_export` to can use with the C++ inference runtime.
+- Download GPT-OSS 20/120B model `safetensors` files from [here](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) and convert them to `bin` using the provided script in `tools/model_export` to can use with the C++ inference runtime.
 
-* Tokenizer compatible with OpenAI `o200k_harmony`  (via `tiktoken`).
+- Tokenizer compatible with OpenAI `o200k_harmony` (via `tiktoken`).
 
-* GCC/Clang with OpenMP and HIP/ROCm installed.
+- GCC/Clang with OpenMP and HIP/ROCm installed.
 
 ### Setup Env
 
@@ -71,21 +70,21 @@ chmod +x run.sh
 
 ### Run
 
-* Chat
+- Chat
 
   ```bash
   # interactive turn-based generation, optional system prompt
   ./run run -m chat -i "How do I tune top-p?" -y "You are a concise assistant." -T 0.7
   ```
 
-* Single-Prompt
+- Single-Prompt
 
   ```bash
   # single prompt → completion
   ./run run -m generate -i "Write a haiku about parallelism." -T 0.8 -p 0.95
   ```
 
-* Batch
+- Batch
 
   ```bash
   # multi-prompt batch
@@ -102,10 +101,10 @@ chmod +x run.sh
 
 ## Experiments
 
-| Model | Mode | Num Requests | Num GPUs  | Warm-up (s) | Throughput (TPS) | METEOR | BERTScore |
-|-------|------|--------------|-----------|-------------|------------------|--------|-----------|
-| `gpt-oss-20b` | `getp` | 7120 | 8x AMD MI250 | 20 | 30086 | 0.52 | 0.98 |
-| `gpt-oss-120b` | `getp` | 6144 | 8x AMD MI250 | 46 | 9993 | 0.30 | 0.99 |
+| Model          | Mode   | Num Requests | Num GPUs     | Warm-up (s) | Throughput (TPS) | METEOR | BERTScore |
+| -------------- | ------ | ------------ | ------------ | ----------- | ---------------- | ------ | --------- |
+| `gpt-oss-20b`  | `getp` | 7120         | 8x AMD MI250 | 20          | 30086            | 0.52   | 0.98      |
+| `gpt-oss-120b` | `getp` | 6144         | 8x AMD MI250 | 46          | 9993             | 0.30   | 0.99      |
 
 ---
 
