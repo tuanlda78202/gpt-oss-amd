@@ -18,7 +18,7 @@ Please note that this project is released with a [Contributor Code of Conduct](C
 
 ## How to Contribute
 
-There are many ways to contribute to Leo:
+There are many ways to contribute to `gpt-oss-amd`:
 
 ### 🐛 Report Bugs
 
@@ -48,7 +48,7 @@ There are many ways to contribute to Leo:
 
 - Answer questions in issues and discussions
 - Review pull requests
-- Share your Leo experience with the community
+- Share your `gpt-oss-amd` experience with the community
 
 ## Development Workflow
 
