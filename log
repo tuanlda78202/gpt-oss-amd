@@ -1,0 +1,71 @@
+.
+├── assets
+├── build
+│   └── tokenizer.bin
+├── CITATION.cff
+├── CODE_OF_CONDUCT.md
+├── CODEOWNERS
+├── CONTRIBUTING.md
+├── include
+│   ├── model.hpp
+│   ├── sampler.hpp
+│   └── tokenizer.hpp
+├── LICENSE
+├── log
+├── Makefile
+├── Makefile.ci
+├── pyproject.toml
+├── readme.md
+├── run.sh
+├── src
+│   ├── decode.cpp
+│   ├── forward.cpp
+│   ├── getp
+│   │   ├── eval.cpp
+│   │   └── run.cpp
+│   ├── hip
+│   │   ├── attention.hip
+│   │   ├── BLAS.hip
+│   │   ├── embed.hip
+│   │   ├── gemms
+│   │   │   ├── gemm_logits.hip
+│   │   │   ├── gemm_o.hip
+│   │   │   ├── gemm_qkv.hip
+│   │   │   └── gemm_router.hip
+│   │   ├── moe.hip
+│   │   ├── rmsnorm.hip
+│   │   ├── rope.hip
+│   │   ├── sampling.hip
+│   │   ├── scheduler.hip
+│   │   ├── softmax.hip
+│   │   ├── split_qkv.hip
+│   │   ├── topk.hip
+│   │   └── vecadd.hip
+│   ├── model.cpp
+│   ├── run.cpp
+│   ├── sampler.cpp
+│   └── tokenizer.cpp
+├── tests
+│   ├── eval.py
+│   ├── README.md
+│   ├── references
+│   │   ├── input.txt
+│   │   ├── output_120b.txt
+│   │   └── output_20b.txt
+│   ├── submission
+│   └── threadhold.json
+├── tools
+│   ├── dequantize_to_bf16.py
+│   ├── export_tokenizer_bin.py
+│   ├── model_export
+│   │   ├── gpt-oss-120b
+│   │   │   ├── config.json
+│   │   │   ├── export_model_bin.py
+│   │   │   └── README.md
+│   │   ├── gpt-oss-20b
+│   │   │   ├── config.json
+│   │   │   ├── export_model_bin.py
+│   │   │   └── README.md
+│   │   └── README.md
+│   └── run_transformers.py
+└── uv.lock
