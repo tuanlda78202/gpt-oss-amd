@@ -12,7 +12,6 @@
 
 <img width="1709" height="963" alt="image" src="https://github.com/user-attachments/assets/ef0a6e0a-acd0-4a8c-8916-4b28d0207822" />
 
-
 </div>
 
 ## Abstract
@@ -108,12 +107,4 @@ This project was conducted as part of the GPU Engineer Training Program, a colla
 
 ## Contact
 
-If you have any questions, please feel free to email the [authors.](tuanleducanh78202@gmail.com)
-
-## References
-
-* [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
-* [llama2.c](https://github.com/karpathy/llama2.c)
-* [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
-* [OpenMP](https://www.openmp.org/specifications/)
-<!-- * [From GPT-2 to gpt-oss](https://magazine.sebastianraschka.com/p/from-gpt-2-to-gpt-oss-analyzing-the) -->
+If you have any questions, please feel free to open an issue or email the [authors.](tuanleducanh78202@gmail.com)
