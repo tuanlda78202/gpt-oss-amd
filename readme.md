@@ -1,6 +1,6 @@
 <div align="center">
 
-# Implementing GPT-OSS from Scratch on AMD GPUs
+# GPT-OSS from Scratch on AMD GPUs
 
  <p>
     <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License: MIT"></a>
@@ -90,7 +90,7 @@ chmod +x run.sh
 ### Help
 
 ```bash
-# full, colorized usage summary (build flavors, run flags, etc.)
+# full, colorized usage summary
 ./run.sh -h
 ```
 
