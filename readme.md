@@ -24,7 +24,14 @@ Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation
 
 ---
 
-## Code Structure
+## Roadmap
+
+* [x] Release codebase
+* [ ] Release worklog blogpost
+
+## Build and Run
+
+### Code Structure
 
 ```plain
 gpt-oss-amd/
@@ -37,8 +44,6 @@ gpt-oss-amd/
    ├── tools/                # Model/tokenizer conversion and HF inference utilities
    └── run.sh                # Build and run script
 ```
-
-## Build and Run
 
 ### Resources
 
