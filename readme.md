@@ -22,17 +22,18 @@ Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation
 
 ---
 
-## structure
+## code structure
 
 ```plain
-├── include/              # Header files
-├── src/
-│   ├── getp/             # Request serving and runtime logic
-│   ├── hip/              # Custom HIP kernels for AMD GPUs
-│   ├── forward.cpp       # Model forward pass implementation
-├── tests/                # Evaluation scripts
-├── tools/                # Model/tokenizer conversion and HF inference utilities
-└── run.sh                # Build and run script
+gpt-oss-amd/
+   ├── include/              # Header files
+   ├── src/
+   │   ├── getp/             # Request serving and runtime logic
+   │   ├── hip/              # Custom HIP kernels for AMD GPUs
+   │   ├── forward.cpp       # Model forward pass implementation
+   ├── tests/                # Evaluation scripts
+   ├── tools/                # Model/tokenizer conversion and HF inference utilities
+   └── run.sh                # Build and run script
 ```
 
 ### goals
