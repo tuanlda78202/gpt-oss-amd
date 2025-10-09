@@ -103,8 +103,8 @@ chmod +x run.sh
 
 ## Acknowledgments
 
-This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and the [THUNDER Research Group](http://snuvm.snu.ac.kr/) at Seoul National University. We thank them for their HPC expertise and generous AMD GPU support, without which this work would not have been possible.
+This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). We thank them for their HPC expertise and generous AMD GPU support, without which this work would not have been possible.
 
 ## Contact
 
-If you have any questions, please feel free to open an issue or email the [authors.](tuanleducanh78202@gmail.com)
+If you have any questions, please feel free to open an issue or email the [authors.](mailto:tuanleducanh78202@gmail.com)
