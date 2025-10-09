@@ -33,7 +33,7 @@ print_fancy_header() {
   echo -e "${FOREST3} \\\$\$    \$\$| \$\$"
   echo -e "${FOREST4}  \\\$\$\$\$\$\$  \\\$\$"
   echo -e "${FOREST5}  ════════════════════════════════════════════════════════════════"
-  echo -e "${FOREST4}                             gpt-oss-amd"
+  echo -e "${FOREST4}                       gpt-oss-amd from scratch"
   echo -e "${FOREST3}              https://github.com/tuanlda78202/gpt-oss-amd"
   echo -e "${FOREST2}  ════════════════════════════════════════════════════════════════"
   echo -e "${NC}"

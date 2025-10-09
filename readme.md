@@ -8,17 +8,18 @@
     <img src="https://img.shields.io/github/last-commit/tuanlda78202/gpt-oss-amd?&label=commit" alt="Last Commit">
  </p>
 
-[abstract](#abstract) | [️build & run](#build--run) | [exp](#exp) | <a href="https://openai.com/index/introducing-gpt-oss/">blog</a> |
+[Abstract](#abstract) | [️Build & Run](#build--run) | [Experiments](#experiments) | <a href="https://openai.com/index/introducing-gpt-oss/">blog</a> |
 <img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" />
 
 </div>
 
 ## abstract
 
-This repository implements an inference serving system for **gpt-oss** models (20B & 120B) using a minimal C/C++ runtime derived from `llama2.c`. It targets **single-node, multi-GPU** execution on AMD MI250 with custom HIP kernels, and supports CPU execution with OpenMP/pthreads.
+After six years-the first time since GPT-2, OpenAI has released new open-weight large language models, `gpt-oss-20b` and `gpt-oss-120b`. From day one, many inference engines such as `llama.cpp`, `vLLM`, and `SGLang` have supported these models; however, most focus on maximizing throughput using CUDA for NVIDIA GPUs, offering limited support for AMD GPUs. Moreover, their library-oriented implementations are often complex and difficult to adapt for personal/experimental use cases.
 
-- **Baseline:** CPU-only C/C++ code (single-prompt, greedy decoding)
-- **Extension:** HIP GPU execution and multi-GPU parallelism on a single node
+To address these limitations, we present `gpt-oss-amd`, a pure C++ implementation of OpenAI’s GPT-OSS models designed to maximize inference throughput on AMD GPUs without relying on external libraries. Our goal is to explore end-to-end LLM optimization-from kernel-level improvements to system-level design—providing insights for researchers and developers interested in high-performance computing and model-level optimization.
+
+Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation uses HIP (an AMD equivalent to CUDA) and avoids dependencies such as rocBLAS, hipBLAS, RCCL, and MPI. We employ a range of optimization techniques for both the 20B and 120B models, including efficient model loading, batching, multi-streaming, multi-GPUs communication, optimized CPU–GPU–SRAM memory access, FlashAttention, matrix-core–based GEMM, and load balancing in MoE routing. Experiments on a single node with 8× AMD MI250 GPUs show that our implementation achieves over 30k TPS on the 20B model and 10k TPS on the 120B model in custom benchmarks, demonstrating the effectiveness of our optimizations and the strong potential of AMD GPUs for large-scale LLM inference.
 
 ---
 
@@ -120,14 +121,6 @@ ln -s run.sh run
 
 ---
 
-## rules
-
-- **Do not modify:** `run.cpp`, `getp_eval.cpp`, `Makefile`.
-- **Implement all GPU kernels from scratch** — **no external GPU libraries**.
-- **Target:** single-node, multi-GPU execution.
-
----
-
 ## refs
 
 - [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
@@ -136,4 +129,3 @@ ln -s run.sh run
 - [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
 - [OpenMP](https://www.openmp.org/specifications/)
 - [Slurm](https://slurm.schedmd.com/documentation.html)
-- [tiktoken](https://github.com/openai/tiktoken)
