@@ -36,49 +36,17 @@ gpt-oss-amd/
    └── run.sh                # Build and run script
 ```
 
-### goals
+## build and run
 
-- **Correctness** — keep simple checks/metrics to verify output validity.
-- **Throughput** — maximize tokens/sec via CPU threading + HIP GPU kernels.
-- **Scope** — single node, multi-GPU execution for 20B and 120B models.
+### resources
 
----
+* Download GPT-OSS 20/120B model `safetensors` files from [here](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) and convert them to `bin` using the provided script in `tools/model_export` to can use with the C++ inference runtime.
 
-## resources
+* Tokenizer compatible with OpenAI `o200k_harmony`  (via `tiktoken`).
 
-- **Model binaries:**
-  - `gpt-oss-20b.bin`
-  - `gpt-oss-120b.bin`
+* GCC/Clang with OpenMP and HIP/ROCm installed.
 
-- **Tokenizer:** compatible with OpenAI **`o200k_harmony`** (via `tiktoken`).
-
-### env
-
-- **Hardware:** single node with up to **8× AMD MI250 GPUs**.
-- **GPU:** HIP/ROCm (write **all GPU kernels from scratch**, no GPU libs).
-- **CPU:** GCC/Clang with **OpenMP**/**pthreads**.
-- **OS:** Slurm for job execution.
-
-### slurm cluster
-
-Login node:
-
-```bash
-ssh getp<XX>@203.205.18.240
-```
-
-Compute node:
-
-```bash
-# srun --gres=gpu:1 rocm-smi
-srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
-```
-
-> The training cluster provides up to **4 nodes** for experimentation, but the **project deliverable focuses on single-node, multi-GPU execution**.
-
----
-
-## build & run
+### setup env
 
 ```bash
 uv sync
@@ -112,33 +80,36 @@ ln -s run.sh run
 ### batch
 
 ```bash
-./run run -m getp
+./run.sh all -b 128 -t 1024 -l -f -m 120 --kv16 -g 8
+```
+
+### help
+
+```bash
+./run.sh -h
 ```
 
 ---
 
-## eval
+## eval modes
 
 | Mode       | Description                             | Example                                                       |
 | ---------- | --------------------------------------- | ------------------------------------------------------------- |
 | `chat`     | Interactive turn-based generation       | `./run.sh -c model.bin -m chat`                               |
 | `generate` | Single prompt → completion              | `./run.sh -c model.bin -m generate -i "..."`                  |
-| `getp`     | Multi-prompt batch for final evaluation | `./run.sh -c model.bin -m getp -i prompts.txt -o outputs.txt` |
+| `getp`     | Multi-prompt batch | `./run.sh -c model.bin -m getp -i prompts.txt -o outputs.txt` |
 
-- Maintain **correctness metrics** (e.g., checksum/sanity prompts).
-- Report **tokens/sec** for each mode and model size.
-- Optimize across:
-  - CPU threading (OpenMP/pthreads)
-  - HIP kernels (coalescing, tiling, occupancy)
-  - Multi-GPU parallelization (pipeline/tensor-level)
+## experiments
 
----
+## acknowledgments
+
+* Special thanks to Moreh Inc. for their support and resources.
 
 ## refs
 
-- [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
-- [llama2.c](https://github.com/karpathy/llama2.c)
-- [AMD ROCm](https://rocm.docs.amd.com/)
-- [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
-- [OpenMP](https://www.openmp.org/specifications/)
-- [Slurm](https://slurm.schedmd.com/documentation.html)
+* [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
+* [llama2.c](https://github.com/karpathy/llama2.c)
+* [AMD ROCm](https://rocm.docs.amd.com/)
+* [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
+* [OpenMP](https://www.openmp.org/specifications/)
+* [Slurm](https://slurm.schedmd.com/documentation.html)
