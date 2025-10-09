@@ -1,7 +1,9 @@
 extends:
   - "@commitlint/config-conventional"
 rules:
+  # Customize max header length
   header-max-length: [2, "always", 100]
+  # Add custom types
   type-enum:
     [
       2,
@@ -26,5 +28,7 @@ rules:
     ]
   # Allow empty scope
   scope-empty: [0, "never"]
+  # Subject should be lowercase
+  subject-case: [2, "always", "lower-case"]
   # No period at end of subject
   subject-full-stop: [2, "never", "."]
