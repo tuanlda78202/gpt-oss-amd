@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/github/last-commit/tuanlda78202/gpt-oss-amd?&label=commit" alt="Last Commit">
  </p>
 
-[abstract](#abstract) | [build & run](#build-and-run) | [Eval Modes](#eval-modes) | [Experiments](#experiments) |
+[Abstract](#abstract) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contact](#contact)
 
 <img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" />
 
@@ -54,9 +54,7 @@ gpt-oss-amd/
 uv sync
 source .venv/bin/activate
 pre-commit install
-
 chmod +x run.sh
-ln -s run.sh run
 ```
 
 ### Build
@@ -70,46 +68,51 @@ ln -s run.sh run
 * Chat
 
   ```bash
-  # interactive turn-based generation
-  ./run run -m chat
+  # interactive turn-based generation, optional system prompt
+  ./run run -m chat -i "How do I tune top-p?" -y "You are a concise assistant." -T 0.7
   ```
 
 * Single-Prompt
 
   ```bash
   # single prompt → completion
-  ./run run -m generate -i "Write a haiku about parallelism."
+  ./run run -m generate -i "Write a haiku about parallelism." -T 0.8 -p 0.95
   ```
 
 * Batch
 
   ```bash
   # multi-prompt batch
-  ./run.sh all -b 128 -t 1024 -l -f -m 120 --kv16 -g 8
+  ./run run                          # default 20B, 1 GPU, uses tests/data/{input,output}.txt
+  ./run run -m 120 -g 8 --kv16       # 120B, 8 GPUs, KV 16-bit
   ```
 
 ### Help
 
 ```bash
+# full, colorized usage summary (build flavors, run flags, etc.)
 ./run.sh -h
 ```
 
 ## Experiments
 
-| Model | Num GPUs  | Warm-up (s) | Throughput (TPS) | METEOR | BERTScore |
-|-------|----------| -------------|------------------|--------|-----------|
-| `gpt-oss-20b` | 8x AMD MI250 | 20 | 30086 | 0.52 | 0.98 |
-| `gpt-oss-120b` | 8x AMD MI250 | 46 | 9903 | 0.30 | 0.99 |
+| Model | Mode | Num Requests | Num GPUs  | Warm-up (s) | Throughput (TPS) | METEOR | BERTScore |
+|-------|------|--------------|-----------|-------------|------------------|--------|-----------|
+| `gpt-oss-20b` | `getp` | 7120 | 8x AMD MI250 | 20 | 30086 | 0.52 | 0.98 |
+| `gpt-oss-120b` | `getp` | 6144 | 8x AMD MI250 | 46 | 9993 | 0.30 | 0.99 |
 
 ## Acknowledgments
 
-* Special thanks to Moreh Inc. for their support and resources.
+This project was conducted as part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). We sincerely thank them for their support, expert HPC guidance, and generous access to AMD GPUs - this work would not have been possible without them.
+
+## Contact
+
+If you have any questions, please feel free to email the [authors.](tuanleducanh78202@gmail.com)
 
 ## References
 
 * [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
 * [llama2.c](https://github.com/karpathy/llama2.c)
-* [AMD ROCm](https://rocm.docs.amd.com/)
 * [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
 * [OpenMP](https://www.openmp.org/specifications/)
-* [Slurm](https://slurm.schedmd.com/documentation.html)
+* [From GPT-2 to gpt-oss](https://magazine.sebastianraschka.com/p/from-gpt-2-to-gpt-oss-analyzing-the)
