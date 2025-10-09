@@ -106,6 +106,8 @@ chmod +x run.sh
 | `gpt-oss-20b` | `getp` | 7120 | 8x AMD MI250 | 20 | 30086 | 0.52 | 0.98 |
 | `gpt-oss-120b` | `getp` | 6144 | 8x AMD MI250 | 46 | 9993 | 0.30 | 0.99 |
 
+---
+
 ## Acknowledgments
 
 This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). We thank them for their HPC expertise and generous AMD GPU support, without which this work would not have been possible.
