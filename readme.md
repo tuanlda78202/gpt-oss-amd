@@ -112,6 +112,16 @@ chmod +x run.sh
 
 This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). We thank them for their HPC expertise and generous AMD GPU support, without which this work would not have been possible.
 
-## Contact
+## Contributions
 
-If you have any questions, please feel free to open an issue or email the [authors.](mailto:tuanleducanh78202@gmail.com)
+Found a bug, typo, or want to extend something? Open a PR — all contributions are welcome.
+
+<p align="left">
+  <a href="https://github.com/tuanlda78202/gpt-oss-amd/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=tuanlda78202/gpt-oss-amd" />
+  </a>
+</p>
+
+## License
+
+MIT License — free to use, adapt, and share for learning and working.
