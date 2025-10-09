@@ -27,7 +27,7 @@ Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation
 ## Roadmap
 
 * [x] Release codebase
-* [ ] Release worklog blogpost
+* [ ] Publish worklog blog post
 
 ## Build and Run
 
