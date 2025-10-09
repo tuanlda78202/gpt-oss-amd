@@ -1,6 +1,6 @@
 cff-version: "1.2.0"
 message: "If you use this software, please cite it as below."
-title: "gpt-oss-amd – Implement GPT-OSS inference from scratch on AMD GPUs"
+title: "gpt-oss-amd – implement GPT-OSS 20/120B C++ inference from scratch on AMD GPUs"
 version: 0.1.0
 type: "Software"
 authors:

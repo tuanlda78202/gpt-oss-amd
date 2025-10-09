@@ -159,10 +159,6 @@ Then create a pull request using our [PR template](.github/PULL_REQUEST_TEMPLATE
 - Help others when you can
 - Follow our [Code of Conduct](CODE_OF_CONDUCT.md)
 
-## 🔒 Security
-
-For security-related issues, please review our [Security Policy](SECURITY.md) and report vulnerabilities responsibly.
-
 ## 📄 License
 
 By contributing to `gpt-oss-amd`, you agree that your contributions will be licensed under the same [MIT License](LICENSE) that covers the project.
