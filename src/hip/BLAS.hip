@@ -25,13 +25,10 @@ using i16x4 = __attribute__((ext_vector_type(4))) short;
 using f4 = __attribute__((ext_vector_type(4))) float;
 using f2 = __attribute__((ext_vector_type(2))) float;
 
-// Helper to get the raw 16-bit payload from a __hip_bfloat16
 static inline __device__ short bf16_bits(__hip_bfloat16 v) {
     return *reinterpret_cast<const short*>(&v);
 }
 
-// A vectorized load function for B. It loads 4 floats from global memory, converts
-// each to bfloat16, and returns their raw bits packed in an i16x4.
 __device__ inline i16x4 load_and_convert_f32_to_bf16x4(const float* gmem_ptr) {
     float4 f_vals = *reinterpret_cast<const float4*>(gmem_ptr);
     i16x4 res;

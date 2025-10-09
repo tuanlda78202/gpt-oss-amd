@@ -1,292 +1,127 @@
 <div align="center">
 
-# gpt-oss inference engine
+# GPT-OSS from Scratch on AMD GPUs
 
-[🌊 flow](#flow) | [🖥️ slurm](#slurm-cluster) | [⚒️ build & run](#build--run) | 🤗 <a href="https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4">hf</a> | 📑 <a href="https://openai.com/index/introducing-gpt-oss/">blog</a> |
+ <p>
+    <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License: MIT"></a>
+    <img src="https://img.shields.io/github/actions/workflow/status/tuanlda78202/gpt-oss-amd/ci.yaml?branch=main&label=CI&logo=github" alt="CI Status">
+    <img src="https://img.shields.io/github/last-commit/tuanlda78202/gpt-oss-amd?&label=commit" alt="Last Commit">
+ </p>
 
-<img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" />
+[Abstract](#abstract) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contributions](#contributions)
+
+<img width="1696" height="980" alt="image" src="https://github.com/user-attachments/assets/efd81a09-5299-4bac-b382-66e576a48b1f" />
 
 </div>
 
-## abstract
+## Abstract
 
-This repository implements an inference serving system for **gpt-oss** models (20B & 120B) using a minimal C/C++ runtime derived from `llama2.c`. It targets **single-node, multi-GPU** execution on AMD MI250 with custom HIP kernels, and supports CPU execution with OpenMP/pthreads.
+After six years-the first time since GPT-2, OpenAI has released new open-weight LLMs, `gpt-oss-20b` and `gpt-oss-120b`. From day one, many inference engines such as llama.cpp, vLLM, and SGLang have supported these models; however, most focus on maximizing throughput using CUDA for NVIDIA GPUs, offering limited support for AMD GPUs. Moreover, their library-oriented implementations are often complex and difficult to adapt for personal/experimental use cases.
 
-- **Baseline:** CPU-only C/C++ code (single-prompt, greedy decoding)
-- **Extension:** HIP GPU execution and multi-GPU parallelism on a single node
+To address these limitations, we introduce `gpt-oss-amd`, a pure C++ implementation of OpenAI’s GPT-OSS models designed to **maximize inference throughput on AMD GPUs without relying on external libraries**. Our goal is to explore end-to-end LLM optimization, from kernel-level improvements to system-level design, providing insights for researchers and developers interested in high-performance computing and model-level optimization.
 
----
-
-### goals
-
-- ✅ **Correctness** — keep simple checks/metrics to verify output validity.
-- 🚀 **Throughput** — maximize tokens/sec via CPU threading + HIP GPU kernels.
-- 📚 **Scope** — single node, multi-GPU execution for 20B and 120B models.
+Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation uses HIP (an AMD equivalent to CUDA) and avoids dependencies such as rocBLAS, hipBLAS, RCCL, and MPI. We employ a range of optimization techniques for both the 20B and 120B models, including efficient model loading, batching, multi-streaming, multi-GPUs communication, optimized CPU–GPU–SRAM memory access, FlashAttention, matrix-core–based GEMM, and load balancing in MoE routing. Experiments on a single node with 8× AMD MI250 GPUs show that our implementation achieves over 30k TPS on the 20B model and nearly 10k TPS on the 120B model in custom benchmarks, demonstrating the effectiveness of our optimizations and the strong potential of AMD GPUs for large-scale LLM inference.
 
 ---
 
-## flow
+## Roadmap
 
-```mermaid
-graph TD
-    %% Entry Point
-    Start([Program Start]) --> Main[main - run.cpp:1099]
+- [x] Release codebase
+- [ ] Publish worklog blog post
 
-    %% Initialization Phase
-    Main --> ParseArgs[Parse Command Line Arguments]
-    ParseArgs --> InitTransformer[build_transformer - run.cpp:285]
-    ParseArgs --> InitTokenizer[read_tokenizer - tokenizer.cpp:49]
-    ParseArgs --> InitSampler[build_sampler - sampler.cpp:build_sampler_oss]
+## Build and Run
 
-    %% Transformer Initialization
-    InitTransformer --> LoadCheckpoint[load_checkpoint - run.cpp]
-    LoadCheckpoint --> MemoryMapWeights[memory_map_weights - run.cpp]
-    LoadCheckpoint --> MallocRunState[malloc_run_state - run.cpp]
+### Code Structure
 
-    %% Mode Selection
-    InitTransformer --> ModeCheck{Mode Selection}
-    InitTokenizer --> ModeCheck
-    InitSampler --> ModeCheck
-
-    %% Three Execution Modes
-    ModeCheck -->|"mode=='generate'"| GenerateMode[generate - run.cpp:886]
-    ModeCheck -->|"mode=='chat'"| ChatMode[chat - run.cpp:985]
-    ModeCheck -->|"mode=='getp'"| GetpMode[getp - getp_run.cpp]
-
-    %% Generate Mode Flow
-    GenerateMode --> EncodePrompt1[encode - tokenizer.cpp:encode]
-    EncodePrompt1 --> GenLoop{Generation Loop}
-    GenLoop --> ForwardPass1[forward_cpu - forward.cpp:204]
-    ForwardPass1 --> Sample1[sample_oss - sampler.cpp:sample_oss]
-    Sample1 --> Decode1[decode_piece - tokenizer.cpp:decode_piece]
-    Decode1 --> PrintToken1[Print Token]
-    PrintToken1 --> CheckSteps1{Steps < Max?}
-    CheckSteps1 -->|Yes| GenLoop
-    CheckSteps1 -->|No| Cleanup
-
-    %% Chat Mode Flow
-    ChatMode --> ReadInput[Read User Input]
-    ReadInput --> FormatPrompt[Format Chat Prompt]
-    FormatPrompt --> EncodePrompt2[encode - tokenizer.cpp:encode]
-    EncodePrompt2 --> ChatLoop{Chat Generation Loop}
-    ChatLoop --> ForwardPass2[forward_cpu - forward.cpp:204]
-    ForwardPass2 --> Sample2[sample_oss - sampler.cpp:sample_oss]
-    Sample2 --> Decode2[decode_piece - tokenizer.cpp:decode_piece]
-    Decode2 --> PrintToken2[Print Token]
-    PrintToken2 --> CheckSteps2{Steps < Max?}
-    CheckSteps2 -->|Yes| ChatLoop
-    CheckSteps2 -->|No| ReadInput
-
-    %% Getp Mode Flow
-    GetpMode --> WarmUp[warm_up - getp_run.cpp:13]
-    WarmUp --> GetpEval[getp_eval - getp_eval.cpp]
-    GetpEval --> SimpleGenerate[simple_getp_generate - getp_run.cpp:31]
-    SimpleGenerate --> EncodePrompt3[encode - tokenizer.cpp:encode]
-    EncodePrompt3 --> GetpLoop{Getp Generation Loop}
-    GetpLoop --> ForwardPass3[forward_cpu - forward.cpp:204]
-    ForwardPass3 --> Sample3[sample_oss - sampler.cpp:sample_oss]
-    Sample3 --> StoreToken[Store Output Token]
-    StoreToken --> CheckSteps3{Steps < Max?}
-    CheckSteps3 -->|Yes| GetpLoop
-    CheckSteps3 -->|No| FinishGetp[finish - getp_run.cpp:22]
-    FinishGetp --> Cleanup
-
-    %% Forward Pass Detail (Core Inference)
-    ForwardPass1 --> TokenEmbedding[Token Embedding Lookup]
-    ForwardPass2 --> TokenEmbedding
-    ForwardPass3 --> TokenEmbedding
-
-    TokenEmbedding --> LayerLoop{For Each Layer}
-    LayerLoop --> AttentionNorm[rmsnorm_cpu - forward.cpp:10]
-    AttentionNorm --> QKVProjection[QKV Projection - matmul_cpu]
-    QKVProjection --> RoPE[apply_rotary_emb_cpu - forward.cpp:37]
-    RoPE --> MultiHeadAttn[Multi-Head Attention]
-
-    MultiHeadAttn --> AttentionCalc[Attention Score Calculation]
-    AttentionCalc --> SoftmaxAttn[softmax_cpu - forward.cpp:26]
-    SoftmaxAttn --> ValueAggregation[Weighted Value Aggregation]
-    ValueAggregation --> OutputProjection[Output Projection - matmul_cpu]
-    OutputProjection --> ResidualAdd1[Residual Connection]
-
-    ResidualAdd1 --> FFNNorm[rmsnorm_cpu - MLP norm]
-    FFNNorm --> Router[Router Network - matmul_cpu]
-    Router --> TopK[topk_cpu - forward.cpp:20]
-    TopK --> ExpertSelection{For Each Selected Expert}
-
-    ExpertSelection --> MLP1[MLP1 Projection - matmul_cpu]
-    MLP1 --> SwiGLU[SwiGLU Activation]
-    SwiGLU --> MLP2[MLP2 Projection - matmul_cpu]
-    MLP2 --> ExpertWeight[Apply Expert Weight]
-    ExpertWeight --> ExpertAgg[Aggregate Expert Outputs]
-    ExpertAgg --> ResidualAdd2[Residual Connection]
-
-    ResidualAdd2 --> NextLayer{More Layers?}
-    NextLayer -->|Yes| LayerLoop
-    NextLayer -->|No| FinalNorm[Final rmsnorm_cpu]
-    FinalNorm --> Classifier[Classifier - matmul_cpu]
-    Classifier --> ReturnLogits[Return Logits]
-
-    %% Sampling Detail
-    Sample1 --> SampleType{Sampling Type}
-    Sample2 --> SampleType
-    Sample3 --> SampleType
-
-    SampleType -->|"temperature=0"| ArgMax[sample_argmax_oss - sampler.cpp:9]
-    SampleType -->|"topp>0"| TopP[sample_topp_oss - sampler.cpp:45]
-    SampleType -->|"temperature>0"| Multinomial[sample_mult_oss - sampler.cpp:22]
-
-    TopP --> SortProbs[Sort Probabilities]
-    SortProbs --> CumulativeSum[Cumulative Sum]
-    CumulativeSum --> SelectToken[Select Token]
-
-    ArgMax --> SelectToken
-    Multinomial --> SelectToken
-    SelectToken --> ReturnToken[Return Token ID]
-
-    %% Tokenization Detail
-    EncodePrompt1 --> FindTokens[find_token_id - tokenizer.cpp:17]
-    EncodePrompt2 --> FindTokens
-    EncodePrompt3 --> FindTokens
-    FindTokens --> BPEEncode[encode_piece_bytes_bpe - tokenizer.cpp:37]
-    BPEEncode --> TokenArray[Return Token Array]
-
-    Decode1 --> TokenLookup[Token to String Lookup]
-    Decode2 --> TokenLookup
-    TokenLookup --> SafePrint[safe_printf - tokenizer.cpp:44]
-
-    %% Cleanup
-    Cleanup --> FreeSampler[free_sampler - sampler.cpp]
-    FreeSampler --> FreeTokenizer[free_tokenizer - tokenizer.cpp]
-    FreeTokenizer --> FreeTransformer[free_transformer - run.cpp]
-    FreeTransformer --> End([Program End])
-
-    %% Additional Components
-    DecodeStandalone[decode.cpp - Standalone Token Decoder]
-    DecodeStandalone --> DecodeMain[main - decode.cpp:22]
-    DecodeMain --> ReadTokenFile[Read Token File]
-    ReadTokenFile --> DecodeTokens[Decode Each Token]
-    DecodeTokens --> PrintDecoded[Print Decoded Text]
-
-    %% Styling
-    classDef mainFlow fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef forward fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef sampling fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef tokenizer fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-    classDef modes fill:#fff8e1,stroke:#f57f17,stroke-width:2px
-
-    class Main,ParseArgs,InitTransformer,InitTokenizer,InitSampler,ModeCheck,Cleanup mainFlow
-    class ForwardPass1,ForwardPass2,ForwardPass3,TokenEmbedding,LayerLoop,AttentionNorm,MultiHeadAttn,FFNNorm,Router,TopK,FinalNorm forward
-    class Sample1,Sample2,Sample3,SampleType,ArgMax,TopP,Multinomial sampling
-    class EncodePrompt1,EncodePrompt2,EncodePrompt3,FindTokens,BPEEncode,Decode1,Decode2,TokenLookup tokenizer
-    class GenerateMode,ChatMode,GetpMode modes
+```plain
+gpt-oss-amd/
+   ├── include/              # Header files
+   ├── src/
+   │   ├── getp/             # Request serving and runtime logic
+   │   ├── hip/              # Custom HIP kernels for AMD GPUs
+   │   ├── forward.cpp       # Model forward pass implementation
+   ├── tests/                # Evaluation scripts
+   ├── tools/                # Model/tokenizer conversion and HF inference utilities
+   └── run.sh                # Build and run script
 ```
 
-## resources
+### Resources
 
-- **Model binaries:**
-  - `/nfs/gpu_trainee/final-project/modelbin/`
-    - `gpt-oss-7m.bin` (debug only)
-    - `gpt-oss-20b.bin`
-    - `gpt-oss-120b.bin`
+- Download GPT-OSS 20/120B model `safetensors` files from [here](https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4) and convert them to `bin` using the provided script in `tools/model_export` to can use with the C++ inference runtime.
 
-- **Tokenizer:** compatible with OpenAI **`o200k_harmony`** (via `tiktoken`).
+- Tokenizer compatible with OpenAI `o200k_harmony` (via `tiktoken`).
 
-### env
+- GCC/Clang with OpenMP and HIP/ROCm installed.
 
-- **Hardware:** single node with up to **8× AMD MI250 GPUs**.
-- **GPU:** HIP/ROCm (write **all GPU kernels from scratch**, no GPU libs).
-- **CPU:** GCC/Clang with **OpenMP**/**pthreads**.
-- **OS:** Slurm for job execution.
-
-### slurm cluster
-
-Login node:
-
-```bash
-ssh getp<XX>@203.205.18.240
-```
-
-Compute node:
-
-```bash
-# srun --gres=gpu:1 rocm-smi
-srun --gres=gpu:<N> ./run /path/to/model.bin -m generate -i "..."
-```
-
-> The training cluster provides up to **4 nodes** for experimentation, but the **project deliverable focuses on single-node, multi-GPU execution**.
-
----
-
-## build & run
+### Setup Env
 
 ```bash
 uv sync
 source .venv/bin/activate
 pre-commit install
-
 chmod +x run.sh
-ln -s run.sh run
 ```
 
-### build
+### Build
 
 ```bash
 ./run build [default|fast|omp]
 ```
 
-## run
+### Run
 
-### chat
+- Chat
+
+  ```bash
+  # interactive turn-based generation, optional system prompt
+  ./run run -m chat -i "How do I tune top-p?" -y "You are a concise assistant." -T 0.7
+  ```
+
+- Single-Prompt
+
+  ```bash
+  # single prompt → completion
+  ./run run -m generate -i "Write a haiku about parallelism." -T 0.8 -p 0.95
+  ```
+
+- Batch
+
+  ```bash
+  # multi-prompt batch
+  ./run run                          # default 20B, 1 GPU, uses tests/data/{input,output}.txt
+  ./run run -m 120 -g 8 --kv16       # 120B, 8 GPUs, KV 16-bit
+  ```
+
+### Help
 
 ```bash
-./run run -m chat
+# full, colorized usage summary
+./run.sh -h
 ```
 
-### single-prompt
+## Experiments
 
-```bash
-./run run -m generate -i "Write a haiku about parallelism."
-```
-
-### batch
-
-```bash
-./run run -m getp
-```
+| Model          | Mode   | Num Requests | Num GPUs     | Warm-up (s) | Throughput (TPS) | METEOR | BERTScore |
+| -------------- | ------ | ------------ | ------------ | ----------- | ---------------- | ------ | --------- |
+| `gpt-oss-20b`  | `getp` | 7120         | 8x AMD MI250 | 20          | 30086            | 0.52   | 0.98      |
+| `gpt-oss-120b` | `getp` | 6144         | 8x AMD MI250 | 46          | 9993             | 0.30   | 0.99      |
 
 ---
 
-## eval
+## Acknowledgments
 
-| Mode       | Description                             | Example                                                       |
-| ---------- | --------------------------------------- | ------------------------------------------------------------- |
-| `chat`     | Interactive turn-based generation       | `./run.sh -c model.bin -m chat`                               |
-| `generate` | Single prompt → completion              | `./run.sh -c model.bin -m generate -i "..."`                  |
-| `getp`     | Multi-prompt batch for final evaluation | `./run.sh -c model.bin -m getp -i prompts.txt -o outputs.txt` |
+This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University). We thank them for their HPC expertise and generous AMD GPU support, without which this work would not have been possible.
 
-- Maintain **correctness metrics** (e.g., checksum/sanity prompts).
-- Report **tokens/sec** for each mode and model size.
-- Optimize across:
-  - CPU threading (OpenMP/pthreads)
-  - HIP kernels (coalescing, tiling, occupancy)
-  - Multi-GPU parallelization (pipeline/tensor-level)
+## Contributions
 
----
+Found a bug, typo, or want to extend something? Open a PR — all contributions are welcome.
 
-## rules
+<p align="left">
+  <a href="https://github.com/tuanlda78202/gpt-oss-amd/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=tuanlda78202/gpt-oss-amd" />
+  </a>
+</p>
 
-- **Do not modify:** `run.cpp`, `getp_eval.cpp`, `Makefile`.
-- **Implement all GPU kernels from scratch** — **no external GPU libraries**.
-- **Target:** single-node, multi-GPU execution.
+## License
 
----
-
-## refs
-
-- [GPT-OSS](https://openai.com/index/introducing-gpt-oss/)
-- [llama2.c](https://github.com/karpathy/llama2.c)
-- [AMD ROCm](https://rocm.docs.amd.com/)
-- [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
-- [OpenMP](https://www.openmp.org/specifications/)
-- [Slurm](https://slurm.schedmd.com/documentation.html)
-- [tiktoken](https://github.com/openai/tiktoken)
+MIT License — free to use, adapt, and share for learning and working.

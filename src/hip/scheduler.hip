@@ -45,7 +45,6 @@ __global__ void exclusive_scan_expert_offsets(int* __restrict__ counts, int* __r
     }
 }
 
-// ! pack (token_id, weight) contiguously per expert
 __global__ void
 compact_by_expert_kernel(const int* __restrict__ expert_ids, const int* __restrict__ tokens,
                          const float* __restrict__ weights, int BK, const int* __restrict__ offsets,
@@ -61,7 +60,6 @@ compact_by_expert_kernel(const int* __restrict__ expert_ids, const int* __restri
     weights_flat[dst] = weights[i];
 }
 
-// ! form x_by_expert (all tokens for expert e are a contiguous submatrix)
 __global__ void gather_rows_vec4_kernel(const float* __restrict__ X, const int* __restrict__ idx,
                                         float* __restrict__ Y, int BK, int H4) {
     int row = blockIdx.y;
@@ -111,21 +109,17 @@ __global__ void build_expert_work_queue(const int* __restrict__ expert_offsets,
     meta[0].y = maxNe;
 }
 
-// Build heavy/light work queues entirely on device.
-// Each entry is 3 ints: {expert_id, offset, Ne}
 __global__ void classify_and_build_queues(const int* __restrict__ expert_offsets, int E,
-                                          int very_sparse_cutoff,     // ADAPT_VERY_SPARSE_CUTOFF
-                                          float heavy_factor_sparse,  // ADAPT_HEAVY_FACTOR_SPARSE
-                                          float heavy_factor_default, // ADAPT_HEAVY_FACTOR_DEFAULT
-                                          int* __restrict__ wq_heavy, // [3*E]
-                                          int* __restrict__ wq_light, // [3*E]
-                                          MoEStats* __restrict__ stats_out // single struct
+                                          int very_sparse_cutoff,
+                                          float heavy_factor_sparse,
+                                          float heavy_factor_default,
+                                          int* __restrict__ wq_heavy,
+                                          int* __restrict__ wq_light,
+                                          MoEStats* __restrict__ stats_out
 ) {
-    // Single CTA is plenty (E is typically small), simple loop avoids atomics.
     if (blockIdx.x != 0 || threadIdx.x != 0)
         return;
 
-    // First pass: collect simple stats
     int active = 0;
     int maxNe = 0;
     long long sumNe_ll = 0;
@@ -151,13 +145,12 @@ __global__ void classify_and_build_queues(const int* __restrict__ expert_offsets
     float avgNe = float(sumNe_ll) / float(active);
     float heavy_factor = heavy_factor_default;
     if (active <= very_sparse_cutoff) {
-        heavy_factor = 1.0f; // treat everyone heavy for 1..cutoff
+        heavy_factor = 1.0f;
     } else if (active <= 12) {
         heavy_factor = heavy_factor_sparse;
     }
     const int heavy_thresh = int(ceilf(heavy_factor * avgNe));
 
-    // Second pass: partition + pack queues
     int heavy_count = 0;
     int light_count = 0;
     int heavy_max = 0;

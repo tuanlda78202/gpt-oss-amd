@@ -300,7 +300,7 @@ install-deps:
 	fi
 	@echo "✅ Dependencies installed!"
 
-# Quick check before commit (most important checks)
+# Quick check before commit
 quick-check: check-python check-clang-format check-whitespace
 	@echo "✅ Quick pre-commit checks completed!"
 

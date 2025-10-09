@@ -8,7 +8,6 @@
 void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t total_size,
                                  const char* tensor_name) {
     const size_t chunk_size = 512 * 1024 * 1024;
-
     bool show_progress = total_size > 1024 * 1024 * 1024;
 
     if (show_progress) {
@@ -16,7 +15,6 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
         fflush(stdout);
     }
 
-    // Allocate temporary conversion buffer
     __hip_bfloat16* conversion_buffer = (__hip_bfloat16*)malloc(chunk_size);
     if (!conversion_buffer) {
         fprintf(stderr, "Failed to allocate conversion buffer for %s\n", tensor_name);
@@ -38,7 +36,6 @@ void copy_large_tensor_streaming(__hip_bfloat16** d_ptr, float* h_ptr, size_t to
             conversion_buffer[i] = __float2bfloat16(h_ptr[element_offset + i]);
         }
 
-        // Transfer converted chunk directly to GPU
         CHECK_HIP(hipMemcpy((char*)(*d_ptr) + bytes_processed, conversion_buffer,
                             current_chunk_bytes, hipMemcpyHostToDevice));
 
@@ -69,7 +66,6 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     OssRunState* state = &t_fp32->state;
     OssRunState* state_d = &t_d->state;
 
-    // Initialize extended runtime bookkeeping for the device copy
     state_d->h_layer_kv_cap = nullptr;
     state_d->h_layer_is_local = nullptr;
     state_d->h2d_stage_capacity = conf->batch_size;
@@ -130,12 +126,8 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     t_d->ep_remote_weight_buffers = nullptr;
     t_d->ep_remote_weight_bytes = 0;
 
-    // printf("\nConverting model to hybrid precision...\n");
-
-    // ! GPU Check
     int current_device;
     CHECK_HIP(hipGetDevice(&current_device));
-
     hipDeviceProp_t deviceProp;
     CHECK_HIP(hipGetDeviceProperties(&deviceProp, current_device));
 
@@ -197,9 +189,8 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     size_t out_size = (size_t)vocab_size * hidden_dim * sizeof(__hip_bfloat16);
     CHECK_HIP(hipMalloc(&t_d->weights.out, out_size));
 
-    // ! Allocate FP32 state on GPU (with batch dimension B)
+    // ! Allocate FP32 state on GPU
     int batch_size = conf->batch_size;
-    // printf("🚒 Allocating GPU buffers for batch size %d...\n", batch_size);
 
     CHECK_HIP(hipMalloc(&t_d->state.x, (size_t)batch_size * hidden_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.t, (size_t)batch_size * hidden_dim * sizeof(float)));
@@ -261,17 +252,14 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
         t_d->ep_remote_weight_bytes = weight_bytes;
     }
 
-    // Compact KV allocation with per-layer capacities for cyclic cache
     const int kv_dim = n_kv_heads * head_dim;
     const int W_even = std::max(0, conf->sliding_window);
     const size_t elem_sz = use_kv16 ? sizeof(__hip_bfloat16) : sizeof(float);
 
-    // Host arrays for layout computation
     std::vector<int> h_cap(n_layers);
     std::vector<int> h_is_local(n_layers);
     std::vector<long long> h_off(n_layers + 1, 0);
 
-    // Compute per-layer capacities: even layers use W_even, odd layers use odd_window if set
     for (int l = 0; l < n_layers; ++l) {
         const bool even = (l % 2 == 0);
         int cap = seq_len;
@@ -285,12 +273,11 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
             cap = odd_window;
         } else {
             is_local = 0;
-            cap = seq_len; // dense (full context)
+            cap = seq_len;
         }
 
         h_is_local[l] = is_local;
         h_cap[l] = cap;
-        // pack (B, T_cap, kv_dim)
         h_off[l + 1] = h_off[l] + (long long)batch_size * cap * kv_dim;
     }
     if (n_layers > 0) {
@@ -307,12 +294,10 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     const size_t kv_elems_total = (size_t)h_off.back();
     const size_t kv_bytes_total = kv_elems_total * elem_sz;
 
-    // Allocate packed KV with per-layer sizes
     CHECK_HIP(hipMalloc(&t_d->state.key_cache, kv_bytes_total));
     CHECK_HIP(hipMalloc(&t_d->state.value_cache, kv_bytes_total));
     t_d->state.kv_cache_is_fp16 = use_kv16;
 
-    // Device copies of layout
     CHECK_HIP(hipMalloc(&t_d->state.d_layer_kv_off, (size_t)n_layers * sizeof(long long)));
     CHECK_HIP(hipMalloc(&t_d->state.d_layer_kv_cap, (size_t)n_layers * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.d_layer_is_local, (size_t)n_layers * sizeof(int)));
@@ -322,8 +307,6 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
                         hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(t_d->state.d_layer_is_local, h_is_local.data(), n_layers * sizeof(int),
                         hipMemcpyHostToDevice));
-
-    // Device arrays are passed as kernel parameters directly
 
     if (use_kv16) {
         printf("Using 16-bit KV cache (bfloat16) with cyclic buffers\n");
@@ -348,7 +331,6 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipMalloc(&t_d->state.cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
     CHECK_HIP(hipMalloc(&t_d->state.sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
 
-    // MoE expert-batching scratch buffers
     int BK_max = batch_size * experts_per_token;
     CHECK_HIP(hipMalloc(&t_d->state.assign_expert, (size_t)BK_max * sizeof(int)));
     CHECK_HIP(hipMalloc(&t_d->state.assign_token, (size_t)BK_max * sizeof(int)));
@@ -370,14 +352,6 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     CHECK_HIP(hipMalloc(&state_d->d_wq_light, wq_ints * sizeof(int)));
     state_d->d_wq_heavy_capacity = (int)wq_ints;
     state_d->d_wq_light_capacity = (int)wq_ints;
-
-    // int max_chunks = (seq_len + 127) / 128; // Assuming 128 is min chunk size
-    // size_t fa_O_size = (size_t)batch_size * n_attn_heads * max_chunks * head_dim * sizeof(float);
-    // size_t fa_ml_size = (size_t)batch_size * n_attn_heads * max_chunks * sizeof(float);
-
-    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_O, fa_O_size));
-    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_m, fa_ml_size));
-    // CHECK_HIP(hipMalloc(&t_d->state.fa_partial_l, fa_ml_size));
 
     printf("Converting and transferring weights...\n");
 
@@ -426,14 +400,12 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
     }
     copy_large_tensor_streaming(&t_d->weights.out, weights->out, out_size, "out");
 
-    // Convert small tensors directly
     __hip_bfloat16* small_buffer = (__hip_bfloat16*)malloc(1024 * 1024 * sizeof(__hip_bfloat16));
     if (!small_buffer) {
         fprintf(stderr, "Failed to allocate small conversion buffer\n");
         exit(EXIT_FAILURE);
     }
 
-    // Convert and copy small weights
     size_t rms_size = n_layers * hidden_dim;
     for (size_t i = 0; i < rms_size; i++) {
         small_buffer[i] = __float2bfloat16(weights->rms_attn_w[i]);
@@ -482,7 +454,7 @@ void copy_transformer_to_device(OssTransformer* t_fp32, OssTransformerHybrid* t_
 
     free(small_buffer);
 
-    // ! Initialize FP32 state buffers (zero initialization) with batch dimension
+    // ! Initialize FP32 state buffers
     CHECK_HIP(hipMemset(t_d->state.x, 0, batch_size * hidden_dim * sizeof(float)));
     CHECK_HIP(hipMemset(t_d->state.t, 0, batch_size * hidden_dim * sizeof(float)));
     CHECK_HIP(hipMemset(t_d->state.tb, 0, batch_size * head_dim * n_attn_heads * sizeof(float)));
@@ -529,7 +501,6 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     printf("\033[1;92m==================================================================\033["
            "0m\n\033[1;92m♻️  FREE GPU MEMORY...\033[0m\n");
 
-    // Free BF16 weights
     CHECK_HIP(hipFree(t_d->weights.token_embedding_table));
     CHECK_HIP(hipFree(t_d->weights.rms_attn_w));
     CHECK_HIP(hipFree(t_d->weights.rms_ffn_w));
@@ -551,7 +522,6 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
     CHECK_HIP(hipFree(t_d->weights.rms_out_w));
     CHECK_HIP(hipFree(t_d->weights.out));
 
-    // Free FP32 state buffers
     CHECK_HIP(hipFree(t_d->state.x));
     CHECK_HIP(hipFree(t_d->state.t));
     CHECK_HIP(hipFree(t_d->state.tb));
@@ -599,9 +569,6 @@ void free_transformer_on_device(OssTransformerHybrid* t_d) {
         t_d->state.d_wq_light = nullptr;
         t_d->state.d_wq_light_capacity = 0;
     }
-    // CHECK_HIP(hipFree(t_d->state.fa_partial_O));
-    // CHECK_HIP(hipFree(t_d->state.fa_partial_m));
-    // CHECK_HIP(hipFree(t_d->state.fa_partial_l));
     if (t_d->ep_aggregate_streams) {
         for (int i = 0; i < t_d->ep_size; ++i) {
             if (t_d->ep_aggregate_streams[i])

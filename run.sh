@@ -5,7 +5,6 @@ set -euo pipefail
 export MODELBIN_ROOT
 export OMP_NUM_THREADS=96
 
-# Color definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -13,13 +12,12 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
-NC='\033[0m'              # No Color
-
-FOREST1='\033[38;5;22m'   # Dark forest green
-FOREST2='\033[38;5;28m'   # Medium forest green
-FOREST3='\033[38;5;34m'   # Bright forest green
-FOREST4='\033[38;5;40m'   # Light forest green
-FOREST5='\033[38;5;46m'   # Very light forest green
+NC='\033[0m'
+FOREST1='\033[38;5;22m'
+FOREST2='\033[38;5;28m'
+FOREST3='\033[38;5;34m'
+FOREST4='\033[38;5;40m'
+FOREST5='\033[38;5;46m'
 
 print_fancy_header() {
   echo -e "${FOREST1}                      __"
@@ -35,13 +33,12 @@ print_fancy_header() {
   echo -e "${FOREST3} \\\$\$    \$\$| \$\$"
   echo -e "${FOREST4}  \\\$\$\$\$\$\$  \\\$\$"
   echo -e "${FOREST5}  ════════════════════════════════════════════════════════════════"
-  echo -e "${FOREST4}                         gpt-oss-c (moreh)"
-  echo -e "${FOREST3}              https://github.com/tuanlda78202/gpt-oss-c"
+  echo -e "${FOREST4}                       gpt-oss-amd from scratch"
+  echo -e "${FOREST3}              https://github.com/tuanlda78202/gpt-oss-amd"
   echo -e "${FOREST2}  ════════════════════════════════════════════════════════════════"
   echo -e "${NC}"
 }
 
-# Color functions
 print_header() {
   local color="$1"
   local title="$2"
@@ -206,7 +203,6 @@ usage() {
 now() { date +"%Y-%m-%d %H:%M:%S"; }
 
 print_kv() {
-  # $1=key, $2=value, $3=note(optional)
   if [[ -n "${3-}" ]]; then
     printf "  %-14s: %s %s\n" "$1" "$2" "$3"
   else
@@ -217,7 +213,6 @@ print_kv() {
 find_checkpoint() {
   local ckpt="${1:-}"
 
-  # explicit
   if [[ -n "${ckpt}" ]]; then
     echo "${ckpt}"; return 0
   fi
@@ -302,7 +297,6 @@ cmd_run() {
     esac
   done
 
-  # Handle model size shortcuts (20/120) for mode
   local model_size=""
   if [[ "${mode}" == "20" ]]; then
     model_size="20b"
@@ -322,10 +316,8 @@ cmd_run() {
     exit 1
   fi
 
-  # Default mode is getp if not specified
   [[ -z "${mode}" ]] && mode="getp"
 
-  # Mode-specific defaults for getp
   if [[ "${mode}" == "getp" ]]; then
     [[ -z "${inp}" ]] && inp="tests/data/input.txt"
     [[ -z "${out}" ]] && out="tests/data/output.txt"
@@ -371,12 +363,10 @@ cmd_run() {
   fi
   [[ -n "${odd_win}" ]] && print_kv "odd_win" "${odd_win}" "(--odd_win)"
 
-  # Optional helpful hint if build/run doesn't exist or isn't executable
   if [[ ! -x build/run ]]; then
     print_warning "build/run not found or not executable. Build it via: ./run.sh build"
   fi
 
-  # Build command line (only pass provided flags; plus getp defaults)
   local args=()
   [[ -n "${mode}" ]] && args+=(-m "${mode}")
   [[ -n "${inp}"  ]] && args+=(-i "${inp}")
@@ -395,7 +385,7 @@ cmd_run() {
   [[ -n "${kv32_flag}" ]] && args+=(--kv32)
   [[ -n "${odd_win}" ]] && args+=(--odd_win "${odd_win}")
 
-  local srun_cmd="srun --gres=gpu:${n_gpus}" # --exclude MV-DZ-MI250-01
+  local srun_cmd="srun --gres=gpu:${n_gpus}"
   print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
 
   if [[ -n "${log_output}" ]]; then
@@ -412,7 +402,6 @@ cmd_all() {
   local clean_flag=""
   local run_args=()
 
-  # Parse arguments - separate clean flag from run arguments
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -c) clean_flag="1"; shift 1 ;;
@@ -423,7 +412,6 @@ cmd_all() {
   print_header "${PURPLE}" "ALL"
   print_kv "clean" "${clean_flag:+enabled}" "$([[ -n "${clean_flag}" ]] && echo "(-c flag)" || echo "(disabled)")"
 
-  # Run make clean if -c flag is provided
   if [[ -n "${clean_flag}" ]]; then
     print_step "make clean"
     print_executing "make clean"
@@ -431,11 +419,9 @@ cmd_all() {
     print_success "Clean completed"
   fi
 
-  # Build
   print_info "building..."
   cmd_build "omp"
 
-  # Run
   print_info "running..."
   cmd_run "${run_args[@]}"
 }

@@ -4,10 +4,8 @@ TabWidth: 4
 UseTab: Never
 ColumnLimit: 100
 
-# C++17 Standard
 Standard: Auto
 
-# Additional formatting options
 AlignAfterOpenBracket: Align
 AlignConsecutiveAssignments: false
 AlignConsecutiveDeclarations: false

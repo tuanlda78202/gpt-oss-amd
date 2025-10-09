@@ -18,7 +18,6 @@ __global__ void topk_kernel(float* router_scores, float* topk_values, int* topk_
     __shared__ int shared_indices[1024];
     int tid = threadIdx.x;
 
-    // Load data into shared memory
     if (tid < num_experts) {
         shared_scores[tid] = batch_scores[tid];
         shared_indices[tid] = tid;
@@ -28,7 +27,6 @@ __global__ void topk_kernel(float* router_scores, float* topk_values, int* topk_
     }
     __syncthreads();
 
-    // Only thread 0 performs the sorting
     if (tid == 0) {
         for (int i = 0; i < experts_per_token && i < num_experts; i++) {
             int max_idx = i;

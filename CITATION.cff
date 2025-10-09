@@ -1,0 +1,12 @@
+cff-version: "1.2.0"
+message: "If you use this software, please cite it as below."
+title: "gpt-oss-amd – implement GPT-OSS 20/120B C++ inference from scratch on AMD GPUs"
+version: 0.1.0
+type: "Software"
+authors:
+  - given-names: "Tuan (Charles)"
+    family-names: "LDA"
+  - given-names: "Quan"
+    family-names: "TH"
+date-released: "2025-10-10"
+repository-code: "https://github.com/tuanlda78202/gpt-oss-amd"

@@ -1,7 +1,6 @@
 #include "BLAS.hip"
 #include <hip/hip_runtime.h>
 
-// GPU Argmax kernel
 __global__ void argmax_kernel(float* logits, int vocab_size, int* result) {
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
@@ -38,7 +37,6 @@ __global__ void argmax_kernel(float* logits, int vocab_size, int* result) {
     }
 }
 
-// Batched argmax kernel - one block per sequence
 __global__ void argmax_batched_kernel(const float* __restrict__ logits,
                                       int vocab_size, int stride,
                                       const int* __restrict__ rows,
@@ -55,7 +53,6 @@ __global__ void argmax_batched_kernel(const float* __restrict__ logits,
     float max_val = -INFINITY;
     int max_idx = 0;
 
-    // Strided scan of this row
     for (int i = tid; i < vocab_size; i += blockDim.x) {
         float v = logits[base + i];
         if (v > max_val) {
@@ -67,7 +64,6 @@ __global__ void argmax_batched_kernel(const float* __restrict__ logits,
     sidx[tid] = max_idx;
     __syncthreads();
 
-    // Block-wide reduction
     for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
         if (tid < step) {
             if (svals[tid] < svals[tid + step]) {
@@ -95,7 +91,7 @@ __global__ void multinomial_sample_kernel(float* probabilities, int vocab_size,
                                           unsigned long long seed, int* result) {
     int tid = threadIdx.x;
     if (tid != 0)
-        return; // Only thread 0 does sampling
+        return;
 
     unsigned long long rng_state = seed + blockIdx.x;
     float coin = gpu_random_f32(&rng_state);
@@ -144,10 +140,8 @@ void sample_multinomial(float* logits, int vocab_size, float temperature,
                            vocab_size, temperature);
     }
 
-    // Apply softmax
     softmax(logits, vocab_size);
 
-    // Sample
     dim3 block(256);
     dim3 grid(1);
     hipLaunchKernelGGL(multinomial_sample_kernel, grid, block, 0, 0, logits, vocab_size, seed,

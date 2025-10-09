@@ -5,14 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-// TokenIndex definition
 typedef struct {
     const char* str;
     int len;
     int id;
 } TokenIndex;
 
-// Tokenizer struct
 typedef struct {
     char** vocab;
     int* lengths;
@@ -24,7 +22,6 @@ typedef struct {
     unsigned char byte_pieces[512];
 } Tokenizer;
 
-// Function declarations
 int compare_tokens(const void* a, const void* b);
 int find_token_id(Tokenizer* t, const char* s, int len);
 int hex_nibble(int c);
