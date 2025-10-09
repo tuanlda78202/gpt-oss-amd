@@ -2,8 +2,13 @@
 
 # gpt-oss-amd from scratch
 
-[🌊 flow](#flow) | [🖥️ slurm](#slurm-cluster) | [⚒️ build & run](#build--run) | 🤗 <a href="https://huggingface.co/collections/openai/gpt-oss-68911959590a1634ba11c7a4">hf</a> | 📑 <a href="https://openai.com/index/introducing-gpt-oss/">blog</a> |
+ <p>
+    <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License: MIT"></a>
+    <img src="https://img.shields.io/github/actions/workflow/status/tuanlda78202/gpt-oss-amd/ci.yaml?branch=main&label=CI&logo=github" alt="CI Status">
+    <img src="https://img.shields.io/github/last-commit/tuanlda78202/gpt-oss-amd?&label=commit" alt="Last Commit">
+ </p>
 
+[abstract](#abstract) | [️build & run](#build--run) | [exp](#exp) | <a href="https://openai.com/index/introducing-gpt-oss/">blog</a> |
 <img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" />
 
 </div>
@@ -19,9 +24,9 @@ This repository implements an inference serving system for **gpt-oss** models (2
 
 ### goals
 
-- ✅ **Correctness** — keep simple checks/metrics to verify output validity.
-- 🚀 **Throughput** — maximize tokens/sec via CPU threading + HIP GPU kernels.
-- 📚 **Scope** — single node, multi-GPU execution for 20B and 120B models.
+- **Correctness** — keep simple checks/metrics to verify output validity.
+- **Throughput** — maximize tokens/sec via CPU threading + HIP GPU kernels.
+- **Scope** — single node, multi-GPU execution for 20B and 120B models.
 
 ---
 
