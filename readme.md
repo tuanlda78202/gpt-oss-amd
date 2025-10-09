@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/github/last-commit/tuanlda78202/gpt-oss-amd?&label=commit" alt="Last Commit">
  </p>
 
-[Abstract](#abstract) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contact](#contact)
+[Abstract](#abstract) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contributions](#contributions)
 
 <img width="1709" height="963" alt="image" src="https://github.com/user-attachments/assets/ef0a6e0a-acd0-4a8c-8916-4b28d0207822" />
 
@@ -18,7 +18,7 @@
 
 After six years-the first time since GPT-2, OpenAI has released new open-weight LLMs, `gpt-oss-20b` and `gpt-oss-120b`. From day one, many inference engines such as llama.cpp, vLLM, and SGLang have supported these models; however, most focus on maximizing throughput using CUDA for NVIDIA GPUs, offering limited support for AMD GPUs. Moreover, their library-oriented implementations are often complex and difficult to adapt for personal/experimental use cases.
 
-To address these limitations, we present `gpt-oss-amd`, a pure C++ implementation of OpenAI’s GPT-OSS models designed to **maximize inference throughput on AMD GPUs without relying on external libraries**. Our goal is to explore end-to-end LLM optimization, from kernel-level improvements to system-level design, providing insights for researchers and developers interested in high-performance computing and model-level optimization.
+To address these limitations, we introduce `gpt-oss-amd`, a pure C++ implementation of OpenAI’s GPT-OSS models designed to **maximize inference throughput on AMD GPUs without relying on external libraries**. Our goal is to explore end-to-end LLM optimization, from kernel-level improvements to system-level design, providing insights for researchers and developers interested in high-performance computing and model-level optimization.
 
 Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation uses HIP (an AMD equivalent to CUDA) and avoids dependencies such as rocBLAS, hipBLAS, RCCL, and MPI. We employ a range of optimization techniques for both the 20B and 120B models, including efficient model loading, batching, multi-streaming, multi-GPUs communication, optimized CPU–GPU–SRAM memory access, FlashAttention, matrix-core–based GEMM, and load balancing in MoE routing. Experiments on a single node with 8× AMD MI250 GPUs show that our implementation achieves over 30k TPS on the 20B model and nearly 10k TPS on the 120B model in custom benchmarks, demonstrating the effectiveness of our optimizations and the strong potential of AMD GPUs for large-scale LLM inference.
 
