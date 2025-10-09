@@ -17,7 +17,7 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
     constexpr int MT_M = 256; // CTA tile height (M)
     constexpr int MT_N = 64;  // CTA tile width  (N)
     constexpr int BK = 64;    // K-slice (multiple of 16)
-    constexpr int PAD = 4;    // Padding for LDS to reduce bank conflicts
+    constexpr int PAD = 4;
     constexpr int LDS_STRIDE_B = BK + PAD;
 
     constexpr int WR = 16;    // waves along M
@@ -48,29 +48,24 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
     const float* __restrict__ B_batch = x_by_expert + static_cast<long long>(off) * H;      // [N,K]
     float* __restrict__ O_batch = gate_by_expert + static_cast<long long>(off) * I;         // [N,I]
 
-    // CTA tile origins
     const int m0_cta = blockIdx.y * MT_M;
     const int n0_cta = blockIdx.x * MT_N;
     if (m0_cta >= M || n0_cta >= N)
         return;
 
-    // Thread/wave ids
     const int tid = threadIdx.x;
     const int wave_id = tid / 64;
     const int lane_id = tid % 64;
     const int lane_x = lane_id % 16;
     const int lane_y = lane_id / 16;
 
-    // Wave tile origins
     const int m0_wave = (wave_id % WR) * 16;
     const int n0_wave = (wave_id / WR) * 64;
 
-    // Shared memory tiles (double-buffered)
     __shared__ union {
-        short sB_T[2][MT_N * LDS_STRIDE_B]; // N-major in LDS with padding
+        short sB_T[2][MT_N * LDS_STRIDE_B];
     } smem;
 
-    // Initialize accumulators with bias
     const int m_bias_base = m0_cta + m0_wave + lane_y * 4;
     f4 bias4 = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -84,7 +79,6 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
     const int num_k_tiles = CEIL_DIV(K, BK);
 
     auto load_tile_g2s = [&](int n0_tile, int k_start, int buf) {
-        // Load B (BK x MT_N), from global B[N,K] f32 => bf16 and transpose into LDS
         const int total_vecsB = (BK * MT_N) / 4;
         for (int vec = tid; vec < total_vecsB; vec += TPB) {
             int n_loc = vec / (BK / 4);
@@ -103,13 +97,10 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
         }
     };
 
-    // Prefetch first tile
-    // Loop across N tiles to honor grid_cap
     const int total_tiles_n = CEIL_DIV(N, MT_N);
     for (int tile_x = blockIdx.x; tile_x < total_tiles_n; tile_x += gridDim.x) {
         const int n0_tile = tile_x * MT_N;
 
-        // Reset accumulators for this N tile
         f4 c0 = bias4, c1 = bias4, c2 = bias4, c3 = bias4;
 
         load_tile_g2s(n0_tile, 0, 0);
@@ -149,7 +140,6 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
 
             i16x4 avec_curr = load_avec(0);
 
-            // Compute on current tile
 #pragma unroll
             for (int kk = 0; kk < BK; kk += 16) {
                 i16x4 avec_next = {0, 0, 0, 0};
@@ -187,8 +177,7 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
             __syncthreads();
         }
 
-        // Epilogue: fused SwiGLU and store [N,I]
-        const int m_out_base = m0_cta + m0_wave + lane_y * 4; // 4 rows per thread
+        const int m_out_base = m0_cta + m0_wave + lane_y * 4;
         const int n_out0 = n0_tile + n0_wave + 0 * 16 + lane_x;
         const int n_out1 = n0_tile + n0_wave + 1 * 16 + lane_x;
         const int n_out2 = n0_tile + n0_wave + 2 * 16 + lane_x;
@@ -202,8 +191,8 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
         };
 
         if (m_out_base + 3 < M) {
-            const int i_idx0 = (m_out_base >> 1); // even, 8B aligned
-            const int i_idx1 = i_idx0 + 1;        // consecutive
+            const int i_idx0 = (m_out_base >> 1);
+            const int i_idx1 = i_idx0 + 1;
 
             f2 v0 = {swiglu(c0[0], c0[1]), swiglu(c0[2], c0[3])};
             f2 v1 = {swiglu(c1[0], c1[1]), swiglu(c1[2], c1[3])};
@@ -219,7 +208,7 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
             if (n_out3 < N)
                 *reinterpret_cast<f2*>(&O_batch[(size_t)n_out3 * I + i_idx0]) = v3;
         } else {
-            // Tail-safe scalar fallback (matches gemm_qkv style with nt_store)
+
 #pragma unroll
             for (int i = 0; i < 4; i += 2) {
                 const int m_gate = m_out_base + i;
@@ -251,7 +240,6 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
                             int H, int I, long long expert_weight_stride,
                             long long expert_bias_stride, float alpha, float swiglu_limit,
                             int maxNe, int grid_cap, hipStream_t stream) {
-    // Match the updated kernel tile sizes (from gemm_o flow)
     constexpr int MT_M = 256;
     constexpr int MT_N = 64;
     constexpr int WR = 16;
@@ -261,7 +249,7 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
     const int grid_x = max(1, min(grid_cap, CEIL_DIV(maxNe, MT_N)));
     const int grid_y = max(1, CEIL_DIV(2 * I, MT_M));
 
-    dim3 block(64 * WAVES, 1, 1); // 1024 threads
+    dim3 block(64 * WAVES, 1, 1);
     dim3 grid(grid_x, grid_y, work_count);
 
     moe_mlp1_swiglu_mfma_kernel<<<grid, block, 0, stream>>>(
@@ -269,7 +257,7 @@ inline void moe_mlp1_swiglu(const int* work_queue, int work_start, int work_coun
         I, expert_weight_stride, expert_bias_stride, alpha, swiglu_limit);
 }
 
-// MLP2 kernel (updated): [Ne, I] x [I, H] -> scatter to e_agg using bf16 MFMA flow
+// MLP2 kernel (updated): [Ne, I] x [I, H] -> scatter e_agg
 __global__ void moe_mlp2_scatter_mfma_kernel(
     const int* __restrict__ work_queue, int work_start, int work_count,
     const float* __restrict__ gate_by_expert, const int* __restrict__ tokens_flat,
@@ -279,7 +267,7 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
     constexpr int MT_M = 256; // CTA tile height (M)
     constexpr int MT_N = 64;  // CTA tile width  (N)
     constexpr int BK = 64;    // K-slice (multiple of 16)
-    constexpr int PAD = 4;    // Padding for LDS to reduce bank conflicts
+    constexpr int PAD = 4;
     constexpr int LDS_STRIDE_B = BK + PAD;
 
     constexpr int WR = 16;    // waves along M
@@ -326,7 +314,7 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
     const int n0_wave = (wave_id / WR) * 64;
 
     __shared__ union {
-        short sB_T[2][MT_N * LDS_STRIDE_B]; // N-major in LDS with padding
+        short sB_T[2][MT_N * LDS_STRIDE_B];
     } smem;
 
     const int m_bias_base = m0_cta + m0_wave + lane_y * 4;
@@ -344,7 +332,6 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
         return;
 
     auto load_tile_g2s = [&](int n0_tile, int k_start, int buf) {
-        // Load B (BK x MT_N), from global B[N,K] f32 => bf16 and transpose into LDS
         const int total_vecsB = (BK * MT_N) / 4;
         for (int vec = tid; vec < total_vecsB; vec += TPB) {
             int n_loc = vec / (BK / 4);
@@ -356,7 +343,6 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
                 bvals = load_and_convert_f32_to_bf16x4(gB);
             }
 
-            // Contiguous 8B write in LDS
             i16x4* sBv = reinterpret_cast<i16x4*>(&smem.sB_T[buf][n_loc * LDS_STRIDE_B + k_loc4]);
             *sBv = bvals;
         }

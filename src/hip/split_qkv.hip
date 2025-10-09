@@ -3,18 +3,18 @@
 
 template<int VEC>
 __global__ void split_qkv_kernel(
-    const float* __restrict__ qkv,     // [B, (Hq+2Hkv)*D]
-    float* __restrict__ q_out,         // [B, Hq*D]
-    void* __restrict__ key_cache,     // global cache
-    void* __restrict__ value_cache,   // global cache
+    const float* __restrict__ qkv,
+    float* __restrict__ q_out,
+    void* __restrict__ key_cache,
+    void* __restrict__ value_cache,
     int B, int head_dim, int n_q_heads, int n_kv_heads,
     int layer, const int* __restrict__ pos_per_token, int seq_len,
     const int* __restrict__ batch_indices, long long B_stride,
-    int kv_dim,                         // = head_dim * n_kv_heads
+    int kv_dim,
     int kv_cache_is_fp16,
-    const long long* __restrict__ d_layer_kv_off,   // layer offsets
-    const int* __restrict__ d_layer_kv_cap,         // layer capacities
-    const int* __restrict__ d_layer_is_local)       // layer locality flags
+    const long long* __restrict__ d_layer_kv_off,
+    const int* __restrict__ d_layer_kv_cap,
+    const int* __restrict__ d_layer_is_local)
 {
     const int t = blockIdx.y;
     const int colv = blockIdx.x * blockDim.x + threadIdx.x;
@@ -24,23 +24,21 @@ __global__ void split_qkv_kernel(
     const int q_row    = n_q_heads * head_dim;
     const int qkv_row  = (n_q_heads + 2*n_kv_heads) * head_dim;
 
-    const long long kv_base = d_layer_kv_off[layer];      // elements
-    const int       cap     = d_layer_kv_cap[layer];      // time capacity for this layer
+    const long long kv_base = d_layer_kv_off[layer];
+    const int       cap     = d_layer_kv_cap[layer];
     const int       local   = d_layer_is_local[layer];
 
     const int pos  = pos_per_token[t];
     const int slot = batch_indices[t];
-    const int pos_wrapped = local ? (pos % cap) : pos;   // ring slot
+    const int pos_wrapped = local ? (pos % cap) : pos;
 
     const float* __restrict__ qkv_t = qkv + (long long)t * qkv_row;
     float*       __restrict__ q_t   = q_out + (long long)t * q_row;
 
-    // Vector copy helpers
     constexpr int V = VEC;
     const int q_col = colv * V;
     const int kv_col = colv * V;
 
-    // 1) Copy Q
     if (q_col < q_row) {
         if constexpr (V == 4) {
             reinterpret_cast<float4*>(q_t)[colv] = reinterpret_cast<const float4*>(qkv_t)[colv];
@@ -53,7 +51,6 @@ __global__ void split_qkv_kernel(
         }
     }
 
-    // 2) Scatter K and V to the cache using ring indexing
     const size_t element_size = kv_cache_is_fp16 ? sizeof(__hip_bfloat16) : sizeof(float);
     const long long elem_index = kv_base + (long long)slot * (long long)cap * kv_dim + (long long)pos_wrapped * kv_dim;
 
@@ -93,7 +90,7 @@ inline void split_qkv(
     const long long* d_layer_kv_off, const int* d_layer_kv_cap, const int* d_layer_is_local)
 {
     const int q_row = n_q_heads * head_dim;
-    const int vec = (q_row % 4 == 0) ? 4 : 1;  // Q can use vec=4, KV always uses scalar
+    const int vec = (q_row % 4 == 0) ? 4 : 1;
 
     dim3 block(256);
     dim3 grid( ((max(q_row, kv_dim) + (vec-1)) / vec + block.x - 1) / block.x, B );

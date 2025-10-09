@@ -94,7 +94,7 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
                        int sliding_window, int layer_idx, int n_attn_heads,
                        const int* __restrict__ d_pos_per_token, // (B)
                        const int* __restrict__ d_batch_indices, // (B)
-                       long long /*B_stride*/,                  // unused (layer offsets used)
+                       long long /*B_stride*/,
                        const long long* __restrict__ d_layer_kv_off,
                        const int* __restrict__ d_layer_kv_cap,
                        const int* __restrict__ d_layer_is_local, int bc_tile_hint) {
@@ -106,8 +106,8 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
     constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
 
     const int lane_id = threadIdx.x;
-    const int lane_x = lane_id % BC_TILE; // column within tile
-    const int lane_y = lane_id / BC_TILE; // K-slice group (0..3)
+    const int lane_x = lane_id % BC_TILE;
+    const int lane_y = lane_id / BC_TILE;
 
     const int kv_head = blockIdx.x;
     const int b = blockIdx.y;
@@ -177,7 +177,6 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
     }
     __syncthreads();
 
-    // Preload Q fragments (bf16) for each row handled by the wave.
     i16x4 q_frag[HEAD_DIM / MFMA_K];
 #pragma unroll
     for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
@@ -234,7 +233,6 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         }
         __syncthreads();
 
-        // Stage K and V tiles in LDS as bf16 bits.
         const int total_tile_elems = bc * HEAD_DIM;
         for (int idx = lane_id; idx < total_tile_elems; idx += 64) {
             const int c = idx / HEAD_DIM;
@@ -267,7 +265,6 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         }
         __syncthreads();
 
-        // Compute Q · K^T tile with MFMA.
         f4 score_frag = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
@@ -310,7 +307,6 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
             score_reg[i] = val;
         }
 
-        // Row-wise maxima reduction.
         float row_max[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -335,7 +331,6 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         }
         __syncthreads();
 
-        // Compute normalized probabilities and update LSE.
         float row_sum[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -397,7 +392,6 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         }
         __syncthreads();
 
-        // Accumulate O += P_tile · V_tile via MFMA.
         const int k_base = lane_y * 4;
         i16x4 w_frag = {0, 0, 0, 0};
         if (lane_x < rows_active) {

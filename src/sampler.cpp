@@ -88,7 +88,6 @@ void build_sampler_oss(OssSampler* sampler, int vocab_size, float temperature, f
     sampler->temperature = temperature;
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
-    // buffer only used with nucleus sampling; may not need but it's ~small
     sampler->probindex =
         reinterpret_cast<OssProbIndex*>(malloc(sampler->vocab_size * sizeof(OssProbIndex)));
 }

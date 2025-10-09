@@ -33,7 +33,7 @@ int hex_nibble(int c) {
 
 int parse_hex_byte_token(const char* s, int len, unsigned char* out) {
     if (len != 6)
-        return 0; // expects exactly "<0xHH>"
+        return 0;
     if (s[0] != '<' || s[1] != '0' || s[2] != 'x' || s[5] != '>')
         return 0;
 

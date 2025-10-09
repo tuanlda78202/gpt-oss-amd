@@ -49,7 +49,6 @@ typedef struct {
 
 // ! Learned parameters
 typedef struct {
-    // token_embedding_table (2D (vocab_size, hidden_dim) -> flat to 1D) - embedding.weight
     float* token_embedding_table; // (vocab_size, hidden_dim) (in, out)
 
     // weights for rmsnorms
@@ -72,11 +71,6 @@ typedef struct {
     // weights for router [mlp.gate.weight & mlp.gate.bias]
     float* w_router; // (n_layers, hidden_dim, n_experts)
     float* b_router; // (n_layers, n_experts)
-
-    // weights for MoE [mlp.mlp1_weight & mlp.mlp1_bias & mlp.mlp2_weight &
-    // mlp.mlp2_bias] NOTE: gate_up projects from hidden_dim to intermediate_dim,
-    // the shape is kinda reverted because the original code use einsum to reduce
-    // over hidden_dim
 
     float* w_mlp1; // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
                    // hidden_dim)
@@ -201,7 +195,7 @@ typedef struct {
     int h2d_stage_capacity;          // number of elements each staging buffer can hold
     int h2d_stage_cursor;            // ping-pong slot selector for staging reuse
 
-    // HIP graph capture handles (optional execution replay)
+    // HIP graph capture handles
     bool forward_graph_enabled;        // set via env/config to request graph capture
     bool forward_graph_ready;          // true once graph has been captured/instantiated
     hipGraph_t forward_graph;          // captured graph for forward path
