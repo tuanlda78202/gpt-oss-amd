@@ -10,7 +10,8 @@
 
 [Abstract](#abstract) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contact](#contact)
 
-<!-- <img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" /> -->
+<img width="1709" height="963" alt="image" src="https://github.com/user-attachments/assets/ef0a6e0a-acd0-4a8c-8916-4b28d0207822" />
+
 
 </div>
 
