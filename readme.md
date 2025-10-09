@@ -10,7 +10,7 @@
 
 [Abstract](#abstract) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contact](#contact)
 
-<img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" />
+<!-- <img width="1589" height="734" alt="image" src="https://github.com/user-attachments/assets/8a797e2b-6ae5-4383-b6ff-4d5b914bbece" /> -->
 
 </div>
 
@@ -115,4 +115,4 @@ If you have any questions, please feel free to email the [authors.](tuanleducanh
 * [llama2.c](https://github.com/karpathy/llama2.c)
 * [HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/)
 * [OpenMP](https://www.openmp.org/specifications/)
-* [From GPT-2 to gpt-oss](https://magazine.sebastianraschka.com/p/from-gpt-2-to-gpt-oss-analyzing-the)
+<!-- * [From GPT-2 to gpt-oss](https://magazine.sebastianraschka.com/p/from-gpt-2-to-gpt-oss-analyzing-the) -->
