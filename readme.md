@@ -112,6 +112,10 @@ chmod +x run.sh
 
 This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-vietnam/) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University).
 
+## License
+
+MIT License — free to use, adapt, and share for learning and working.
+
 ## Contributions
 
 Found a bug, typo, or want to extend something? Open a PR — all contributions are welcome.
@@ -121,7 +125,3 @@ Found a bug, typo, or want to extend something? Open a PR — all contributions 
     <img src="https://contrib.rocks/image?repo=tuanlda78202/gpt-oss-amd" />
   </a>
 </p>
-
-## License
-
-MIT License — free to use, adapt, and share for learning and working.
