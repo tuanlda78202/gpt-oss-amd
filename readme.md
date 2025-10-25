@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/github/last-commit/tuanlda78202/gpt-oss-amd?&label=commit" alt="Last Commit">
  </p>
 
-[Overview](#overview) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) | [Contributors](#contributors)
+[Overview](#overview) | [Build & Run](#build-and-run) | [Experiments](#experiments) | [Acknowledgements](#acknowledgments) |
 
 <img width="1696" height="980" alt="image" src="https://github.com/user-attachments/assets/efd81a09-5299-4bac-b382-66e576a48b1f" />
 
