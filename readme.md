@@ -109,4 +109,3 @@ chmod +x run.sh
 ## Acknowledgments
 
 This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-inc) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University).
-
